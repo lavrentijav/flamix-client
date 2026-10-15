@@ -49,8 +49,13 @@ brings the features of Happ, v2RayTun and v2rayN into one application.
 **Routing and diagnostics**
 - Presets: Global, "Bypass RU" (RU sites and IPs direct, ads blocked), Custom (domains, IPs, processes in TUN)
 - Ping: TCP and a real URL test through the core
-- Per-subscription traffic bar, per-server traffic bar, statistics page
-- Tray, autostart, light/dark theme, RU/EN UI
+- Per-subscription traffic bar and per-server traffic bar (core data)
+
+**Desktop UI (in progress)**
+- Slint app: server list, server selection and ping, tray, autostart, light/dark theme, RU/EN
+
+The client core (share-link and subscription parsing, core config generation, ping, system layer) is
+implemented; the graphical interface is under active development.
 
 **Backup servers and multi-traffic (planned)**
 - A primary server plus an ordered list of backups kept warm.
@@ -65,17 +70,17 @@ brings the features of Happ, v2RayTun and v2rayN into one application.
 
 | Feature | Flamix | Happ | v2RayTun | v2rayN |
 |---|:---:|:---:|:---:|:---:|
-| Open source | ✅ | ❌ | ❌ | ✅ (GPL-3.0) |
-| Desktop: Windows / macOS / Linux | ✅ | ? | ? | ✅ |
+| Open source | ✅ | ❌ | ❌ | ✅ |
+| Desktop: Windows / macOS / Linux | ✅ | ✅ | ? | ✅ |
 | TUN mode | ✅ | ✅ | ? | ✅ |
-| Backup subscription URLs | ✅ | ? | ? | ? |
-| Per-server traffic | ✅ | ? | ? | ? |
-| Backup servers and multi-traffic | 🚧 | ? | ? | ? |
-| Xray-core | ✅ | ✅ | ✅ | ✅ |
-| sing-box | ✅ | ? | ? | ✅ |
-| Understands other clients' deep links | ✅ | ? | ? | ? |
+| Backup subscription URLs | ✅ | ✅ | ❌ | ❌ |
+| Per-server traffic | ✅ | ❌ | ❌ | ❌ |
+| Backup servers and multi-traffic | 🚧 | ❌ | ❌ | ✅ |
+| Xray-core | ✅ | ✅ | ? | ✅ |
+| sing-box | ✅ | ✅ | ? | ✅ |
+| Understands other clients' deep links | ✅ | ❌ | ? | ? |
 
-"?" — no data, so we do not guess.
+"?" — no data, so we do not guess. Based on public documentation as of October 2026.
 
 ## Platforms
 
@@ -120,8 +125,14 @@ Full specification of formats, headers and body metadata — see
 
 ## Build from source
 
-Build instructions (including building on the server via `scripts/ru1` and CI) — see
-**[docs/build.md](docs/build.md)**.
+You need [Rust](https://rustup.rs) (stable, via rustup) and the system dependencies for your OS. In short:
+
+```
+cargo build --release -p flamix
+cargo test --workspace
+```
+
+Detailed instructions (per-platform dependencies, packaging) — see **[docs/build.md](docs/build.md)**.
 
 ## Project structure
 
@@ -129,8 +140,8 @@ Build instructions (including building on the server via `scripts/ru1` and CI) �
 crates/flamix-core   # platform-independent logic: model, links, subscriptions, configs, store, ping
 crates/flamix-sys    # OS integration: system proxy, core processes, elevation, autostart
 app/flamix           # Slint desktop app (ui/*.slint, src/*.rs)
-docs/                # specs, tasks, design
-scripts/             # build/packaging scripts (scripts/ru1 — build on the server)
+docs/                # specs and design
+scripts/             # build and packaging scripts
 ```
 
 ## Roadmap
