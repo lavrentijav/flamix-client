@@ -1,0 +1,27 @@
+// Flamix theme tokens (dark = mockup, light = WinUI variant).
+// `Theme.dark` is switched from Rust (see `AppWindow.dark`).
+
+export global Theme {
+    in-out property <bool> dark: true;
+
+    out property <color> window-bg: dark ? #2B2621 : #F6F1EB;
+    out property <color> rail-bg: dark ? #2B2621 : #F6F1EB;
+    out property <color> panel-bg: dark ? #3D3328 : #FFFFFF;
+    out property <color> card-header: dark ? #5A4632 : #FFFFFF;
+    out property <color> card-body: dark ? #4A3B2C : #FFFFFF;
+
+    out property <color> accent: #C07A2C;
+    out property <color> accent-strong: #8A5418;
+    out property <color> text: dark ? #F2E9DF : #2B2621;
+    out property <color> muted: dark ? #B9A894 : #6B5E4E;
+    out property <color> stroke: dark ? #FFFFFF14 : #00000014;
+    out property <color> hover: dark ? #FFFFFF12 : #0000000A;
+    out property <color> track: dark ? #FFFFFF1A : #00000012;
+
+    out property <color> success: #6CCB5F;
+    out property <color> warning: #E3B341;
+    out property <color> danger: #E5534B;
+    out property <color> on-accent: #FFFFFF;
+
+    out property <length> radius: 10px;
+}

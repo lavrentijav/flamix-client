@@ -21,6 +21,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# Only used by the hidden `--screenshot` mode (offscreen software renderer -> PNG).
+png = "0.17"
+# Workaround for build hosts without libfontconfig (e.g. ru1): build fontique's
+# fontconfig backend in dlopen mode so it doesn't need the system library at link time.
+fontique = { version = "0.11.1", default-features = false, features = ["fontconfig-dlopen"] }
 
 [build-dependencies]
 slint-build = "1"

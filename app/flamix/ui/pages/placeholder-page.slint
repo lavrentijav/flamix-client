@@ -1,0 +1,17 @@
+import { Theme } from "../theme.slint";
+
+// Placeholder for the not-yet-implemented pages (Add, Routing, Settings, ...).
+export component PlaceholderPage inherits Rectangle {
+    in property <string> title: "";
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-size: 28px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}

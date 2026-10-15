@@ -1,0 +1,10 @@
+import { Theme } from "../theme.slint";
+
+// Monochrome glyph, recoloured to the theme.
+export component Icon inherits Image {
+    in property <color> tint: Theme.text;
+    in property <length> size: 20px;
+    width: size;
+    height: size;
+    colorize: tint;
+}

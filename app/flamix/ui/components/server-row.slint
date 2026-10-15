@@ -1,0 +1,123 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+import { ServerItem } from "../model.slint";
+
+export component ServerRow inherits Rectangle {
+    in property <ServerItem> item;
+    in property <bool> edit-mode: false;
+    callback clicked();
+    callback open();
+    callback delete-clicked();
+
+    height: item.has-quota ? 64px : 50px;
+    border-radius: 8px;
+    background: item.selected ? Theme.accent.with-alpha(0.18) : (ta.has-hover ? Theme.hover : transparent);
+    animate background { duration: 140ms; }
+
+    property <color> ping-color: item.ping == -1 ? Theme.danger : item.ping < 0 ? Theme.muted : item.ping < 150 ? Theme.success : item.ping < 400 ? Theme.warning : Theme.danger;
+    property <string> ping-text: item.ping < -1 ? "" : item.ping == -1 ? "—" : "\{item.ping} ms";
+
+    // Flag.
+    Image {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 26px;
+        height: 20px;
+        source: item.flag;
+    }
+
+    // Name + subtitle.
+    Text {
+        x: 48px;
+        y: item.has-quota ? 9px : 7px;
+        width: parent.width - 48px - 104px;
+        text: item.name;
+        color: Theme.text;
+        font-size: 14px;
+        overflow: elide;
+        vertical-alignment: top;
+    }
+    Text {
+        x: 48px;
+        y: item.has-quota ? 27px : 25px;
+        width: parent.width - 48px - 104px;
+        text: item.summary;
+        color: Theme.muted;
+        font-size: 12px;
+        overflow: elide;
+    }
+
+    // Per-server quota: thin bar + remaining text.
+    if item.has-quota : Rectangle {
+        x: 48px;
+        y: 47px;
+        width: 150px;
+        height: 3px;
+        border-radius: 2px;
+        background: Theme.track;
+        Rectangle {
+            width: min(parent.width * item.quota-fraction, parent.width);
+            height: parent.height;
+            border-radius: 2px;
+            background: Theme.accent;
+        }
+    }
+    if item.has-quota : Text {
+        x: 204px;
+        y: 41px;
+        text: item.quota-text;
+        color: Theme.muted;
+        font-size: 11px;
+    }
+
+    // Ping badge.
+    if item.ping != -2 : Text {
+        x: parent.width - 104px;
+        y: (parent.height - self.height) / 2;
+        width: 48px;
+        text: root.ping-text;
+        color: root.ping-color;
+        font-size: 12px;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
+
+    // Chevron -> open details.
+    Icon {
+        x: parent.width - 30px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        source: @image-url("../../assets/icons/chevron-right.svg");
+        tint: Theme.muted;
+    }
+
+    // Delete (edit mode).
+    if edit-mode : Icon {
+        x: parent.width - 58px;
+        y: (parent.height - self.height) / 2;
+        width: 18px;
+        height: 18px;
+        source: @image-url("../../assets/icons/trash.svg");
+        tint: Theme.muted;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    if edit-mode : TouchArea {
+        x: parent.width - 68px;
+        width: 34px;
+        height: parent.height;
+        mouse-cursor: pointer;
+        clicked => { root.delete-clicked(); }
+    }
+    TouchArea {
+        x: parent.width - 36px;
+        width: 36px;
+        height: parent.height;
+        mouse-cursor: pointer;
+        clicked => { root.open(); }
+    }
+}

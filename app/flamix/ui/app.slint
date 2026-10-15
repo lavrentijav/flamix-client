@@ -1,4 +1,115 @@
+// Flamix main window. Rust <-> UI contract for the controller task (T07).
+// Bundle a font so the software renderer works on machines without system fonts.
+import "../assets/fonts/DejaVuSans.ttf";
+import "../assets/fonts/DejaVuSans-Bold.ttf";
+// Re-exported so Rust can switch the theme via `ui.global::<Theme>().set_dark(..)`.
+import { Theme } from "theme.slint";
+export { Theme } from "theme.slint";
+import { Rail } from "components/rail.slint";
+import { ServersPanel } from "components/servers-panel.slint";
+import { ConnectionPanel } from "components/connection-panel.slint";
+import { PlaceholderPage } from "pages/placeholder-page.slint";
+import { ServerItem, SubscriptionItem, ConnState } from "model.slint";
+export { ServerItem, SubscriptionItem, ConnState } from "model.slint";
+
 export component AppWindow inherits Window {
     title: "Flamix";
-    Text { text: "Flamix"; }
+    background: Theme.window-bg;
+    preferred-width: 960px;
+    preferred-height: 600px;
+    min-width: 720px;
+    min-height: 480px;
+    default-font-family: root.font-family;
+
+    in property <[SubscriptionItem]> subscriptions;
+    in property <[ServerItem]> local-servers;
+    in property <string> selected-name;
+    in property <image> selected-flag;
+    in property <string> ping-result;
+    in property <ConnState> state: ConnState.disconnected;
+    in property <string> status-text;
+    in property <string> speed-text;
+    in-out property <bool> tun-mode: false;
+    in-out property <string> search-text;
+    in property <bool> dark: true;
+    // Segoe-first for the WinUI look; the screenshot switches this to the bundled font.
+    in-out property <string> font-family: "Segoe UI Variable";
+    in-out property <int> page: 0; // 0 servers, 1 add, 2 routing, 3 settings, 4 stats, 5 about
+    in-out property <bool> edit-mode: false;
+    in-out property <bool> rail-expanded: false;
+
+    callback toggle-connect();
+    callback select-server(string);
+    callback open-server(string);
+    callback ping-selected();
+    callback ping-all();
+    callback update-subscription(string);
+    callback update-all();
+    callback toggle-pin(string);
+    callback toggle-collapse(string);
+    callback subscription-settings(string);
+    callback delete-server(string);
+    callback delete-subscription(string);
+    callback import-clipboard();
+    callback sort-by-ping();
+    callback mode-changed(bool);
+    callback search-changed(string);
+    callback toggle-edit();
+    callback add-subscription();
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            vertical-stretch: 1;
+
+            rail := Rail {
+                page: root.page;
+                expanded <=> root.rail-expanded;
+                navigate(p) => { root.page = p; }
+            }
+
+            if root.page == 0 : ServersPanel {
+                horizontal-stretch: 1;
+                subscriptions: root.subscriptions;
+                local-servers: root.local-servers;
+                search-text <=> root.search-text;
+                edit-mode: root.edit-mode;
+                search-changed(q) => { root.search-changed(q); }
+                toggle-edit => { root.toggle-edit(); }
+                import-clipboard => { root.import-clipboard(); }
+                update-all => { root.update-all(); }
+                ping-all => { root.ping-all(); }
+                sort-by-ping => { root.sort-by-ping(); }
+                add-subscription => { root.add-subscription(); }
+                toggle-collapse(id) => { root.toggle-collapse(id); }
+                toggle-pin(id) => { root.toggle-pin(id); }
+                refresh(id) => { root.update-subscription(id); }
+                subscription-settings(id) => { root.subscription-settings(id); }
+                delete-subscription(id) => { root.delete-subscription(id); }
+                select-server(id) => { root.select-server(id); }
+                open-server(id) => { root.open-server(id); }
+                delete-server(id) => { root.delete-server(id); }
+            }
+            if root.page != 0 : PlaceholderPage {
+                horizontal-stretch: 1;
+                title: root.page == 1 ? "Добавить" : root.page == 2 ? "Маршрутизация" : root.page == 3 ? "Настройки" : root.page == 4 ? "Статистика" : root.page == 5 ? "О программе" : "Серверы";
+            }
+
+            ConnectionPanel {
+                selected-flag: root.selected-flag;
+                selected-name: root.selected-name;
+                ping-result: root.ping-result;
+                state: root.state;
+                status-text: root.status-text;
+                speed-text: root.speed-text;
+                tun-mode <=> root.tun-mode;
+                toggle-connect => { root.toggle-connect(); }
+                ping-selected => { root.ping-selected(); }
+                mode-changed(v) => { root.mode-changed(v); }
+            }
+        }
+    }
 }

@@ -1,0 +1,217 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+import { SubscriptionItem } from "../model.slint";
+import { ServerRow } from "server-row.slint";
+
+export component SubscriptionCard inherits Rectangle {
+    in property <SubscriptionItem> sub;
+    in property <bool> edit-mode: false;
+
+    callback toggle-collapse();
+    callback toggle-pin();
+    callback refresh();
+    callback settings();
+    callback delete-sub();
+    callback select-server(string);
+    callback open-server(string);
+    callback delete-server(string);
+
+    background: Theme.card-body;
+    border-radius: 12px;
+    clip: true;
+    // Size to content (the root is a Rectangle, so adopt the layout's preferred height).
+    height: content.preferred-height;
+
+    content := VerticalLayout {
+        padding: 0px;
+        spacing: 0px;
+
+        // Header.
+        Rectangle {
+            height: 46px;
+            background: Theme.card-header;
+
+            TouchArea {
+                x: 0;
+                y: 0;
+                width: 40px;
+                height: parent.height;
+                mouse-cursor: pointer;
+                clicked => { root.toggle-collapse(); }
+            }
+            Icon {
+                x: 13px;
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
+                source: @image-url("../../assets/icons/chevron-down.svg");
+                tint: Theme.text;
+                transform-rotation: sub.collapsed ? -90deg : 0deg;
+                animate transform-rotation { duration: 160ms; }
+            }
+            Text {
+                x: 40px;
+                width: parent.width - 40px - 150px;
+                y: (parent.height - self.height) / 2;
+                text: sub.name;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 600;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            // Action buttons, right aligned (36px slots).
+            Icon {
+                x: parent.width - 108px + 9px;
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                source: @image-url("../../assets/icons/pin.svg");
+                tint: sub.pinned ? Theme.accent : Theme.muted;
+            }
+            TouchArea {
+                x: parent.width - 108px;
+                width: 36px;
+                height: parent.height;
+                mouse-cursor: pointer;
+                clicked => { root.toggle-pin(); }
+            }
+            Icon {
+                x: parent.width - 72px + 9px;
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                source: @image-url("../../assets/icons/refresh.svg");
+                tint: Theme.muted;
+                transform-rotation: sub.updating ? 360deg : 0deg;
+                animate transform-rotation { duration: 900ms; iteration-count: -1; easing: linear; }
+            }
+            TouchArea {
+                x: parent.width - 72px;
+                width: 36px;
+                height: parent.height;
+                mouse-cursor: pointer;
+                clicked => { root.refresh(); }
+            }
+            Icon {
+                x: parent.width - 36px + 9px;
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                source: @image-url("../../assets/icons/settings.svg");
+                tint: Theme.muted;
+            }
+            TouchArea {
+                x: parent.width - 36px;
+                width: 36px;
+                height: parent.height;
+                mouse-cursor: pointer;
+                clicked => { root.settings(); }
+            }
+            if edit-mode : Icon {
+                x: parent.width - 144px + 9px;
+                y: (parent.height - self.height) / 2;
+                width: 18px;
+                height: 18px;
+                source: @image-url("../../assets/icons/trash.svg");
+                tint: Theme.danger;
+            }
+            if edit-mode : TouchArea {
+                x: parent.width - 144px;
+                width: 36px;
+                height: parent.height;
+                mouse-cursor: pointer;
+                clicked => { root.delete-sub(); }
+            }
+        }
+
+        // Traffic bar.
+        if sub.has-traffic : Rectangle {
+            height: 42px;
+            background: Theme.card-body;
+
+            Icon {
+                x: 14px;
+                y: 12px;
+                width: 15px;
+                height: 15px;
+                source: @image-url("../../assets/icons/info.svg");
+                tint: Theme.muted;
+            }
+            Text {
+                x: 37px;
+                y: 11px;
+                text: sub.traffic-text;
+                color: Theme.text;
+                font-size: 12px;
+            }
+            Text {
+                x: parent.width - 150px;
+                y: 11px;
+                width: 136px;
+                text: sub.expire-text;
+                color: Theme.muted;
+                font-size: 12px;
+                horizontal-alignment: right;
+            }
+            Rectangle {
+                x: 14px;
+                y: 32px;
+                width: parent.width - 28px;
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.track;
+                Rectangle {
+                    width: min(parent.width * sub.traffic-fraction, parent.width);
+                    height: parent.height;
+                    border-radius: 2px;
+                    background: Theme.accent;
+                }
+            }
+        }
+
+        // Announce / error text.
+        if sub.announce != "" : HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+            Text {
+                text: sub.announce;
+                color: Theme.muted;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+        if sub.error != "" : HorizontalLayout {
+            padding-left: 16px;
+            padding-right: 16px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+            Text {
+                text: sub.error;
+                color: Theme.danger;
+                font-size: 11px;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+        }
+
+        // Servers.
+        if !sub.collapsed : VerticalLayout {
+            padding: 0px;
+            spacing: 0px;
+            for s in sub.servers : ServerRow {
+                item: s;
+                edit-mode: root.edit-mode;
+                clicked => { root.select-server(s.id); }
+                open => { root.open-server(s.id); }
+                delete-clicked => { root.delete-server(s.id); }
+            }
+        }
+
+        Rectangle { height: 4px; background: transparent; }
+    }
+}
