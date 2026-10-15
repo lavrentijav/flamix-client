@@ -1,0 +1,22 @@
+# deps / build
+node_modules/
+dist/
+build/
+target/
+*.o
+*.out
+# python
+__pycache__/
+.venv/
+venv/
+*.pyc
+# env / secrets
+.env
+.env.*
+!.env.example
+# os / editor
+.DS_Store
+*.swp
+# logs / tmp
+*.log
+tmp/
