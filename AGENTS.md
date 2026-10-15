@@ -35,3 +35,9 @@ and then apply the same formatting by hand — the remote copy is not synced bac
 ## Git
 - Work in your own worktree/branch: `git -C /srv/dev/projects/flamix-client worktree add /srv/dev/projects/flamix-client-wt/<id> -b oc/<id>`.
 - Local commits with meaningful messages. Never push, never merge, never touch other branches.
+
+## How to work (important for opencode agents)
+- Reasoning per turn is capped (~32k tokens); a turn that only thinks is cut off with NO output.
+  Never plan a whole module in your head: write one file / one function group per step, test, continue.
+- Run `scripts/ru1` checks after every couple of files, not only at the end.
+- You cannot view images; visual review is done by the lead.
