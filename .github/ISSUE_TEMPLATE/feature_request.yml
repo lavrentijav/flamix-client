@@ -1,0 +1,57 @@
+name: Предложение
+description: Предложить новую функцию или улучшение для Flamix
+title: "[Идея]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за идею! Опишите, какую задачу она решает и как вы это видите.
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Я искал похожее предложение и не нашёл его.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Какую проблему это решает
+      placeholder: Мне неудобно/не хватает …
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Предлагаемое решение
+      description: Опишите желаемое поведение или интерфейс.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Альтернативы
+      description: Какие ещё варианты вы рассматривали и почему они хуже.
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Область
+      options:
+        - Протоколы и ядра
+        - Подписки
+        - Маршрутизация
+        - Интерфейс
+        - Упаковка и установка
+        - Другое
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: Дополнительный контекст
+      description: Ссылки на аналоги в других клиентах, примеры, скриншоты.
+    validations:
+      required: false
