@@ -4,8 +4,10 @@
 # Team helper: run builds on the shared build server. This script:
 #   1. rsyncs the tracked + untracked-not-ignored files of the current git checkout
 #      (works from any worktree) to builder@ru1:wt/flamix/<checkout-name>/
-#   2. runs the command there under a remote flock, with a shared CARGO_TARGET_DIR
-#      (~/flamix-target), so parallel agents queue instead of exhausting RAM.
+#   2. runs the command there under ONE remote flock (parallel agents queue instead of exhausting
+#      RAM), with a target dir PER CHECKOUT (~/flamix-target/<checkout-name>): worktrees of one
+#      workspace produce identically named artifacts, and rsync keeps old mtimes, so a shared
+#      target dir makes cargo run another worktree's stale binaries.
 #
 # Examples:
 #   scripts/ru1 cargo test -p flamix-core
@@ -36,9 +38,9 @@ echo "ru1: [$NAME/$REL] $*" >&2
 set +e
 $SSH "$BUSER@$ADDR" "export PATH=\$HOME/.cargo/bin:\$HOME/flamix-tools/bin:\$PATH; \
   [ -f \$HOME/flamix-tools/env.sh ] && . \$HOME/flamix-tools/env.sh; \
-  export CARGO_TARGET_DIR=\$HOME/flamix-target CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0; \
+  export CARGO_TARGET_DIR=\$HOME/flamix-target/$NAME CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0; \
   mkdir -p \$CARGO_TARGET_DIR; cd $DEST/$REL && \
-  flock \$CARGO_TARGET_DIR/.flamix-lock sh -c 'exec \"\$@\"' sh $ARGS"
+  flock \$HOME/flamix-target/.flamix-lock sh -c 'exec \"\$@\"' sh $ARGS"
 RC=$?
 set -e
 if [ -n "$FLAMIX_FETCH" ]; then
