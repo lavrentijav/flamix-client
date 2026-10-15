@@ -52,6 +52,15 @@ brings the features of Happ, v2RayTun and v2rayN into one application.
 - Per-subscription traffic bar, per-server traffic bar, statistics page
 - Tray, autostart, light/dark theme, RU/EN UI
 
+**Backup servers and multi-traffic (planned)**
+- A primary server plus an ordered list of backups kept warm.
+- New connections switch instantly when the primary dies; during the switch the client "freezes" instead of
+  failing (apps see a slow connect, not an error).
+- Seamless UDP/QUIC when backups share the same exit IP (the flow survives the switch).
+- Load-balance mode and per-routing-rule server choice.
+- To be honest: existing TCP connections cannot be migrated to another server — the app reconnects by itself.
+- Design and details — in [docs/failover.md](docs/failover.md).
+
 ## Comparison
 
 | Feature | Flamix | Happ | v2RayTun | v2rayN |
@@ -61,6 +70,7 @@ brings the features of Happ, v2RayTun and v2rayN into one application.
 | TUN mode | ✅ | ✅ | ? | ✅ |
 | Backup subscription URLs | ✅ | ? | ? | ? |
 | Per-server traffic | ✅ | ? | ? | ? |
+| Backup servers and multi-traffic | 🚧 | ? | ? | ? |
 | Xray-core | ✅ | ✅ | ✅ | ✅ |
 | sing-box | ✅ | ? | ? | ✅ |
 | Understands other clients' deep links | ✅ | ? | ? | ? |
@@ -129,6 +139,7 @@ scripts/             # build/packaging scripts (scripts/ru1 — build on the ser
 - [ ] 🚧 OS integration: system proxy, core processes, elevation, autostart — in progress
 - [ ] 🚧 Slint main window, themes, RU/EN — in progress
 - [ ] 🚧 Packaging and CI: deb, rpm, PKGBUILD, AppImage, tar.gz, Windows installer, macOS `.dmg` — in progress
+- [ ] Backup servers and multi-traffic — planned ([docs/failover.md](docs/failover.md))
 - [ ] Android — planned
 - [ ] iOS — planned
 
