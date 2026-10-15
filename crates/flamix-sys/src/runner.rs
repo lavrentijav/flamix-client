@@ -1,4 +1,10 @@
 //! External core processes (xray / sing-box). OWNER: task T05.
+//!
+//! A normal core is a direct child process. An **elevated** core (TUN) is different: it runs as
+//! root, so the app cannot signal it. It is therefore launched through a tiny root-owned POSIX
+//! watchdog script which holds the core, watches the app pid and a stop file, and tears the core
+//! down when either disappears. This keeps `stop()` working without a second password prompt and
+//! cleans up even if the app crashes.
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
@@ -13,6 +19,16 @@ pub type LogBuffer = Arc<Mutex<VecDeque<String>>>;
 
 /// Number of log lines kept (per task T05).
 const LOG_CAP: usize = 500;
+
+/// Stop-request file for elevated cores (inside the user-owned work dir).
+const STOP_FILE: &str = "stop";
+
+/// How long `stop` waits for the root watchdog to tear its core down.
+const ELEVATED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the app waits for a freshly launched elevated core to report its pid.
+/// Generous because the polkit password prompt is interactive.
+const ELEVATED_PID_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -89,11 +105,28 @@ struct Proc {
 
 enum Handle {
     Child(tokio::process::Child),
-    /// Elevated core started detached by macOS `osascript`; tracked through its pid.
-    #[allow(dead_code)]
-    Pid {
-        pid: u32,
-    },
+    #[cfg(unix)]
+    Elevated(Elevated),
+}
+
+/// An elevated core managed by a root watchdog script. Tracked through its pid file and torn down
+/// by writing `<work_dir>/stop`.
+#[cfg(unix)]
+struct Elevated {
+    pid: u32,
+    name: String,
+    work_dir: PathBuf,
+}
+
+#[cfg(unix)]
+impl Elevated {
+    fn pid_file(&self) -> PathBuf {
+        self.work_dir.join(format!("{}.pid", self.name))
+    }
+
+    fn stop_file(&self) -> PathBuf {
+        self.work_dir.join(STOP_FILE)
+    }
 }
 
 impl Running {
@@ -129,6 +162,8 @@ impl Running {
 /// process exits within 1.5 s (error carries its last log lines).
 pub async fn start(plans: &[CorePlan], work_dir: &Path) -> crate::Result<Running> {
     tokio::fs::create_dir_all(work_dir).await?;
+    // A stop file left over from a previous run must not kill the new core immediately.
+    let _ = tokio::fs::remove_file(work_dir.join(STOP_FILE)).await;
 
     let log: LogBuffer = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_CAP)));
     let mut ordered: Vec<&CorePlan> = plans.iter().collect();
@@ -243,6 +278,128 @@ async fn spawn_command(
     })
 }
 
+// --- elevated launch helpers -------------------------------------------------
+
+/// Quote a string for safe use as one `/bin/sh` word (POSIX single-quote form).
+#[cfg(unix)]
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The body of the root watchdog script. `core_cmd`, `log`, `pid` and `stop` must already be
+/// shell-quoted. The app pid is passed as `$1`.
+#[cfg(unix)]
+fn watchdog_script_body(core_cmd: &str, log: &str, pid: &str, stop: &str) -> String {
+    format!(
+        "app_pid=$1\n\
+         {core_cmd} > {log} 2>&1 &\n\
+         core_pid=$!\n\
+         printf '%s\\n' \"$core_pid\" > {pid}\n\
+         while kill -0 \"$app_pid\" 2>/dev/null && [ ! -e {stop} ] && kill -0 \"$core_pid\" 2>/dev/null; do\n\
+         \tsleep 0.3\n\
+         done\n\
+         kill \"$core_pid\" 2>/dev/null\n\
+         n=0\n\
+         while kill -0 \"$core_pid\" 2>/dev/null; do\n\
+         \tn=$((n+1))\n\
+         \tif [ \"$n\" -ge 10 ]; then kill -9 \"$core_pid\" 2>/dev/null; break; fi\n\
+         \tsleep 0.3\n\
+         done\n\
+         rm -f {stop}\n"
+    )
+}
+
+/// Build the POSIX `/bin/sh` watchdog script used to launch an elevated core. The script starts
+/// the core in the background, writes its pid to `<work_dir>/<core>.pid`, redirects its output to
+/// `<work_dir>/<core>.log`, then loops until the app pid (`$1`) is gone, `<work_dir>/stop`
+/// appears, or the core exits, and finally kills the core (TERM then KILL after 3 s).
+///
+/// Exposed so tests can run it directly without `pkexec`/`osascript`.
+#[cfg(unix)]
+pub fn elevated_watchdog_script(
+    core: CoreKind,
+    binary: &Path,
+    config_path: &Path,
+    work_dir: &Path,
+) -> String {
+    let name = core.binary_name();
+    let mut parts = vec![shell_quote(&binary.to_string_lossy())];
+    for arg in core_args(core, config_path, work_dir) {
+        parts.push(shell_quote(&arg.to_string_lossy()));
+    }
+    let core_cmd = parts.join(" ");
+    let log = shell_quote(&work_dir.join(format!("{name}.log")).to_string_lossy());
+    let pid = shell_quote(&work_dir.join(format!("{name}.pid")).to_string_lossy());
+    let stop = shell_quote(&work_dir.join(STOP_FILE).to_string_lossy());
+    watchdog_script_body(&core_cmd, &log, &pid, &stop)
+}
+
+/// Wait until the watchdog has written `<path>`, returning the core pid.
+#[cfg(unix)]
+async fn wait_pid_file(path: &Path, timeout: Duration) -> crate::Result<u32> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(text) = tokio::fs::read_to_string(path).await {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                if pid > 0 {
+                    return Ok(pid);
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(crate::Error::Command(
+                "elevation was cancelled or the core did not start".to_string(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Is `pid` alive? Uses `kill -0`: success or EPERM ("Operation not permitted", i.e. a root
+/// process we cannot signal) both mean "still running"; "No such process" means gone.
+#[cfg(unix)]
+fn pid_alive_privileged(pid: u32) -> bool {
+    let Ok(out) = std::process::Command::new("kill")
+        .env("LC_ALL", "C")
+        .args(["-0", &pid.to_string()])
+        .output()
+    else {
+        return false;
+    };
+    if out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stderr).contains("not permitted")
+}
+
+/// Ask the root watchdog to tear its core down by creating the stop file, then wait until the
+/// core pid is gone (up to [`ELEVATED_STOP_TIMEOUT`]).
+#[cfg(unix)]
+async fn elevated_stop(e: &Elevated) -> crate::Result<()> {
+    tokio::fs::write(e.stop_file(), b"").await?;
+    let deadline = tokio::time::Instant::now() + ELEVATED_STOP_TIMEOUT;
+    while pid_alive_privileged(e.pid) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "elevated core {} did not stop within {:?}",
+                e.pid,
+                ELEVATED_STOP_TIMEOUT
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let _ = tokio::fs::remove_file(e.pid_file()).await;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(cmd: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(cmd).is_file()))
+        .unwrap_or(false)
+}
+
 #[cfg(target_os = "linux")]
 async fn spawn_elevated(
     plan: &CorePlan,
@@ -252,13 +409,57 @@ async fn spawn_elevated(
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
+    // Already root or the binary carries the capability: run it directly.
     if crate::elevation::is_elevated() || has_cap_net_admin(binary) {
         let args = core_args(plan.core, config_path, work_dir);
         return spawn_command(binary.as_os_str(), &args, log, tasks).await;
     }
-    let mut args: Vec<OsString> = vec![binary.as_os_str().to_os_string()];
-    args.extend(core_args(plan.core, config_path, work_dir));
-    spawn_command(OsStr::new("pkexec"), &args, log, tasks).await
+    if !command_exists("pkexec") {
+        return Err(crate::Error::Command(format!(
+            "pkexec not found: install polkit, or grant the core the needed capabilities with \
+             'sudo setcap cap_net_admin,cap_net_bind_service+ep {}'",
+            binary.display()
+        )));
+    }
+
+    let name = plan.core.binary_name().to_string();
+    let pid_path = work_dir.join(format!("{name}.pid"));
+    let log_path = work_dir.join(format!("{name}.log"));
+    let _ = tokio::fs::remove_file(&pid_path).await;
+
+    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir);
+    let app_pid = std::process::id().to_string();
+    let mut cmd = tokio::process::Command::new("pkexec");
+    cmd.arg("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .arg("flamix")
+        .arg(&app_pid)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| crate::Error::Command(format!("failed to start pkexec: {e}")))?;
+    if let Some(stdout) = child.stdout.take() {
+        tasks.push(spawn_reader(stdout, log.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        tasks.push(spawn_reader(stderr, log.clone()));
+    }
+    // Keep the launcher reaped, but never signal it: the watchdog must survive the app.
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+
+    let pid = wait_pid_file(&pid_path, ELEVATED_PID_TIMEOUT).await?;
+    tasks.push(spawn_tailer(log_path, log.clone()));
+    Ok(Proc {
+        handle: Handle::Elevated(Elevated {
+            pid,
+            name,
+            work_dir: work_dir.to_path_buf(),
+        }),
+    })
 }
 
 /// Best-effort check: does `getcap <binary>` report `cap_net_admin`?
@@ -279,27 +480,24 @@ async fn spawn_elevated(
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
-    let name = plan.core.binary_name();
-    let pid_file = work_dir.join(format!("{name}.pid"));
-    let log_file = work_dir.join(format!("{name}.log"));
-    let _ = std::fs::remove_file(&pid_file);
+    let name = plan.core.binary_name().to_string();
+    let pid_path = work_dir.join(format!("{name}.pid"));
+    let log_path = work_dir.join(format!("{name}.log"));
+    let _ = tokio::fs::remove_file(&pid_path).await;
 
-    let mut command = shell_quote(&binary.to_string_lossy());
-    for arg in core_args(plan.core, config_path, work_dir) {
-        command.push(' ');
-        command.push_str(&shell_quote(&arg.to_string_lossy()));
-    }
+    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir);
+    let app_pid = std::process::id().to_string();
     let shell = format!(
-        "{command} > {log} 2>&1 & echo $! > {pid}",
-        log = shell_quote(&log_file.to_string_lossy()),
-        pid = shell_quote(&pid_file.to_string_lossy())
+        "/bin/sh -c {} flamix {} &> /dev/null &",
+        shell_quote(&script),
+        app_pid
     );
-    let script = format!(
+    let osa = format!(
         "do shell script \"{}\" with administrator privileges",
         applescript_escape(&shell)
     );
     let status = tokio::process::Command::new("osascript")
-        .args(["-e", &script])
+        .args(["-e", &osa])
         .status()
         .await?;
     if !status.success() {
@@ -307,10 +505,15 @@ async fn spawn_elevated(
             "osascript elevation was cancelled or failed".to_string(),
         ));
     }
-    let pid = read_pid(&pid_file).await?;
-    tasks.push(spawn_tailer(log_file, log.clone()));
+
+    let pid = wait_pid_file(&pid_path, ELEVATED_PID_TIMEOUT).await?;
+    tasks.push(spawn_tailer(log_path, log.clone()));
     Ok(Proc {
-        handle: Handle::Pid { pid },
+        handle: Handle::Elevated(Elevated {
+            pid,
+            name,
+            work_dir: work_dir.to_path_buf(),
+        }),
     })
 }
 
@@ -359,7 +562,7 @@ where
 }
 
 /// Tail `<path>` for lines appended by an elevated, detached core.
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn spawn_tailer(path: PathBuf, log: LogBuffer) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut seen = 0usize;
@@ -391,7 +594,8 @@ fn push_line(log: &LogBuffer, line: String) {
 fn handle_alive(handle: &mut Handle) -> bool {
     match handle {
         Handle::Child(child) => matches!(child.try_wait(), Ok(None)),
-        Handle::Pid { pid } => pid_alive(*pid),
+        #[cfg(unix)]
+        Handle::Elevated(e) => pid_alive_privileged(e.pid),
     }
 }
 
@@ -411,13 +615,8 @@ async fn stop_handle(handle: &mut Handle) -> crate::Result<()> {
             let _ = child.wait().await;
             Ok(())
         }
-        Handle::Pid { pid } => {
-            let _ = kill_pid_elevated(*pid, false).await;
-            if !wait_pid_gone(*pid, Duration::from_secs(3)).await {
-                let _ = kill_pid_elevated(*pid, true).await;
-            }
-            Ok(())
-        }
+        #[cfg(unix)]
+        Handle::Elevated(e) => elevated_stop(e).await,
     }
 }
 
@@ -433,78 +632,6 @@ async fn wait_exit(child: &mut tokio::process::Child, timeout: Duration) -> bool
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        true
-    }
-}
-
-async fn wait_pid_gone(pid: u32, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-    loop {
-        if !pid_alive(pid) {
-            return true;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-#[cfg(target_os = "macos")]
-async fn kill_pid_elevated(pid: u32, force: bool) -> crate::Result<()> {
-    let command = if force {
-        format!("kill -9 {pid}")
-    } else {
-        format!("kill {pid}")
-    };
-    let script = format!("do shell script \"{command}\" with administrator privileges");
-    tokio::process::Command::new("osascript")
-        .args(["-e", &script])
-        .status()
-        .await?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn kill_pid_elevated(pid: u32, force: bool) -> crate::Result<()> {
-    let _ = (pid, force);
-    Err(crate::Error::Unsupported)
-}
-
-#[cfg(target_os = "macos")]
-async fn read_pid(path: &Path) -> crate::Result<u32> {
-    for _ in 0..20 {
-        if let Ok(text) = tokio::fs::read_to_string(path).await {
-            if let Ok(pid) = text.trim().parse() {
-                return Ok(pid);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    Err(crate::Error::Command(
-        "elevated core did not report a pid".to_string(),
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 #[cfg(target_os = "macos")]
@@ -561,5 +688,32 @@ mod tests {
         std::env::remove_var("FLAMIX_CORE_DIR");
         assert!(matches!(err, crate::Error::CoreNotFound(_)));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_quote_handles_spaces_and_quotes() {
+        assert_eq!(shell_quote("plain/path"), "'plain/path'");
+        assert_eq!(shell_quote("/tmp/a b/c"), "'/tmp/a b/c'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_script_quotes_paths_and_loops() {
+        let work = PathBuf::from("/tmp/fla mix/work'x");
+        let bin = PathBuf::from("/opt/x ray/sing-box");
+        let cfg = work.join("sing-box.json");
+        let script = elevated_watchdog_script(CoreKind::SingBox, &bin, &cfg, &work);
+
+        assert!(script.contains("app_pid=$1"));
+        assert!(script.contains("'/opt/x ray/sing-box'"));
+        assert!(script.contains(&shell_quote("/tmp/fla mix/work'x/sing-box.log")));
+        assert!(script.contains("kill -9"));
+        assert!(script.contains(&format!(
+            "rm -f {}",
+            shell_quote("/tmp/fla mix/work'x/stop")
+        )));
     }
 }
