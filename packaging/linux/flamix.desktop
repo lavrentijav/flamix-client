@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Flamix
+GenericName=VPN Client
+Comment=Cross-platform VPN client (Xray / sing-box)
+Comment[ru]=Кроссплатформенный VPN-клиент (Xray / sing-box)
+Exec=flamix %u
+Icon=flamix
+Terminal=false
+Categories=Network;Security;
+Keywords=vpn;proxy;xray;sing-box;
+MimeType=x-scheme-handler/flamix;
+StartupWMClass=flamix
