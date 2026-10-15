@@ -608,7 +608,9 @@ impl AppState {
     }
 
     pub fn selected(&self) -> Option<&Server> {
-        self.selected_server.as_deref().and_then(|id| self.server(id))
+        self.selected_server
+            .as_deref()
+            .and_then(|id| self.server(id))
     }
 }
 
