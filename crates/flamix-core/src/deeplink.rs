@@ -5,6 +5,7 @@
 //!   `clash://install-config?url=<url>`, `sing-box://import-remote-profile?url=<url>#name`
 //! - a bare `https://` subscription URL or a share link.
 
+use crate::provider_routing::{self, RoutingLinkAction};
 use crate::subscription::util::decode_b64_str;
 use percent_encoding::percent_decode_str;
 
@@ -15,6 +16,8 @@ pub enum Import {
     Subscription { url: String, name: Option<String> },
     /// One or more share links.
     Links(String),
+    /// A `happ://routing/...` provider routing change.
+    Routing(RoutingLinkAction),
 }
 
 /// Classify a deep link / pasted text. `None` if it is neither.
@@ -34,19 +37,35 @@ pub fn parse_import(text: &str) -> Option<Import> {
         return Some(Import::Links(text.to_string()));
     }
 
-    for scheme in ["flamix", "happ", "v2raytun"] {
-        if let Some(rest) = strip_scheme(text, scheme) {
-            return parse_action_link(rest);
-        }
+    if let Some(rest) = strip_scheme(text, "happ") {
+        return parse_happ(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "v2raytun") {
+        return parse_v2raytun(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "flamix") {
+        return parse_action_link(rest);
     }
     if let Some(rest) = strip_scheme(text, "v2rayng") {
-        return parse_v2rayng(rest);
+        return parse_url_param_link(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "hiddify") {
+        return parse_hiddify(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "v2rayn") {
+        return parse_url_param_link(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "v2ray") {
+        return parse_url_param_link(rest);
+    }
+    if let Some(rest) = strip_scheme(text, "clashmeta") {
+        return parse_url_param_link(rest);
     }
     if let Some(rest) = strip_scheme(text, "clash") {
-        return parse_query_link(rest);
+        return parse_url_param_link(rest);
     }
     if let Some(rest) = strip_scheme(text, "sing-box") {
-        return parse_singbox(rest);
+        return parse_url_param_link(rest);
     }
 
     if is_share_link(text) {
@@ -77,36 +96,72 @@ fn parse_action_link(rest: &str) -> Option<Import> {
     classify_payload(&payload)
 }
 
-/// `v2rayng://install-sub?url=..&name=..`
-fn parse_v2rayng(rest: &str) -> Option<Import> {
-    let params = query_params(rest);
-    let url = find_param(&params, "url")?;
-    let name = find_param(&params, "name").filter(|n| !n.is_empty());
+/// `happ://add/..`, `happ://routing/...` and the unsupported `happ://crypt*` links.
+fn parse_happ(rest: &str) -> Option<Import> {
+    let action = rest.split_once('/').map(|(a, _)| a).unwrap_or(rest);
+    if action.eq_ignore_ascii_case("routing") {
+        return provider_routing::from_happ_link(&format!("happ://{rest}"))
+            .ok()
+            .map(Import::Routing);
+    }
+    if action.eq_ignore_ascii_case("crypt4") || action.eq_ignore_ascii_case("crypt5") {
+        tracing::info!(
+            action,
+            "encrypted Happ link is not supported (proprietary key)"
+        );
+        return None;
+    }
+    parse_action_link(rest)
+}
+
+/// `v2raytun://import/..` and the unsupported `v2raytun://crypt/..` links.
+fn parse_v2raytun(rest: &str) -> Option<Import> {
+    let action = rest.split_once('/').map(|(a, _)| a).unwrap_or(rest);
+    if action.eq_ignore_ascii_case("crypt") {
+        tracing::info!("encrypted v2RayTun link is not supported (proprietary key)");
+        return None;
+    }
+    parse_action_link(rest)
+}
+
+/// `hiddify://install-config?url=..&name=..#name` and the path form `hiddify://<url>#<name>`.
+fn parse_hiddify(rest: &str) -> Option<Import> {
+    if rest.contains("url=") {
+        return parse_url_param_link(rest);
+    }
+    let (url_part, fragment) = split_fragment(rest);
+    let url = percent_decode(url_part);
+    let name = fragment;
     match classify_url(&url) {
         Some(Import::Subscription { url, .. }) => Some(Import::Subscription { url, name }),
         other => other,
     }
 }
 
-/// `clash://install-config?url=..`
-fn parse_query_link(rest: &str) -> Option<Import> {
-    let params = query_params(rest);
+/// `<scheme>://...?url=<url>&name=<name>#<name>` used by v2rayng, v2rayN, clash(clashmeta),
+/// hiddify and sing-box. The name may come from `name=` or the URL fragment.
+fn parse_url_param_link(rest: &str) -> Option<Import> {
+    let (before, fragment) = split_fragment(rest);
+    let params = query_params(before);
     let url = find_param(&params, "url")?;
-    classify_url(&url)
-}
-
-/// `sing-box://import-remote-profile?url=..#name`
-fn parse_singbox(rest: &str) -> Option<Import> {
-    let (before_fragment, fragment) = match rest.split_once('#') {
-        Some((head, fragment)) => (head, Some(fragment)),
-        None => (rest, None),
-    };
-    let params = query_params(before_fragment);
-    let url = find_param(&params, "url")?;
-    let name = fragment.map(percent_decode).filter(|name| !name.is_empty());
+    let name = find_param(&params, "name")
+        .filter(|n| !n.is_empty())
+        .or(fragment);
     match classify_url(&url) {
         Some(Import::Subscription { url, .. }) => Some(Import::Subscription { url, name }),
         other => other,
+    }
+}
+
+/// Split off a percent-decoded `#fragment`, treating an empty fragment as absent.
+fn split_fragment(text: &str) -> (&str, Option<String>) {
+    match text.split_once('#') {
+        Some((head, fragment)) => {
+            let name = percent_decode(fragment);
+            let trimmed = name.trim();
+            (head, (!trimmed.is_empty()).then(|| trimmed.to_string()))
+        }
+        None => (text, None),
     }
 }
 
@@ -325,5 +380,79 @@ mod tests {
     #[test]
     fn rejects_unknown() {
         assert_eq!(parse_import("not a link at all"), None);
+    }
+
+    #[test]
+    fn happ_routing_links() {
+        use crate::provider_routing::RoutingLinkAction;
+        let profile = r#"{"Name":"P","ProxySites":["geosite:google"]}"#;
+        let link = format!("happ://routing/add/{}", b64(profile));
+        match parse_import(&link) {
+            Some(Import::Routing(RoutingLinkAction::Add(r))) => assert_eq!(r.name, "P"),
+            other => panic!("expected Add, got {other:?}"),
+        }
+        let link = format!("happ://routing/onadd/{}", b64(profile));
+        assert!(matches!(
+            parse_import(&link),
+            Some(Import::Routing(RoutingLinkAction::AddAndActivate(_)))
+        ));
+        assert_eq!(
+            parse_import("happ://routing/off"),
+            Some(Import::Routing(RoutingLinkAction::Off))
+        );
+    }
+
+    #[test]
+    fn encrypted_links_are_rejected() {
+        assert_eq!(parse_import("happ://crypt5/AbcDef"), None);
+        assert_eq!(parse_import("happ://crypt4/AbcDef"), None);
+        assert_eq!(parse_import("v2raytun://crypt/AbcDef"), None);
+    }
+
+    #[test]
+    fn v2rayng_install_config_fragment_name() {
+        assert_eq!(
+            parse_import("v2rayng://install-config?url=https%3A%2F%2Fexample.com%2Fsub#My%20Sub"),
+            Some(Import::Subscription {
+                url: "https://example.com/sub".to_string(),
+                name: Some("My Sub".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn hiddify_query_and_path_forms() {
+        assert_eq!(
+            parse_import("hiddify://install-config?url=https%3A%2F%2Fexample.com%2Fsub&name=Hid"),
+            Some(Import::Subscription {
+                url: "https://example.com/sub".to_string(),
+                name: Some("Hid".to_string()),
+            })
+        );
+        assert_eq!(
+            parse_import("hiddify://https://example.com/sub#Path%20Name"),
+            Some(Import::Subscription {
+                url: "https://example.com/sub".to_string(),
+                name: Some("Path Name".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn other_scheme_variants() {
+        for link in [
+            "v2ray://install-config?url=https://example.com/sub&name=V2Ray",
+            "v2rayn://install-config?url=https://example.com/sub&name=V2RayN",
+            "clashmeta://install-config?url=https://example.com/sub&name=Meta",
+        ] {
+            assert!(
+                matches!(
+                    parse_import(link),
+                    Some(Import::Subscription { ref url, ref name })
+                        if url == "https://example.com/sub" && name.is_some()
+                ),
+                "link {link}"
+            );
+        }
     }
 }

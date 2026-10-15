@@ -17,6 +17,7 @@ pub mod error;
 pub mod link;
 pub mod model;
 pub mod ping;
+pub mod provider_routing;
 pub mod store;
 pub mod subscription;
 
