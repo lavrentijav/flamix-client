@@ -340,6 +340,11 @@ pub struct Subscription {
     pub id: String,
     /// Name: user given, else `profile-title` header, else host of the URL.
     pub name: String,
+    /// Last name set automatically from the subscription (`profile-title` / `content-disposition`).
+    /// Lets [`subscription::update`](crate::subscription::update) refresh the name on later
+    /// fetches while keeping a name the user changed by hand.
+    #[serde(default)]
+    pub auto_title: Option<String>,
     /// Primary URL as entered by the user.
     pub url: String,
     /// Backup URLs (from the user and/or from subscription headers), tried in order when the
@@ -608,7 +613,9 @@ impl AppState {
     }
 
     pub fn selected(&self) -> Option<&Server> {
-        self.selected_server.as_deref().and_then(|id| self.server(id))
+        self.selected_server
+            .as_deref()
+            .and_then(|id| self.server(id))
     }
 }
 
