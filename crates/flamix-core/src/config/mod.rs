@@ -36,6 +36,17 @@ pub struct CorePlan {
     pub config: serde_json::Value,
     /// Needs admin/root (TUN).
     pub elevated: bool,
+    /// Stats endpoint: Xray gRPC API port (`xray api statsquery`) or sing-box clash_api port.
+    pub api_port: u16,
+}
+
+/// Port of the stats API for a core: Xray = `socks_port + 10`, sing-box = `socks_port + 11`.
+pub fn api_port(kind: CoreKind, settings: &Settings) -> u16 {
+    let off = match kind {
+        CoreKind::Xray => 10,
+        CoreKind::SingBox => 11,
+    };
+    settings.socks_port.saturating_add(off)
 }
 
 /// Cores that can run `server` as an outbound.
