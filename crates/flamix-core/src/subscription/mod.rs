@@ -23,6 +23,17 @@ pub struct SubscriptionMeta {
     pub server_userinfo: HashMap<String, TrafficInfo>,
 }
 
+/// Request options for [`update`].
+#[derive(Debug, Clone, Default)]
+pub struct FetchOptions {
+    /// Optional local proxy URL to fetch through, e.g. "socks5h://127.0.0.1:10808".
+    pub proxy: Option<String>,
+    /// Stable device id sent as `x-hwid` (see docs/subscription-headers.md).
+    pub hwid: Option<String>,
+    /// Request timeout per URL attempt; `None` = 20 s.
+    pub timeout: Option<std::time::Duration>,
+}
+
 /// Parse a `subscription-userinfo` style value: `upload=1; download=2; total=3; expire=4`.
 pub fn parse_userinfo(value: &str) -> Option<TrafficInfo> {
     let _ = value;
@@ -46,8 +57,7 @@ pub fn decode_body(body: &str) -> Result<String> {
 /// answers 2xx with a non-empty server list) and update it in place: servers (keeping
 /// `last_ping_ms` / `local_traffic` of servers whose id did not change), meta, `last_update`,
 /// `last_error`, `last_working_url`. New backup URLs from headers are merged in (deduplicated).
-/// `proxy` = optional local proxy URL (e.g. "socks5h://127.0.0.1:10808") to fetch through.
-pub async fn update(sub: &mut Subscription, proxy: Option<&str>) -> Result<()> {
-    let _ = (sub, proxy);
+pub async fn update(sub: &mut Subscription, opts: &FetchOptions) -> Result<()> {
+    let _ = (sub, opts);
     todo!("T02")
 }
