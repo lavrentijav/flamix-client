@@ -20,3 +20,6 @@ venv/
 # logs / tmp
 *.log
 tmp/
+# flamix
+/dist/
+/cores/
