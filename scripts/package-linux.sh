@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # Build Linux release packages for the current architecture:
-#   dist/flamix_<ver>_<debarch>.deb        (cargo-deb)
-#   dist/flamix-<ver>-1.<rpmarch>.rpm      (cargo-generate-rpm)
+#   dist/flamix_<ver>_<debarch>.deb        (cargo-deb, optional)
+#   dist/flamix-<ver>-1.<rpmarch>.rpm      (cargo-generate-rpm, optional)
 #   dist/flamix-<ver>-linux-<arch>.tar.gz
 #   dist/flamix-<ver>-linux-<arch>.AppImage
 #   dist/PKGBUILD                          (x86_64 only, from packaging/arch/PKGBUILD.in)
 #
-# Used both by CI (.github/workflows/release.yml) and manually on ru1:
-#   FLAMIX_FETCH=dist scripts/ru1 scripts/package-linux.sh
+# Runs on any Linux machine (including CI); it only needs a Rust toolchain and
+# the Slint system dependencies — see docs/build.md. `.deb`/`.rpm` additionally
+# need cargo-deb / cargo-generate-rpm, the AppImage needs curl:
 #
-# Requires cargo-deb and cargo-generate-rpm in PATH:
 #   cargo install --locked cargo-deb cargo-generate-rpm
+#   scripts/package-linux.sh
+#
+# Environment overrides:
+#   FLAMIX_CORES_DIR    use pre-downloaded cores instead of running fetch-cores.sh
+#   FLAMIX_DOWNLOAD_URL URL of the tar.gz referenced by the generated PKGBUILD
+#   FLAMIX_TOOLS        directory to cache appimagetool (default: ~/.cache/flamix)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -35,18 +41,20 @@ STAGE="$DIST/linux-staging"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/cores" "$STAGE/icons"
 
-# Slint's font backend links libfontconfig on Linux. Some build hosts (e.g. the
-# ru1 builder, which has no sudo) lack the -dev package; stage it into a private
-# prefix in that case. CI installs libfontconfig1-dev, so this is a no-op there.
+# Slint links libfontconfig on Linux. Prefer the system dev package (see
+# docs/build.md); on Debian/Ubuntu without sudo we can stage it into a private
+# prefix as a best-effort fallback. Anything else is a clear actionable error.
 setup_fontconfig() {
     if pkg-config --exists fontconfig 2>/dev/null; then
         return 0
     fi
     if ! command -v apt-get >/dev/null 2>&1 || ! command -v dpkg-deb >/dev/null 2>&1; then
-        echo "error: fontconfig development files not found and cannot be staged" >&2
+        echo "error: fontconfig development files not found." >&2
+        echo "Install the Slint system dependencies first (see docs/build.md), e.g." >&2
+        echo "  sudo apt install libfontconfig1-dev pkg-config" >&2
         exit 1
     fi
-    echo "--- staging libfontconfig-dev into a private prefix ---"
+    echo "--- fontconfig dev files missing; staging libfontconfig-dev into a private prefix ---"
     local root="${FLAMIX_SYSROOT:-$HOME/.cache/flamix-sysroot}"
     local prefix="$root/usr"
     mkdir -p "$root/debs" "$prefix" "$root/pc"
@@ -129,7 +137,7 @@ fi
 
 # --- AppImage ----------------------------------------------------------------
 echo "--- AppImage ---"
-TOOLS="${FLAMIX_TOOLS:-$HOME/flamix-tools}"
+TOOLS="${FLAMIX_TOOLS:-${XDG_CACHE_HOME:-$HOME/.cache}/flamix}"
 mkdir -p "$TOOLS"
 APPIMAGETOOL="$TOOLS/appimagetool-${AIT_ARCH}.AppImage"
 if [ ! -x "$APPIMAGETOOL" ]; then

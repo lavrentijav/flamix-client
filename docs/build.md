@@ -1,41 +1,97 @@
 # Сборка Flamix / Building Flamix
 
-## Разработка
+Flamix — обычный Cargo-workspace. Нужен стабильный Rust (edition 2021,
+`rust-version = 1.85`) и системные библиотеки, которые использует Slint/winit.
 
-Вся компиляция, тесты и clippy идут на сервере ru1 через `scripts/ru1` (не локально):
+## 1. Инструменты
 
-    scripts/ru1 cargo build --release
-    scripts/ru1 cargo test --workspace
-    scripts/ru1 cargo clippy --workspace --all-targets -- -D warnings
-    scripts/ru1 cargo fmt --all --check
+- Rust через [rustup](https://rustup.rs/):
 
-## Релизные пакеты
+      rustup toolchain install stable
+      rustup component add rustfmt clippy
 
-Релизные пакеты собирает CI: `.github/workflows/release.yml` по тегу `v*` или вручную
-(`workflow_dispatch`):
+- Системные зависимости:
 
-- Linux: `flamix_<ver>_<arch>.deb` (cargo-deb), `flamix-<ver>-1.<arch>.rpm`
-  (cargo-generate-rpm), `flamix-<ver>-linux-<arch>.tar.gz`, `flamix-<ver>-linux-<arch>.AppImage`
-  и `PKGBUILD` для Arch (генерируется из `packaging/arch/PKGBUILD.in` с sha256 tarball'а);
-- Windows: портативный `.zip` и установщик Inno Setup (`packaging/windows/flamix.iss`);
-- macOS: universal `.app` + `.dmg`.
+  **Debian / Ubuntu**
 
-Финальная job собирает артефакты в GitHub Release и добавляет `SHA256SUMS.txt`.
+      sudo apt install pkg-config \
+        libxkbcommon-dev libfontconfig1-dev libwayland-dev libx11-dev \
+        libxcursor-dev libxrandr-dev libxi-dev libgl1-mesa-dev
 
-## Локальная (ru1) проверка упаковки
+  **Fedora / RHEL**
 
-Linux-упаковку можно повторить вручную на ru1 — тем же скриптом, что использует CI:
+      sudo dnf install pkgconf-pkg-config fontconfig-devel libxkbcommon-devel \
+        wayland-devel libX11-devel libXcursor-devel libXrandr-devel libXi-devel mesa-libGL-devel
+
+  **Arch**
+
+      sudo pacman -S base-devel pkgconf fontconfig libxkbcommon wayland libx11 \
+        libxcursor libxrandr libxi mesa
+
+  **macOS** — Xcode Command Line Tools (`xcode-select --install`).
+  **Windows** — MSVC-тулчейн (Visual Studio Build Tools, компонент «Desktop development with C++»).
+
+## 2. Сборка, тесты, линт
+
+Из корня репозитория:
+
+    cargo build --release -p flamix     # бинарник: target/release/flamix[.exe]
+    cargo test --workspace
+    cargo clippy --workspace --all-targets -- -D warnings
+    cargo fmt --all --check
+
+## 3. Ядра Xray-core / sing-box и geo-базы
+
+Приложению нужны `xray[.exe]`, `sing-box[.exe]`, `geoip.dat`, `geosite.dat`.
+Кладём их рядом с бинарником (в подкаталог `cores/`):
+
+    scripts/fetch-cores.sh <os> <arch> <out-dir>
+    # os:   linux | macos | windows
+    # arch: amd64 | arm64
+    # пример:
+    scripts/fetch-cores.sh linux amd64 cores
+
+Скрипт скачивает пиннутые версии **Xray-core**, **sing-box** и geo-данных из
+**Loyalsoldier/v2ray-rules-dat**, проверяет SHA256 (там, где upstream публикует
+дайджесты) и кладёт файлы в `<out-dir>`. Версии закреплены переменными в начале скрипта.
+
+## 4. Упаковка
+
+Скрипты рассчитаны на запуск на любой машине соответствующей ОС (и используются CI —
+см. `.github/workflows/release.yml`).
+
+### Linux — `scripts/package-linux.sh`
+
+Собирает в `dist/`:
+
+- `flamix-<ver>-linux-<arch>.tar.gz` (portable, с ядрами);
+- `PKGBUILD` для Arch (x86_64; генерируется из `packaging/arch/PKGBUILD.in`);
+- `flamix_<ver>_<arch>.deb` — если установлен `cargo-deb`;
+- `flamix-<ver>-1.<arch>.rpm` — если установлен `cargo-generate-rpm`;
+- `flamix-<ver>-linux-<arch>.AppImage` — appimagetool скачивается автоматически.
 
     cargo install --locked cargo-deb cargo-generate-rpm
-    FLAMIX_FETCH=dist scripts/ru1 scripts/package-linux.sh
+    scripts/package-linux.sh
 
-Результат — в `dist/`: `.deb`, `.rpm`, `.tar.gz`, `.AppImage` и `PKGBUILD`
-(`dist/` в `.gitignore`).
+Результат — в `dist/` (не коммитится).
 
-## Ядра и geo-базы
+### macOS — `scripts/package-macos.sh`
 
-`scripts/fetch-cores.sh <linux|macos|windows> <amd64|arm64> <out-dir>` скачивает
-пиннутые версии **Xray-core**, **sing-box** и geo-базы из **Loyalsoldier/v2ray-rules-dat**,
-проверяет SHA256 (там, где upstream публикует дайджесты) и кладёт `xray[.exe]`,
-`sing-box[.exe]`, `geoip.dat`, `geosite.dat` в `<out-dir>`. Версии закреплены
-переменными в начале скрипта.
+Собирает universal-бинарник (`aarch64-apple-darwin` + `x86_64-apple-darwin` через `lipo`),
+кладывает ядра в `Flamix.app/Contents/Resources/cores/`, подписывает ad-hoc и делает `.dmg`:
+
+    rustup target add aarch64-apple-darwin x86_64-apple-darwin
+    scripts/package-macos.sh
+
+### Windows — `scripts/package-windows.sh`
+
+Делает портативный `.zip` и установщик Inno Setup (`packaging/windows/flamix.iss`).
+Нужны ImageMagick (иконка `.ico`) и Inno Setup 6; запускается из Git Bash:
+
+    scripts/package-windows.sh
+
+## 5. CI
+
+`.github/workflows/ci.yml` на push/PR в `main` гоняет `fmt`, `clippy` и тесты на Linux,
+плюс `cargo check -p flamix` на Windows и macOS. `.github/workflows/release.yml` по тегу `v*`
+(или вручную) собирает все пакеты и прикрепляет их вместе с `SHA256SUMS.txt` к GitHub Release.
