@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 /// User-Agent sent by default. Many panels (Marzban, Remnawave, 3x-ui) choose the
 /// response format by UA; this one makes them return plain/base64 share links.
-pub const DEFAULT_USER_AGENT: &str = concat!("Flamix/", env!("CARGO_PKG_VERSION"), " v2rayN/7.0 Happ/3.0");
+pub const DEFAULT_USER_AGENT: &str =
+    concat!("Flamix/", env!("CARGO_PKG_VERSION"), " v2rayN/7.0 Happ/3.0");
 
 /// Metadata extracted from response headers and from `#key: value` lines at the top of the body.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
