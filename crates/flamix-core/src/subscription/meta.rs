@@ -2,9 +2,32 @@
 
 use super::util::decode_b64_str;
 use super::SubscriptionMeta;
-use crate::model::TrafficInfo;
+use crate::model::{HwidStatus, InfoBanner, ProviderRouting, Timestamp, TrafficInfo};
+use crate::provider_routing::{self, RoutingLinkAction};
 use percent_encoding::percent_decode_str;
 use std::collections::HashMap;
+
+/// Happ app-management keys (not otherwise mapped) stored verbatim in `app_overrides`.
+const APP_OVERRIDE_KEYS: &[&str] = &[
+    "custom-tunnel-config",
+    "socks-auth-mode",
+    "socks-auth-user",
+    "socks-auth-password",
+    "http-auth-mode",
+    "http-auth-user",
+    "http-auth-password",
+    "tun-type",
+    "new-url",
+    "new-domain",
+];
+
+/// Response headers carrying HWID device-limit state (Remnawave / v2RayTun).
+const HWID_HEADERS: &[&str] = &[
+    "x-hwid-limit",
+    "x-hwid-active",
+    "x-hwid-max-devices-reached",
+    "x-hwid-not-supported",
+];
 
 /// Parse a `subscription-userinfo` style value: `upload=1; download=2; total=3; expire=4`.
 ///
@@ -123,7 +146,12 @@ fn apply_field(meta: &mut SubscriptionMeta, key: &str, value: &str, header: bool
                 meta.announce = Some(v);
             }
         }
-        "profile-backup-urls" | "backup-urls" | "x-backup-urls" | "fallback-urls" => {
+        // Happ `fallback-url` is an alias of `profile-backup-urls`.
+        "profile-backup-urls"
+        | "backup-urls"
+        | "x-backup-urls"
+        | "fallback-urls"
+        | "fallback-url" => {
             let urls = parse_backup_urls(value);
             if header {
                 if !urls.is_empty() {
@@ -138,8 +166,152 @@ fn apply_field(meta: &mut SubscriptionMeta, key: &str, value: &str, header: bool
                 meta.server_userinfo.insert(k, v);
             }
         }
+        "providerid" | "provider-id" => {
+            if let Some(v) = non_empty(value) {
+                meta.provider_id = Some(v);
+            }
+        }
+        "routing" => {
+            if value.trim().eq_ignore_ascii_case("happ://routing/off") {
+                meta.routing_enable = Some(false);
+            } else if let Some(routing) = parse_routing_value(value) {
+                meta.routing = Some(routing);
+            }
+        }
+        "routing-enable" => {
+            if !value.trim().is_empty() {
+                meta.routing_enable = Some(is_enabled(value));
+            }
+        }
+        "announce-url" => {
+            if let Some(v) = non_empty(value) {
+                meta.announce_url = Some(v);
+            }
+        }
+        "sub-info-text" => {
+            let banner = meta.info_banner.get_or_insert_with(InfoBanner::default);
+            let text = value.trim();
+            banner.text = if text.is_empty() || text == "0" {
+                String::new()
+            } else {
+                decode_text(value).unwrap_or_default()
+            };
+        }
+        "sub-info-color" => {
+            let banner = meta.info_banner.get_or_insert_with(InfoBanner::default);
+            banner.color = non_empty(value);
+        }
+        "sub-info-button-text" => {
+            let banner = meta.info_banner.get_or_insert_with(InfoBanner::default);
+            banner.button_text = decode_text(value);
+        }
+        "sub-info-button-link" => {
+            let banner = meta.info_banner.get_or_insert_with(InfoBanner::default);
+            banner.button_link = non_empty(value);
+        }
+        "sub-expire" => {
+            if let Some(v) = non_empty(value) {
+                meta.expire_notice = Some(v);
+            }
+        }
+        "sub-expire-button-link" => {
+            if let Some(v) = non_empty(value) {
+                meta.expire_button_link = Some(v);
+            }
+        }
+        "update-always" => {
+            meta.update_always = is_enabled(value);
+        }
+        "network-filter" => {
+            if let Some(v) = non_empty(value) {
+                meta.network_filter = Some(v);
+            }
+        }
+        "subscription-refill-date" => {
+            if let Some(ts) = parse_refill_date(value) {
+                meta.refill_date = Some(ts);
+            }
+        }
+        hwid if HWID_HEADERS.contains(&hwid) => {
+            let status = meta.hwid.get_or_insert_with(HwidStatus::default);
+            match hwid {
+                "x-hwid-limit" => status.limit = parse_u32(value),
+                "x-hwid-active" => status.active = parse_u32(value),
+                "x-hwid-max-devices-reached" => status.max_devices_reached = header_flag(value),
+                "x-hwid-not-supported" => status.not_supported = header_flag(value),
+                _ => {}
+            }
+        }
+        _ if APP_OVERRIDE_KEYS.contains(&key) => {
+            if let Some(v) = non_empty(value) {
+                meta.app_overrides.insert(key.to_string(), v);
+            }
+        }
         _ => {}
     }
+}
+
+/// Parse a `routing` value: a `happ://routing/...` link, base64 Xray routing JSON
+/// (v2RayTun) or base64 Happ profile JSON.
+fn parse_routing_value(value: &str) -> Option<ProviderRouting> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value.to_ascii_lowercase().starts_with("happ://routing/") {
+        return match provider_routing::from_happ_link(value) {
+            Ok(RoutingLinkAction::Add(r)) | Ok(RoutingLinkAction::AddAndActivate(r)) => Some(r),
+            _ => None,
+        };
+    }
+    let payload = match value.get(..7) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("base64:") => &value[7..],
+        _ => value,
+    };
+    let text = decode_b64_str(payload).unwrap_or_else(|| payload.to_string());
+    let text = text.trim().trim_start_matches('\u{feff}');
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let obj = json.as_object()?;
+    if obj.keys().any(|k| k.eq_ignore_ascii_case("rules")) {
+        provider_routing::from_xray_routing(&json).ok()
+    } else {
+        provider_routing::from_happ_profile(&json).ok()
+    }
+}
+
+/// Happ/v2RayTun enable semantics: `true`/`1` enable, any other non-empty value disables.
+fn is_enabled(value: &str) -> bool {
+    matches!(value.trim().to_ascii_lowercase().as_str(), "true" | "1")
+}
+
+/// A response header flag: present-but-empty counts as true; `0`/`false`/`no` are false.
+fn header_flag(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value.trim().parse::<u32>().ok()
+}
+
+/// `subscription-refill-date`: unix seconds, RFC 3339 or `YYYY-MM-DD`, as unix seconds.
+fn parse_refill_date(value: &str) -> Option<Timestamp> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if let Ok(n) = value.parse::<i64>() {
+        return Some(n);
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Some(dt.timestamp());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        return Some(date.and_hms_opt(0, 0, 0)?.and_utc().timestamp());
+    }
+    None
 }
 
 /// Parse the `server-userinfo` value: a JSON object mapping names / `host:port` /
@@ -255,9 +427,44 @@ fn body_metadata(body: &str) -> Vec<(String, String)> {
         let rest = rest.trim_start_matches('#').trim();
         if let Some((key, value)) = rest.split_once(':') {
             out.push((key.trim().to_string(), value.trim().to_string()));
+        } else if let Some((key, value)) = rest.split_once(char::is_whitespace) {
+            // Happ `#providerid X` style (no colon), e.g. `#providerid Abcd1234`.
+            out.push((key.trim().to_string(), value.trim().to_string()));
         }
     }
     out
+}
+
+/// Find and remove a raw `happ://routing/...` line from a (possibly base64) subscription body.
+/// Returns the routing profile (first line wins) and the body with those lines removed.
+pub fn split_body_routing(body: &str) -> (Option<ProviderRouting>, String) {
+    let decoded = decode_body_for_meta(body);
+    if !decoded.to_ascii_lowercase().contains("happ://routing/") {
+        return (None, body.to_string());
+    }
+    let mut routing = None;
+    let mut kept: Vec<&str> = Vec::new();
+    for line in decoded.lines() {
+        let trimmed = line.trim();
+        if trimmed.to_ascii_lowercase().starts_with("happ://routing/") {
+            if routing.is_none() {
+                if let Ok(RoutingLinkAction::Add(r)) | Ok(RoutingLinkAction::AddAndActivate(r)) =
+                    provider_routing::from_happ_link(trimmed)
+                {
+                    routing = Some(r);
+                }
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    let joined = kept.join("\n");
+    if matches!(decoded, std::borrow::Cow::Owned(_)) {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+        return (routing, STANDARD.encode(joined));
+    }
+    (routing, joined)
 }
 
 fn decode_body_for_meta(body: &str) -> std::borrow::Cow<'_, str> {
@@ -422,5 +629,178 @@ mod tests {
         )];
         let meta = parse_meta(&headers, "");
         assert_eq!(meta.backup_urls, vec!["https://a/s", "https://b/s"]);
+    }
+
+    #[test]
+    fn fallback_url_is_backup_alias() {
+        let body = "#fallback-url: https://backup.example/sub\nvless://x@h:443#A\n";
+        let meta = parse_meta(&[], body);
+        assert_eq!(meta.backup_urls, vec!["https://backup.example/sub"]);
+    }
+
+    #[test]
+    fn providerid_header_body_and_precedence() {
+        let body = "#providerid BodyId\nvless://x@h:443#A\n";
+        let meta = parse_meta(&[], body);
+        assert_eq!(meta.provider_id.as_deref(), Some("BodyId"));
+
+        let headers = vec![header("providerid", "HeaderId")];
+        let meta = parse_meta(&headers, body);
+        assert_eq!(meta.provider_id.as_deref(), Some("HeaderId"));
+    }
+
+    #[test]
+    fn routing_header_happ_link_and_xray_json() {
+        use crate::model::RuleAction;
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        // v2RayTun: base64 of an Xray routing JSON.
+        let xray = r#"{"domainStrategy":"IPIfNonMatch","rules":[{"domain":["geosite:category-ads"],"outboundTag":"block"},{"domain":["geosite:google"],"outboundTag":"proxy"}]}"#;
+        let headers = vec![header(
+            "routing",
+            &format!("base64:{}", STANDARD.encode(xray)),
+        )];
+        let meta = parse_meta(&headers, "");
+        let routing = meta.routing.expect("routing");
+        assert_eq!(routing.domain_strategy.as_deref(), Some("IPIfNonMatch"));
+        assert_eq!(routing.rules.len(), 2);
+        assert_eq!(routing.rules[0].action, RuleAction::Block);
+
+        // Happ: a `happ://routing/onadd/<b64>` link in the header.
+        let profile = r#"{"Name":"P","ProxySites":["geosite:google"]}"#;
+        let link = format!("happ://routing/onadd/{}", STANDARD.encode(profile));
+        let headers = vec![header("routing", &link)];
+        let meta = parse_meta(&headers, "");
+        let routing = meta.routing.expect("routing");
+        assert_eq!(routing.name, "P");
+        assert_eq!(routing.rules[0].action, RuleAction::Proxy);
+
+        // `happ://routing/off` disables routing.
+        let headers = vec![header("routing", "happ://routing/off")];
+        let meta = parse_meta(&headers, "");
+        assert!(meta.routing.is_none());
+        assert_eq!(meta.routing_enable, Some(false));
+    }
+
+    #[test]
+    fn split_body_routing_removes_line() {
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let profile = r#"{"Name":"Body","DirectSites":["geosite:cn"]}"#;
+        let link = format!("happ://routing/add/{}", STANDARD.encode(profile));
+        let body = format!("{link}\nvless://x@h:443#A\n");
+        let (routing, cleaned) = split_body_routing(&body);
+        assert_eq!(routing.unwrap().name, "Body");
+        assert!(!cleaned.contains("happ://routing/"));
+        assert!(cleaned.contains("vless://x@h:443#A"));
+
+        // Base64 body stays base64 and keeps the link list.
+        let b64 = STANDARD.encode(&body);
+        let (routing, cleaned) = split_body_routing(&b64);
+        assert_eq!(routing.unwrap().name, "Body");
+        let decoded = STANDARD.decode(&cleaned).unwrap();
+        assert!(String::from_utf8(decoded).unwrap().contains("vless://"));
+
+        // No routing line: body unchanged.
+        let (routing, same) = split_body_routing("vless://x@h:443#A\n");
+        assert!(routing.is_none());
+        assert_eq!(same, "vless://x@h:443#A\n");
+    }
+
+    #[test]
+    fn announcement_and_management_keys() {
+        let headers = vec![
+            header("announce-url", "https://t.me/channel"),
+            header("sub-info-text", "Maintenance tonight"),
+            header("sub-info-color", "red"),
+            header("sub-info-button-text", "More"),
+            header("sub-info-button-link", "https://example.com/info"),
+            header("sub-expire", "true"),
+            header("sub-expire-button-link", "https://example.com/renew"),
+            header("update-always", "true"),
+            header("network-filter", "true"),
+            header("subscription-refill-date", "2026-01-01"),
+            header("tun-type", "singbox"),
+            header("socks-auth-mode", "manual"),
+            header("new-domain", "new.example.com"),
+        ];
+        let meta = parse_meta(&headers, "");
+        assert_eq!(meta.announce_url.as_deref(), Some("https://t.me/channel"));
+        let banner = meta.info_banner.unwrap();
+        assert_eq!(banner.text, "Maintenance tonight");
+        assert_eq!(banner.color.as_deref(), Some("red"));
+        assert_eq!(banner.button_text.as_deref(), Some("More"));
+        assert_eq!(
+            banner.button_link.as_deref(),
+            Some("https://example.com/info")
+        );
+        assert_eq!(meta.expire_notice.as_deref(), Some("true"));
+        assert_eq!(
+            meta.expire_button_link.as_deref(),
+            Some("https://example.com/renew")
+        );
+        assert!(meta.update_always);
+        assert_eq!(meta.network_filter.as_deref(), Some("true"));
+        assert_eq!(meta.refill_date, Some(1_767_225_600));
+        assert_eq!(
+            meta.app_overrides.get("tun-type").map(String::as_str),
+            Some("singbox")
+        );
+        assert_eq!(
+            meta.app_overrides
+                .get("socks-auth-mode")
+                .map(String::as_str),
+            Some("manual")
+        );
+        assert_eq!(
+            meta.app_overrides.get("new-domain").map(String::as_str),
+            Some("new.example.com")
+        );
+    }
+
+    #[test]
+    fn sub_info_text_zero_disables() {
+        let headers = vec![
+            header("sub-info-text", "0"),
+            header("sub-info-color", "green"),
+        ];
+        let meta = parse_meta(&headers, "");
+        let banner = meta.info_banner.unwrap();
+        assert!(banner.text.is_empty());
+        assert_eq!(banner.color.as_deref(), Some("green"));
+    }
+
+    #[test]
+    fn hwid_headers_and_routing_enable() {
+        let headers = vec![
+            header("x-hwid-limit", "3"),
+            header("x-hwid-active", "3"),
+            header("x-hwid-max-devices-reached", "true"),
+            header("x-hwid-not-supported", "0"),
+        ];
+        let meta = parse_meta(&headers, "");
+        let hwid = meta.hwid.unwrap();
+        assert_eq!(hwid.limit, Some(3));
+        assert_eq!(hwid.active, Some(3));
+        assert!(hwid.max_devices_reached);
+        assert!(!hwid.not_supported);
+
+        let headers = vec![header("routing-enable", "1"), header("providerid", "x")];
+        assert_eq!(parse_meta(&headers, "").routing_enable, Some(true));
+        let headers = vec![header("routing-enable", "0")];
+        assert_eq!(parse_meta(&headers, "").routing_enable, Some(false));
+    }
+
+    #[test]
+    fn refill_date_formats() {
+        assert_eq!(parse_refill_date("1798761600"), Some(1_798_761_600));
+        assert_eq!(parse_refill_date("2027-01-01"), Some(1_798_761_600));
+        assert_eq!(
+            parse_refill_date("2027-01-01T00:00:00Z"),
+            Some(1_798_761_600)
+        );
+        assert!(parse_refill_date("not a date").is_none());
     }
 }
