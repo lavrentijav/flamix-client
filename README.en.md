@@ -15,13 +15,11 @@ Cross-platform VPN/proxy client written in Rust, with a Slint UI (WinUI 3 / Flue
 Flamix is an open client that runs the external **Xray-core** and **sing-box** cores (like v2rayN) and
 brings the features of Happ, v2RayTun and v2rayN into one application.
 
-![Flamix main window](docs/design/screenshot-main.png)
+<!-- A screenshot will be added in upcoming builds: ![Flamix main window](docs/design/screenshot-main.png) -->
 
-*Flamix main window (a screenshot will be added in upcoming builds).*
+![Main window mockup](docs/design/main-window.png)
 
-![Interface mockup](docs/design/main-window.png)
-
-*Interface mockup — design mockup.*
+*Main window mockup.*
 
 ## Features
 
@@ -58,12 +56,12 @@ brings the features of Happ, v2RayTun and v2rayN into one application.
 
 | Feature | Flamix | Happ | v2RayTun | v2rayN |
 |---|:---:|:---:|:---:|:---:|
-| Open source | ✅ | ? | ? | ✅ |
-| Desktop: Windows / macOS / Linux | ✅ | ? | ? | ? |
-| TUN mode | ✅ | ? | ? | ? |
+| Open source | ✅ | ❌ | ❌ | ✅ (GPL-3.0) |
+| Desktop: Windows / macOS / Linux | ✅ | ? | ? | ✅ |
+| TUN mode | ✅ | ✅ | ? | ✅ |
 | Backup subscription URLs | ✅ | ? | ? | ? |
 | Per-server traffic | ✅ | ? | ? | ? |
-| Xray-core | ✅ | ? | ? | ✅ |
+| Xray-core | ✅ | ✅ | ✅ | ✅ |
 | sing-box | ✅ | ? | ? | ✅ |
 | Understands other clients' deep links | ✅ | ? | ? | ? |
 
@@ -87,10 +85,12 @@ see **[docs/install.md](docs/install.md)**.
 ## Quick start
 
 1. **Add a subscription**: "Add" → paste the subscription URL (or a `flamix://…` / `vless://…` link from the clipboard).
-2. **Pick a server** in the list and, if needed, mark it for routing.
+2. **Pick a server** in the list (the "Ping test" button shows latency).
 3. **Connect**: **Proxy** mode (system proxy + local SOCKS5/HTTP) or **TUN** (whole traffic,
    requires administrator/root).
 4. Refresh the subscription with the "Refresh" button — if the primary URL is down, the client switches to a backup.
+
+Routing presets (Global, "Bypass RU", Custom) are configured on the **Routing** page.
 
 ## For providers
 
@@ -125,11 +125,10 @@ scripts/             # build/packaging scripts (scripts/ru1 — build on the ser
 
 ## Roadmap
 
-- [x] Core logic: model, links, subscriptions, configs, store, ping
-- [x] OS integration: system proxy, core processes, elevation, autostart
-- [x] Slint main window, themes, RU/EN
-- [x] ✅ Desktop core: Windows, macOS, Linux
-- [ ] 🚧 Packaging: deb, rpm, PKGBUILD, AppImage, tar.gz, Windows installer, macOS `.dmg`
+- [ ] 🚧 Core logic: model, links, subscriptions, configs, store, ping — in progress
+- [ ] 🚧 OS integration: system proxy, core processes, elevation, autostart — in progress
+- [ ] 🚧 Slint main window, themes, RU/EN — in progress
+- [ ] 🚧 Packaging and CI: deb, rpm, PKGBUILD, AppImage, tar.gz, Windows installer, macOS `.dmg` — in progress
 - [ ] Android — planned
 - [ ] iOS — planned
 
