@@ -84,7 +84,7 @@ Slint has a software renderer: add a hidden CLI flag `--screenshot <out.png>` th
 render into a `SharedPixelBuffer<Rgb8Pixel>`, save PNG — add the `png` crate only for this, or the `image` crate with
 png feature only) and exits. Run it on ru1:
     scripts/ru1 sh -c 'cargo run -p flamix -- --screenshot /home/builder/flamix-shot.png'
-then fetch it: `scp -i ~/.ssh/id_builder builder@BUILD_HOST:flamix-shot.png docs/design/screenshot-main.png`,
+then fetch it: `FLAMIX_FETCH=shots scripts/ru1 sh -c 'cargo run -p flamix -- --screenshot shots/main.png'` (copies `shots/` back),
 LOOK at it (open the PNG with your image-reading ability) and iterate until it clearly matches the mockup.
 Commit the final `docs/design/screenshot-main.png` (also a `--light` variant `screenshot-main-light.png`).
 

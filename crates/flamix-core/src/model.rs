@@ -340,6 +340,11 @@ pub struct Subscription {
     pub id: String,
     /// Name: user given, else `profile-title` header, else host of the URL.
     pub name: String,
+    /// Last name set automatically from the subscription (`profile-title` / `content-disposition`).
+    /// Lets [`subscription::update`](crate::subscription::update) refresh the name on later
+    /// fetches while keeping a name the user changed by hand.
+    #[serde(default)]
+    pub auto_title: Option<String>,
     /// Primary URL as entered by the user.
     pub url: String,
     /// Backup URLs (from the user and/or from subscription headers), tried in order when the
@@ -378,6 +383,99 @@ pub struct Subscription {
     pub collapsed: bool,
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// Extra data delivered by the provider (Happ / v2RayTun / Remnawave compatible headers).
+    #[serde(default)]
+    pub provider: ProviderExtras,
+    /// User options of this subscription.
+    #[serde(default)]
+    pub options: SubscriptionOptions,
+}
+
+/// Provider-controlled extras of a subscription (see `docs/research/*.md`, `docs/subscription-headers.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderExtras {
+    /// Happ `providerid` (URL fragment `#?providerid=`, body `#providerid X`, or header).
+    pub provider_id: Option<String>,
+    /// Routing profile pushed by the provider (Happ `routing` / `happ://routing/...`,
+    /// v2RayTun base64 Xray routing JSON). Applied when connecting through this subscription.
+    pub routing: Option<ProviderRouting>,
+    /// Announcement link (v2RayTun `announce-url`).
+    pub announce_url: Option<String>,
+    /// Happ info banner (`sub-info-text`, `sub-info-color`, `sub-info-button-text`, `sub-info-button-link`).
+    pub info_banner: Option<InfoBanner>,
+    /// Happ `sub-expire` notice text and `sub-expire-button-link`.
+    pub expire_notice: Option<String>,
+    pub expire_button_link: Option<String>,
+    /// HWID device-limit state from response headers (Remnawave `x-hwid-*`).
+    pub hwid: Option<HwidStatus>,
+    /// v2RayTun `update-always`: refresh on every app start (while disconnected).
+    pub update_always: bool,
+    /// v2RayTun `network-filter` (only show servers whose transport matches), raw value.
+    pub network_filter: Option<String>,
+    /// Remnawave `subscription-refill-date` (traffic reset), unix seconds.
+    pub refill_date: Option<Timestamp>,
+    /// Happ app-management keys (`routing-enable`, `tun-type`, `socks-auth-*`, `http-auth-*`,
+    /// `new-url`, `new-domain`, `custom-tunnel-config`, ...): stored raw (lower-case key -> value);
+    /// the app decides which ones to honour.
+    pub app_overrides: BTreeMap<String, String>,
+}
+
+/// A provider routing profile, normalised to Flamix rules.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRouting {
+    pub name: String,
+    /// User switch (Happ `routing-enable` / `happ://routing/off` set it to false).
+    pub enabled: bool,
+    /// Happ `GlobalProxy`: everything not matched goes through the proxy (else direct).
+    pub global_proxy: bool,
+    /// Rules in order (Happ Block*/Direct*/Proxy* lists, or Xray `rules[]` with outboundTag).
+    pub rules: Vec<RoutingRule>,
+    pub domain_strategy: Option<String>,
+    /// Remote / direct DNS from the profile, if given.
+    pub dns: Option<Dns>,
+    /// Static hosts (Happ `DnsHosts`).
+    pub dns_hosts: BTreeMap<String, String>,
+    pub fake_dns: bool,
+    /// Custom geo files (Happ `Geoipurl` / `Geositeurl`).
+    pub geoip_url: Option<String>,
+    pub geosite_url: Option<String>,
+    /// Original JSON as received, for display/debug.
+    pub raw: Option<serde_json::Value>,
+}
+
+/// Happ-style info banner shown above the server list.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InfoBanner {
+    pub text: String,
+    /// Colour name or `#RRGGBB`.
+    pub color: Option<String>,
+    pub button_text: Option<String>,
+    pub button_link: Option<String>,
+}
+
+/// Device-limit state reported by the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HwidStatus {
+    pub limit: Option<u32>,
+    pub active: Option<u32>,
+    pub max_devices_reached: bool,
+    pub not_supported: bool,
+}
+
+/// User options of a subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubscriptionOptions {
+    /// Extra request headers sent when fetching (v2rayN "custom headers").
+    pub custom_headers: BTreeMap<String, String>,
+    /// Keep only servers whose name matches this regex (v2rayN "Filter").
+    pub name_filter: Option<String>,
+    /// Ignore provider routing for this subscription.
+    pub ignore_provider_routing: bool,
 }
 
 /// How traffic is captured.

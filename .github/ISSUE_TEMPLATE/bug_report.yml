@@ -1,0 +1,96 @@
+name: Баг
+description: Сообщить об ошибке в Flamix
+title: "[Баг]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Спасибо за отчёт! Заполните, пожалуйста, поля ниже — так мы быстрее найдём причину.
+        **Не прикладывайте реальные ссылки подписки, UUID и приватные ключи.**
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Перед отправкой
+      options:
+        - label: Я искал похожий Issue и не нашёл его.
+          required: true
+        - label: Я использую последнюю доступную сборку или свежий `main`.
+          required: false
+  - type: input
+    id: version
+    attributes:
+      label: Версия Flamix
+      description: Версия из раздела «О программе» или номер сборки/коммита.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Операционная система
+      options:
+        - Windows 10/11 x64
+        - macOS 11+
+        - Linux x86_64
+        - Linux aarch64
+        - Другое
+    validations:
+      required: true
+  - type: input
+    id: os-version
+    attributes:
+      label: Версия ОС
+      placeholder: "Windows 11 23H2 / Ubuntu 24.04 / macOS 14.5"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Режим подключения
+      options:
+        - Proxy (системный прокси)
+        - TUN
+        - Не подключался
+    validations:
+      required: true
+  - type: dropdown
+    id: core
+    attributes:
+      label: Ядро
+      options:
+        - Xray-core
+        - sing-box
+        - Не знаю
+    validations:
+      required: false
+  - type: textarea
+    id: steps
+    attributes:
+      label: Шаги воспроизведения
+      placeholder: |
+        1. Открыть …
+        2. Нажать …
+        3. Увидеть …
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Ожидаемое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Фактическое поведение
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Логи и скриншоты
+      description: Приложите логи приложения (без приватных данных) и скриншоты.
+      render: text
+    validations:
+      required: false

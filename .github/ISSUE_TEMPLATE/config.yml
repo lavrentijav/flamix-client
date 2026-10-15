@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Вопросы и обсуждения
+    url: https://github.com/lavrentijav/flamix-client/issues
+    about: Задайте вопрос или посмотрите существующие обсуждения.
+  - name: Уязвимости в безопасности
+    url: https://github.com/lavrentijav/flamix-client/security/advisories/new
+    about: Сообщите о проблеме безопасности приватно, не создавая публичный Issue.

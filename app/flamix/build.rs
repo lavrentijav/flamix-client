@@ -2,6 +2,9 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 fn main() {
+    #[cfg(windows)]
+    windows_resources();
+
     // `ui/app.slint` imports `assets/fonts/DejaVuSans*.ttf`, embedded via the
     // default `EmbedFiles` and registered at runtime, so the software renderer
     // has a font on hosts without system fonts.
@@ -43,4 +46,24 @@ fn generate_flags() {
     );
 
     std::fs::write(Path::new(&out_dir).join("flags.rs"), code).expect("write flags.rs");
+}
+
+/// Embed the application icon and manifest into the Windows executable.
+#[cfg(windows)]
+fn windows_resources() {
+    use std::path::Path;
+
+    let mut res = winresource::WindowsResource::new();
+
+    let icon = Path::new("assets/app-icon/flamix.ico");
+    if icon.exists() {
+        res.set_icon(icon.to_str().expect("utf-8 icon path"));
+    }
+
+    let manifest = Path::new("../../packaging/windows/flamix.manifest");
+    if manifest.exists() {
+        res.set_manifest_file(manifest.to_str().expect("utf-8 manifest path"));
+    }
+
+    res.compile().expect("embed windows resources");
 }

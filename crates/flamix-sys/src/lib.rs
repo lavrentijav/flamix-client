@@ -4,6 +4,7 @@
 pub mod autostart;
 pub mod elevation;
 pub mod runner;
+pub mod stats;
 pub mod sysproxy;
 
 /// Error type of flamix-sys.

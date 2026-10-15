@@ -78,3 +78,56 @@ with "remaining / total" under such a server; the subscription bar shows the sub
   format by UA); user-overridable per subscription.
 - Headers sent: `x-hwid` (stable random device id), `x-device-os`, `x-ver-os`, `x-device-model`
   (Happ-compatible HWID limits on Remnawave), `Accept-Encoding: gzip`.
+- Extra user headers (`SubscriptionOptions::custom_headers`) are sent too and override the
+  defaults above, except `Host`.
+
+## Compatibility (Happ / v2RayTun / Remnawave)
+
+Every key below is accepted both as an HTTP response header and as a `#key: value` body line
+(plain/base64 body); headers win. `#providerid X` (space, no colon) is also accepted. All of it is
+stored in `Subscription::provider` (`ProviderExtras`).
+
+| Key | Source | Meaning |
+|---|---|---|
+| `fallback-url` | Happ | Alias of `profile-backup-urls` (merged into `Subscription::backup_urls`) |
+| `providerid` | Happ | Provider id; header, `#providerid X` body line, or subscription URL fragment `#?providerid=X` |
+| `routing` | Happ / v2RayTun | Routing profile: a `happ://routing/...` link, base64 Xray routing JSON (`rules[]` + `outboundTag`), or base64 Happ profile JSON → `ProviderExtras::routing` |
+| `routing-enable` | Happ | `true`/`1` enable, any other non-empty value disables provider routing |
+| `announce-url` | v2RayTun | URL opened when the announcement is tapped |
+| `sub-info-text` | Happ | Info banner text (empty/`0` disables) |
+| `sub-info-color` | Happ | Banner colour: `red` / `blue` (default) / `green` or `#RRGGBB` |
+| `sub-info-button-text` | Happ | Banner button label |
+| `sub-info-button-link` | Happ | Banner button link |
+| `sub-expire` | Happ | Expiry notice (raw value kept in `ProviderExtras::expire_notice`) |
+| `sub-expire-button-link` | Happ | "Renew" button link |
+| `update-always` | v2RayTun | Refresh on every app start while disconnected |
+| `network-filter` | v2RayTun | Comma-separated transport/protocol tokens; only matching servers are kept |
+| `subscription-refill-date` | Remnawave | Traffic reset date: unix seconds, RFC 3339 or `YYYY-MM-DD` |
+| `x-hwid-limit` | Remnawave | Device limit (response header) |
+| `x-hwid-active` | Remnawave | Currently active devices (response header) |
+| `x-hwid-max-devices-reached` | Remnawave | Device limit reached flag (response header) |
+| `x-hwid-not-supported` | Remnawave | HWID not supported flag (response header) |
+| `custom-tunnel-config` | Happ | Full sing-box tunnel JSON (desktop) |
+| `socks-auth-mode`, `socks-auth-user`, `socks-auth-password` | Happ | Local SOCKS inbound auth |
+| `http-auth-mode`, `http-auth-user`, `http-auth-password` | Happ | Local HTTP inbound auth |
+| `tun-type` | Happ | `singbox` / `tun2proxy` / `default` / `xray` |
+| `new-url` | Happ | Replacement subscription URL |
+| `new-domain` | Happ | Replacement subscription host |
+
+The app-management keys in the last block are stored verbatim in `ProviderExtras::app_overrides`
+(lower-case key → raw value); applying them to the core configs is a separate task.
+
+A raw `happ://routing/...` line in the body is parsed as a routing profile and removed before the
+share links are parsed.
+
+### Deep links accepted for import
+
+`flamix://import|add/`, `happ://add/`, `happ://routing/{add,onadd,off}/<base64>`,
+`v2raytun://import/`, `v2rayng://install-sub?url=..` and `v2rayng://install-config?url=..`
+(fragment = name), `hiddify://install-config?url=..&name=..#name` and the path form
+`hiddify://<url>#<name>`, `v2ray://`, `v2rayn://`, `clash://`, `clashmeta://`,
+`sing-box://import-remote-profile?url=..` (all with `?url=` / `name=` / fragment), plus bare
+`https://` subscription URLs and share links.
+
+Encrypted links (`happ://crypt4/`, `happ://crypt5/`, `v2raytun://crypt/`) use proprietary keys and
+are **not** supported: they are ignored with a log message.
