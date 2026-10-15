@@ -25,5 +25,68 @@ chrono.workspace = true
 [build-dependencies]
 slint-build = "1"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
 [lints]
 workspace = true
+
+# --- packaging metadata (consumed by cargo-deb / cargo-generate-rpm) --------
+# Assets are staged by scripts/package-linux.sh into dist/linux-staging/.
+# Paths are relative to this crate directory for cargo-deb (hence ../../).
+
+[package.metadata.deb]
+name = "flamix"
+maintainer = "Flamix <flamix@lavrentijav.github.io>"
+copyright = "2026, Flamix contributors"
+section = "net"
+priority = "optional"
+revision = ""
+depends = "libxkbcommon0, libfontconfig1, libgl1 | libegl1"
+maintainer-scripts = "../../packaging/debian"
+assets = [
+    ["target/release/flamix", "usr/bin/", "755"],
+    ["../../dist/linux-staging/cores/xray", "usr/lib/flamix/cores/", "755"],
+    ["../../dist/linux-staging/cores/sing-box", "usr/lib/flamix/cores/", "755"],
+    ["../../dist/linux-staging/cores/geoip.dat", "usr/lib/flamix/cores/", "644"],
+    ["../../dist/linux-staging/cores/geosite.dat", "usr/lib/flamix/cores/", "644"],
+    ["../../dist/linux-staging/flamix.desktop", "usr/share/applications/", "644"],
+    ["../../dist/linux-staging/icons/16.png", "usr/share/icons/hicolor/16x16/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/32.png", "usr/share/icons/hicolor/32x32/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/48.png", "usr/share/icons/hicolor/48x48/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/64.png", "usr/share/icons/hicolor/64x64/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/128.png", "usr/share/icons/hicolor/128x128/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/256.png", "usr/share/icons/hicolor/256x256/apps/flamix.png", "644"],
+    ["../../dist/linux-staging/icons/512.png", "usr/share/icons/hicolor/512x512/apps/flamix.png", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "flamix"
+assets = [
+    { source = "target/release/flamix", dest = "/usr/bin/flamix", mode = "755" },
+    { source = "dist/linux-staging/cores/xray", dest = "/usr/lib/flamix/cores/xray", mode = "755" },
+    { source = "dist/linux-staging/cores/sing-box", dest = "/usr/lib/flamix/cores/sing-box", mode = "755" },
+    { source = "dist/linux-staging/cores/geoip.dat", dest = "/usr/lib/flamix/cores/geoip.dat", mode = "644" },
+    { source = "dist/linux-staging/cores/geosite.dat", dest = "/usr/lib/flamix/cores/geosite.dat", mode = "644" },
+    { source = "dist/linux-staging/flamix.desktop", dest = "/usr/share/applications/flamix.desktop", mode = "644" },
+    { source = "dist/linux-staging/icons/16.png", dest = "/usr/share/icons/hicolor/16x16/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/32.png", dest = "/usr/share/icons/hicolor/32x32/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/48.png", dest = "/usr/share/icons/hicolor/48x48/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/64.png", dest = "/usr/share/icons/hicolor/64x64/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/128.png", dest = "/usr/share/icons/hicolor/128x128/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/256.png", dest = "/usr/share/icons/hicolor/256x256/apps/flamix.png", mode = "644" },
+    { source = "dist/linux-staging/icons/512.png", dest = "/usr/share/icons/hicolor/512x512/apps/flamix.png", mode = "644" },
+]
+post_install_script = """
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_admin,cap_net_bind_service+ep /usr/lib/flamix/cores/sing-box || true
+fi
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+"""
+
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
+fontconfig = "*"
+libglvnd-glx = "*"

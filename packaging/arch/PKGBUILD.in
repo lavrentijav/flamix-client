@@ -1,0 +1,33 @@
+# Maintainer: Flamix <flamix@lavrentijav.github.io>
+# Generated from packaging/arch/PKGBUILD.in by the release workflow.
+pkgname=flamix
+pkgver=@@VERSION@@
+pkgrel=1
+pkgdesc="Cross-platform VPN client (Xray / sing-box)"
+arch=('x86_64')
+url="https://github.com/lavrentijav/flamix-client"
+license=('GPL-3.0-or-later')
+depends=('libxkbcommon' 'fontconfig' 'libglvnd')
+provides=('flamix')
+conflicts=('flamix')
+source=("${pkgname}-${pkgver}-linux-x86_64.tar.gz::@@URL@@")
+sha256sums=('@@SHA256@@')
+
+package() {
+    local pkgdir_root="${pkgname}-${pkgver}-linux-x86_64"
+
+    install -Dm755 "${srcdir}/${pkgdir_root}/flamix" "${pkgdir}/usr/bin/flamix"
+
+    install -d "${pkgdir}/usr/lib/flamix/cores"
+    install -m755 "${srcdir}/${pkgdir_root}/cores/xray" "${pkgdir}/usr/lib/flamix/cores/xray"
+    install -m755 "${srcdir}/${pkgdir_root}/cores/sing-box" "${pkgdir}/usr/lib/flamix/cores/sing-box"
+    install -m644 "${srcdir}/${pkgdir_root}/cores/geoip.dat" "${pkgdir}/usr/lib/flamix/cores/geoip.dat"
+    install -m644 "${srcdir}/${pkgdir_root}/cores/geosite.dat" "${pkgdir}/usr/lib/flamix/cores/geosite.dat"
+
+    install -Dm644 "${srcdir}/${pkgdir_root}/flamix.desktop" "${pkgdir}/usr/share/applications/flamix.desktop"
+
+    for size in 16 32 48 64 128 256 512; do
+        install -Dm644 "${srcdir}/${pkgdir_root}/icons/${size}.png" \
+            "${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/flamix.png"
+    done
+}

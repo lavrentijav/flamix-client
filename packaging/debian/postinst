@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+# Allow sing-box to create the TUN device without pkexec/root.
+if command -v setcap >/dev/null 2>&1; then
+    setcap cap_net_admin,cap_net_bind_service+ep /usr/lib/flamix/cores/sing-box || true
+fi
+
+# Register/refresh the flamix:// URL scheme handler.
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database -q /usr/share/applications || true
+fi
+
+exit 0
