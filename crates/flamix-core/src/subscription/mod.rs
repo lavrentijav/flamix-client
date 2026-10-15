@@ -1,8 +1,19 @@
 //! Subscriptions: download, decode, headers, backup URLs. OWNER: task T02.
 //! Header format: see `docs/subscription-headers.md` (authoritative).
+//!
+//! The implementation is split into [`meta`] (headers / `#key: value` lines),
+//! [`body`] (base64 / plain / JSON / Clash YAML decoding) and [`fetch`] (request + fallback).
 
-use crate::model::{Subscription, TrafficInfo};
-use crate::Result;
+mod body;
+mod fetch;
+mod meta;
+pub(crate) mod util;
+
+pub use body::decode_body;
+pub use fetch::{apply_server_userinfo, update, url_order};
+pub use meta::{parse_meta, parse_server_userinfo, parse_userinfo};
+
+use crate::model::TrafficInfo;
 use std::collections::HashMap;
 
 /// User-Agent sent by default. Many panels (Marzban, Remnawave, 3x-ui) choose the
@@ -33,32 +44,4 @@ pub struct FetchOptions {
     pub hwid: Option<String>,
     /// Request timeout per URL attempt; `None` = 20 s.
     pub timeout: Option<std::time::Duration>,
-}
-
-/// Parse a `subscription-userinfo` style value: `upload=1; download=2; total=3; expire=4`.
-pub fn parse_userinfo(value: &str) -> Option<TrafficInfo> {
-    let _ = value;
-    todo!("T02")
-}
-
-/// Extract metadata from headers (names case-insensitive) and the body.
-pub fn parse_meta(headers: &[(String, String)], body: &str) -> SubscriptionMeta {
-    let _ = (headers, body);
-    todo!("T02")
-}
-
-/// Decode a subscription body into share links text (one link per line):
-/// base64 (std/url-safe, padded or not), plain text, or JSON / Clash YAML (best effort).
-pub fn decode_body(body: &str) -> Result<String> {
-    let _ = body;
-    todo!("T02")
-}
-
-/// Download `sub` (primary URL, then `last_working_url`, then each backup URL, until one
-/// answers 2xx with a non-empty server list) and update it in place: servers (keeping
-/// `last_ping_ms` / `local_traffic` of servers whose id did not change), meta, `last_update`,
-/// `last_error`, `last_working_url`. New backup URLs from headers are merged in (deduplicated).
-pub async fn update(sub: &mut Subscription, opts: &FetchOptions) -> Result<()> {
-    let _ = (sub, opts);
-    todo!("T02")
 }
