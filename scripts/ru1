@@ -1,7 +1,7 @@
 #!/bin/sh
 # scripts/ru1 <command...> — run a command for this checkout on the ru1 build server.
 #
-# ALL builds of flamix-client happen on ru1 (user `builder`, no sudo). This script:
+# Team helper: run builds on the shared build server. This script:
 #   1. rsyncs the tracked + untracked-not-ignored files of the current git checkout
 #      (works from any worktree) to builder@ru1:wt/flamix/<checkout-name>/
 #   2. runs the command there under a remote flock, with a shared CARGO_TARGET_DIR
@@ -13,7 +13,11 @@
 #   scripts/ru1 scripts/package-linux.sh        # runs a repo script remotely
 #   FLAMIX_FETCH=dist scripts/ru1 scripts/package-linux.sh   # then copy ~/wt/.../dist back
 set -e
-ADDR=BUILD_HOST
+# Build host address is NOT stored in the repo: env FLAMIX_BUILD_HOST, else the first line of
+# /srv/dev/tools/flamix-build-host (team machines). User on the host: FLAMIX_BUILD_USER (default builder).
+ADDR="${FLAMIX_BUILD_HOST:-$(head -n1 /srv/dev/tools/flamix-build-host 2>/dev/null)}"
+BUSER="${FLAMIX_BUILD_USER:-builder}"
+[ -n "$ADDR" ] || { echo "scripts/ru1: set FLAMIX_BUILD_HOST" >&2; exit 2; }
 KEY="$HOME/.ssh/id_builder"
 SSH="ssh -i $KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=30"
 [ $# -gt 0 ] || { echo "usage: scripts/ru1 <command...>" >&2; exit 2; }
@@ -25,12 +29,12 @@ DEST="wt/flamix/$NAME"
 
 (cd "$ROOT" && git ls-files -co --exclude-standard -z) |
   rsync -a --from0 --files-from=- --delete-missing-args \
-    --rsync-path="mkdir -p $DEST && rsync" -e "$SSH" "$ROOT/" "builder@$ADDR:$DEST/"
+    --rsync-path="mkdir -p $DEST && rsync" -e "$SSH" "$ROOT/" "$BUSER@$ADDR:$DEST/"
 
 ARGS=""; for a in "$@"; do ARGS="$ARGS '$(printf %s "$a" | sed "s/'/'\\\\''/g")'"; done
 echo "ru1: [$NAME/$REL] $*" >&2
 set +e
-$SSH "builder@$ADDR" "export PATH=\$HOME/.cargo/bin:\$HOME/flamix-tools/bin:\$PATH; \
+$SSH "$BUSER@$ADDR" "export PATH=\$HOME/.cargo/bin:\$HOME/flamix-tools/bin:\$PATH; \
   [ -f \$HOME/flamix-tools/env.sh ] && . \$HOME/flamix-tools/env.sh; \
   export CARGO_TARGET_DIR=\$HOME/flamix-target CARGO_BUILD_JOBS=4 CARGO_INCREMENTAL=0; \
   mkdir -p \$CARGO_TARGET_DIR; cd $DEST/$REL && \
@@ -39,7 +43,7 @@ RC=$?
 set -e
 if [ -n "$FLAMIX_FETCH" ]; then
   mkdir -p "$ROOT/$FLAMIX_FETCH"
-  rsync -a -e "$SSH" "builder@$ADDR:$DEST/$FLAMIX_FETCH/" "$ROOT/$FLAMIX_FETCH/"
+  rsync -a -e "$SSH" "$BUSER@$ADDR:$DEST/$FLAMIX_FETCH/" "$ROOT/$FLAMIX_FETCH/"
   echo "ru1: fetched $FLAMIX_FETCH/ -> $ROOT/$FLAMIX_FETCH/" >&2
 fi
 exit $RC
