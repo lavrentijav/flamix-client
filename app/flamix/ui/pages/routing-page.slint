@@ -1,17 +1,20 @@
-// Page "Маршрутизация" (page 2). OWNER: T17C (docs/tasks/T17-pages.md).
+// Page "Маршрутизация" (page 2). OWNER: T17C (docs/tasks/T17-pages.md), T28 value fields.
 // Rust side: src/pages/routing.rs talks to the page ONLY through the global RoutingBridge.
-import { ScrollView, ComboBox, Switch, TextEdit } from "std-widgets.slint";
+import { ScrollView, LineEdit, ComboBox, Switch } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { Icon } from "../components/icon.slint";
 
-// One custom routing rule as shown/edited in the list. `action`/`kind` are indices into the
-// fixed chip sets (proxy/direct/block, domains/ip/processes); the label text lives in the UI.
+// One custom routing rule as shown/edited in the list. `action` is an index into the fixed
+// proxy/direct/block chip set; the label text lives in the UI. The three value lists hold the
+// editable rows (stored entries plus one trailing empty input row) for domains/IPs/processes.
 export struct RoutingRuleItem {
     index: int,
     action: int,
-    kind: int,
-    values: string,
     enabled: bool,
+    collapsed: bool,
+    domains: [string],
+    ips: [string],
+    processes: [string],
 }
 
 // One subscription that ships its own routing profile.
@@ -34,21 +37,38 @@ export global RoutingBridge {
     in property <bool> has-providers: false;
     in property <string> error-text: "";
 
+    // UI-local collapse state of the four page sections.
+    in-out property <bool> presets-collapsed: false;
+    in-out property <bool> rules-collapsed: false;
+    in-out property <bool> extra-collapsed: false;
+    in-out property <bool> providers-collapsed: false;
+
+    // Focus request after a structural list edit. Rust publishes the target coordinates plus a
+    // fresh non-zero token before refreshing the rules model; the matching value row focuses
+    // itself and resets the token to 0 so ordinary repaints never steal focus.
+    in property <int> focus-rule: -1;
+    in property <int> focus-field: -1;
+    in property <int> focus-row: -1;
+    in-out property <int> focus-token: 0;
+
     callback preset-selected(int);
     callback rule-action-changed(int, int);
-    callback rule-kind-changed(int, int);
-    callback rule-values-changed(int, int, string);
     callback rule-enabled-changed(int, bool);
+    callback rule-collapsed-changed(int, bool);
     callback rule-move(int, int);
     callback rule-delete(int);
     callback rule-add();
+    // (rule, field, row, text) — field: 0 domains, 1 ips, 2 processes.
+    callback rule-item-edited(int, int, int, string);
+    callback rule-item-insert(int, int, int);
+    callback rule-item-remove(int, int, int);
     callback domain-strategy-changed(string);
     callback block-quic-changed(bool);
     callback provider-enabled-changed(string, bool);
     callback provider-ignored-changed(string, bool);
 }
 
-// Small selectable pill used for the rule action and kind.
+// Small selectable pill used for the rule action.
 component Chip inherits Rectangle {
     in property <string> text;
     in property <bool> selected: false;
@@ -133,19 +153,172 @@ component IconButton inherits Rectangle {
     ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
 }
 
+// Collapsible section header: chevron + title + one-line summary. Clicking toggles the section.
+component SectionHeader inherits Rectangle {
+    in property <string> title;
+    in property <string> summary: "";
+    in property <bool> collapsed: false;
+    callback toggled();
+
+    height: 28px;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: center;
+        Icon {
+            width: 14px;
+            height: 14px;
+            source: @image-url("../../assets/icons/chevron-down.svg");
+            tint: Theme.muted;
+            transform-rotation: root.collapsed ? -90deg : 0deg;
+            animate transform-rotation { duration: 150ms; }
+        }
+        Text {
+            text: root.title;
+            color: Theme.text;
+            font-size: 15px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.summary != "" : Text {
+            text: "· \{root.summary}";
+            color: Theme.muted;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
+}
+
+// One editable entry of a value list. Enter inserts a fresh row below, backspace on an empty row
+// removes it. Focus after a structural edit is driven by the RoutingBridge focus coordinates.
+component ValueRow inherits Rectangle {
+    in property <string> value;
+    in property <string> placeholder;
+    in property <int> rule-index;
+    in property <int> field-index;
+    in property <int> row-index;
+
+    callback edited(string);
+    callback enter();
+    callback backspace();
+
+    height: 34px;
+    background: transparent;
+
+    LineEdit {
+        width: 100%;
+        height: 32px;
+        text: root.value;
+        placeholder-text: root.placeholder;
+        edited(t) => { root.edited(t); }
+        accepted => { root.enter(); }
+        key-pressed(event) => {
+            // The built-in handler runs after this callback, so `self.text` still holds the
+            // pre-keypress value here. Backspace on an already empty row removes the row.
+            if event.text == "\u{8}" && self.text == "" {
+                root.backspace();
+            }
+            reject
+        }
+        init => {
+            if RoutingBridge.focus-token != 0
+                && RoutingBridge.focus-rule == root.rule-index
+                && RoutingBridge.focus-field == root.field-index
+                && RoutingBridge.focus-row == root.row-index {
+                self.focus();
+                RoutingBridge.focus-token = 0;
+            }
+        }
+    }
+}
+
+// One titled value field: a vertical list of one-line rows plus a trailing empty input row.
+component ValueField inherits VerticalLayout {
+    in property <string> title;
+    in property <string> placeholder;
+    in property <string> hint: "";
+    in property <int> rule-index;
+    in property <int> field-index;
+    in property <[string]> values;
+
+    callback edited(int, string);
+    callback insert(int);
+    callback remove(int);
+
+    spacing: 4px;
+
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: end;
+        Text {
+            text: root.title;
+            color: Theme.muted;
+            font-size: 12px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: Theme.muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+    }
+    for value[row] in root.values : ValueRow {
+        value: value;
+        placeholder: root.placeholder;
+        rule-index: root.rule-index;
+        field-index: root.field-index;
+        row-index: row;
+        edited(t) => { root.edited(row, t); }
+        enter => { root.insert(row); }
+        backspace => { root.remove(row); }
+    }
+}
+
+// Chevron button used to collapse a rule; the whole square is clickable.
+component CollapseChevron inherits Rectangle {
+    in property <bool> collapsed: false;
+    callback toggled();
+
+    width: 20px;
+    height: 20px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    border-radius: 6px;
+
+    Icon {
+        x: (parent.width - 14px) / 2;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        source: @image-url("../../assets/icons/chevron-down.svg");
+        tint: Theme.muted;
+        transform-rotation: root.collapsed ? -90deg : 0deg;
+        animate transform-rotation { duration: 150ms; }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.toggled(); } }
+}
+
 component RuleRow inherits Rectangle {
     in property <int> index;
     // Local copies so the chip click updates the visuals instantly even before Rust refreshes.
     in-out property <int> action: 0;
-    in-out property <int> kind: 0;
-    in property <string> values;
     in property <bool> enabled;
+    in-out property <bool> collapsed: false;
+    in property <[string]> domains;
+    in property <[string]> ips;
+    in property <[string]> processes;
 
     callback action-changed(int);
-    callback kind-changed(int);
-    // (kind, values): the current kind is sent along so empty rules keep the chosen kind.
-    callback values-changed(int, string);
     callback enabled-changed(bool);
+    callback collapsed-changed(bool);
+    callback item-edited(int, int, string);
+    callback item-insert(int, int);
+    callback item-remove(int, int);
     callback move-up();
     callback move-down();
     callback remove();
@@ -162,33 +335,60 @@ component RuleRow inherits Rectangle {
         HorizontalLayout {
             spacing: 6px;
             alignment: center;
+            CollapseChevron {
+                collapsed: root.collapsed;
+                toggled => { root.collapsed = !root.collapsed; root.collapsed-changed(root.collapsed); }
+            }
             Chip { text: "Прокси"; selected: root.action == 0; tint: Theme.accent; clicked => { root.action = 0; root.action-changed(0); } }
             Chip { text: "Напрямую"; selected: root.action == 1; tint: Theme.success; clicked => { root.action = 1; root.action-changed(1); } }
             Chip { text: "Блок"; selected: root.action == 2; tint: Theme.danger; clicked => { root.action = 2; root.action-changed(2); } }
-            Rectangle { width: 1px; height: 20px; background: Theme.stroke; }
-            Chip { text: "Домены"; selected: root.kind == 0; clicked => { root.kind = 0; root.kind-changed(0); } }
-            Chip { text: "IP"; selected: root.kind == 1; clicked => { root.kind = 1; root.kind-changed(1); } }
-            Chip { text: "Процессы"; selected: root.kind == 2; clicked => { root.kind = 2; root.kind-changed(2); } }
             Rectangle { horizontal-stretch: 1; background: transparent; }
             Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
         }
 
-        // One value per line (commas typed by the user become line breaks on refresh). Full width.
-        TextEdit {
-            horizontal-stretch: 1;
-            height: 64px;
-            text: root.values;
-            placeholder-text: "geosite:category-ru\ndomain:example.com\ndomain:example.org";
-            edited(t) => { root.values-changed(root.kind, t); }
-        }
+        if !root.collapsed : VerticalLayout {
+            spacing: 8px;
 
-        HorizontalLayout {
-            spacing: 6px;
-            alignment: center;
-            Rectangle { horizontal-stretch: 1; background: transparent; }
-            IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
-            IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
-            IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
+            ValueField {
+                title: "Домены";
+                placeholder: "geosite:category-ru · domain:example.com · full:x.y · regexp:…";
+                rule-index: root.index;
+                field-index: 0;
+                values: root.domains;
+                edited(r, t) => { root.item-edited(0, r, t); }
+                insert(r) => { root.item-insert(0, r); }
+                remove(r) => { root.item-remove(0, r); }
+            }
+            ValueField {
+                title: "IP / подсети";
+                placeholder: "geoip:ru · 10.0.0.0/8 · geoip:private";
+                rule-index: root.index;
+                field-index: 1;
+                values: root.ips;
+                edited(r, t) => { root.item-edited(1, r, t); }
+                insert(r) => { root.item-insert(1, r); }
+                remove(r) => { root.item-remove(1, r); }
+            }
+            ValueField {
+                title: "Процессы";
+                hint: "только TUN";
+                placeholder: "telegram.exe · Discord.exe";
+                rule-index: root.index;
+                field-index: 2;
+                values: root.processes;
+                edited(r, t) => { root.item-edited(2, r, t); }
+                insert(r) => { root.item-insert(2, r); }
+                remove(r) => { root.item-remove(2, r); }
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: center;
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+                IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
+                IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
+                IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
+            }
         }
     }
 }
@@ -242,6 +442,20 @@ export component RoutingPage inherits Rectangle {
     background: Theme.panel-bg;
     border-radius: 16px;
 
+    // Russian plural helpers for the section summaries.
+    property <int> rule-count: RoutingBridge.rules.length;
+    property <string> rules-summary: rule-count == 0 ? "нет правил"
+        : (Math.mod(rule-count, 100) >= 11 && Math.mod(rule-count, 100) <= 14) ? "\{rule-count} правил"
+        : Math.mod(rule-count, 10) == 1 ? "\{rule-count} правило"
+        : (Math.mod(rule-count, 10) >= 2 && Math.mod(rule-count, 10) <= 4) ? "\{rule-count} правила"
+        : "\{rule-count} правил";
+    property <int> provider-count: RoutingBridge.providers.length;
+    property <string> providers-summary: provider-count == 0 ? "нет"
+        : (Math.mod(provider-count, 100) >= 11 && Math.mod(provider-count, 100) <= 14) ? "\{provider-count} профилей"
+        : Math.mod(provider-count, 10) == 1 ? "\{provider-count} профиль"
+        : (Math.mod(provider-count, 10) >= 2 && Math.mod(provider-count, 10) <= 4) ? "\{provider-count} профиля"
+        : "\{provider-count} профилей";
+
     VerticalLayout {
         padding: 16px;
         spacing: 12px;
@@ -258,33 +472,44 @@ export component RoutingPage inherits Rectangle {
             VerticalLayout {
                 spacing: 14px;
 
-                // Preset selector.
-                HorizontalLayout {
-                    spacing: 10px;
-                    PresetCard {
-                        horizontal-stretch: 1;
-                        title: "Global";
-                        description: "Весь трафик через прокси";
-                        selected: RoutingBridge.preset == 0;
-                        clicked => { RoutingBridge.preset-selected(0); }
-                    }
-                    PresetCard {
-                        horizontal-stretch: 1;
-                        title: "Обход РФ";
-                        description: "РФ-сайты напрямую, реклама блокируется";
-                        selected: RoutingBridge.preset == 1;
-                        clicked => { RoutingBridge.preset-selected(1); }
-                    }
-                    PresetCard {
-                        horizontal-stretch: 1;
-                        title: "Свои правила";
-                        description: "Только ваши правила, остальное через прокси";
-                        selected: RoutingBridge.preset == 2;
-                        clicked => { RoutingBridge.preset-selected(2); }
+                // --- Пресеты -------------------------------------------------------------
+                Rectangle {
+                    background: transparent;
+                    VerticalLayout {
+                        spacing: 10px;
+                        SectionHeader {
+                            title: "Пресеты";
+                            collapsed: RoutingBridge.presets-collapsed;
+                            toggled => { RoutingBridge.presets-collapsed = !RoutingBridge.presets-collapsed; }
+                        }
+                        if !RoutingBridge.presets-collapsed : HorizontalLayout {
+                            spacing: 10px;
+                            PresetCard {
+                                horizontal-stretch: 1;
+                                title: "Global";
+                                description: "Весь трафик через прокси";
+                                selected: RoutingBridge.preset == 0;
+                                clicked => { RoutingBridge.preset-selected(0); }
+                            }
+                            PresetCard {
+                                horizontal-stretch: 1;
+                                title: "Обход РФ";
+                                description: "РФ-сайты напрямую, реклама блокируется";
+                                selected: RoutingBridge.preset == 1;
+                                clicked => { RoutingBridge.preset-selected(1); }
+                            }
+                            PresetCard {
+                                horizontal-stretch: 1;
+                                title: "Свои правила";
+                                description: "Только ваши правила, остальное через прокси";
+                                selected: RoutingBridge.preset == 2;
+                                clicked => { RoutingBridge.preset-selected(2); }
+                            }
+                        }
                     }
                 }
 
-                // Custom rules.
+                // --- Свои правила --------------------------------------------------------
                 Rectangle {
                     background: Theme.card-body;
                     border-radius: 12px;
@@ -295,15 +520,15 @@ export component RoutingPage inherits Rectangle {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 8px;
-                            Text {
-                                text: "Свои правила";
-                                color: Theme.text;
-                                font-size: 15px;
-                                font-weight: 600;
-                                vertical-alignment: center;
+                            alignment: center;
+                            SectionHeader {
                                 horizontal-stretch: 1;
+                                title: "Свои правила";
+                                summary: rules-summary;
+                                collapsed: RoutingBridge.rules-collapsed;
+                                toggled => { RoutingBridge.rules-collapsed = !RoutingBridge.rules-collapsed; }
                             }
-                            Rectangle {
+                            if !RoutingBridge.rules-collapsed : Rectangle {
                                 width: 170px;
                                 height: 32px;
                                 border-radius: 8px;
@@ -318,40 +543,47 @@ export component RoutingPage inherits Rectangle {
                                 add-ta := TouchArea { mouse-cursor: pointer; clicked => { RoutingBridge.rule-add(); } }
                             }
                         }
-                        if RoutingBridge.rules.length == 0 : Text {
-                            text: "Нет правил — трафик пойдёт по выбранному пресету";
-                            color: Theme.muted;
-                            font-size: 12px;
-                        }
-                        for rule in RoutingBridge.rules : RuleRow {
-                            index: rule.index;
-                            action: rule.action;
-                            kind: rule.kind;
-                            values: rule.values;
-                            enabled: rule.enabled;
-                            action-changed(a) => { RoutingBridge.rule-action-changed(rule.index, a); }
-                            kind-changed(k) => { RoutingBridge.rule-kind-changed(rule.index, k); }
-                            values-changed(k, t) => { RoutingBridge.rule-values-changed(rule.index, k, t); }
-                            enabled-changed(v) => { RoutingBridge.rule-enabled-changed(rule.index, v); }
-                            move-up => { RoutingBridge.rule-move(rule.index, -1); }
-                            move-down => { RoutingBridge.rule-move(rule.index, 1); }
-                            remove => { RoutingBridge.rule-delete(rule.index); }
-                        }
-                        if RoutingBridge.error-text != "" : Text {
-                            text: RoutingBridge.error-text;
-                            color: Theme.danger;
-                            font-size: 12px;
-                        }
-                        Text {
-                            text: "Формат Xray: geosite:category-ru · domain:example.com · geoip:ru · 10.0.0.0/8 · telegram.exe";
-                            color: Theme.muted;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                        if !RoutingBridge.rules-collapsed : VerticalLayout {
+                            spacing: 10px;
+                            if RoutingBridge.rules.length == 0 : Text {
+                                text: "Нет правил — трафик пойдёт по выбранному пресету";
+                                color: Theme.muted;
+                                font-size: 12px;
+                            }
+                            for rule in RoutingBridge.rules : RuleRow {
+                                index: rule.index;
+                                action: rule.action;
+                                enabled: rule.enabled;
+                                collapsed: rule.collapsed;
+                                domains: rule.domains;
+                                ips: rule.ips;
+                                processes: rule.processes;
+                                action-changed(a) => { RoutingBridge.rule-action-changed(rule.index, a); }
+                                enabled-changed(v) => { RoutingBridge.rule-enabled-changed(rule.index, v); }
+                                collapsed-changed(v) => { RoutingBridge.rule-collapsed-changed(rule.index, v); }
+                                item-edited(f, r, t) => { RoutingBridge.rule-item-edited(rule.index, f, r, t); }
+                                item-insert(f, r) => { RoutingBridge.rule-item-insert(rule.index, f, r); }
+                                item-remove(f, r) => { RoutingBridge.rule-item-remove(rule.index, f, r); }
+                                move-up => { RoutingBridge.rule-move(rule.index, -1); }
+                                move-down => { RoutingBridge.rule-move(rule.index, 1); }
+                                remove => { RoutingBridge.rule-delete(rule.index); }
+                            }
+                            if RoutingBridge.error-text != "" : Text {
+                                text: RoutingBridge.error-text;
+                                color: Theme.danger;
+                                font-size: 12px;
+                            }
+                            Text {
+                                text: "Формат Xray: geosite:category-ru · domain:example.com · geoip:ru · 10.0.0.0/8 · telegram.exe";
+                                color: Theme.muted;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
                         }
                     }
                 }
 
-                // Domain strategy + QUIC.
+                // --- Дополнительно -------------------------------------------------------
                 Rectangle {
                     background: Theme.card-body;
                     border-radius: 12px;
@@ -360,13 +592,12 @@ export component RoutingPage inherits Rectangle {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 10px;
-                        Text {
-                            text: "Дополнительно";
-                            color: Theme.text;
-                            font-size: 15px;
-                            font-weight: 600;
+                        SectionHeader {
+                            title: "Дополнительно";
+                            collapsed: RoutingBridge.extra-collapsed;
+                            toggled => { RoutingBridge.extra-collapsed = !RoutingBridge.extra-collapsed; }
                         }
-                        HorizontalLayout {
+                        if !RoutingBridge.extra-collapsed : HorizontalLayout {
                             spacing: 12px;
                             alignment: center;
                             Text {
@@ -396,7 +627,7 @@ export component RoutingPage inherits Rectangle {
                     }
                 }
 
-                // Provider routing.
+                // --- Маршрутизация провайдера -------------------------------------------
                 Rectangle {
                     background: Theme.card-body;
                     border-radius: 12px;
@@ -405,25 +636,28 @@ export component RoutingPage inherits Rectangle {
                     VerticalLayout {
                         padding: 12px;
                         spacing: 10px;
-                        Text {
-                            text: "Маршрутизация провайдера";
-                            color: Theme.text;
-                            font-size: 15px;
-                            font-weight: 600;
+                        SectionHeader {
+                            title: "Маршрутизация провайдера";
+                            summary: providers-summary;
+                            collapsed: RoutingBridge.providers-collapsed;
+                            toggled => { RoutingBridge.providers-collapsed = !RoutingBridge.providers-collapsed; }
                         }
-                        if !RoutingBridge.has-providers : Text {
-                            text: "В ваших подписках нет маршрутизации провайдера";
-                            color: Theme.muted;
-                            font-size: 12px;
-                            wrap: word-wrap;
-                        }
-                        for provider in RoutingBridge.providers : ProviderRow {
-                            name: provider.name;
-                            rules-text: provider.rules-text;
-                            enabled: provider.enabled;
-                            ignored: provider.ignored;
-                            enabled-changed(v) => { RoutingBridge.provider-enabled-changed(provider.id, v); }
-                            ignored-changed(v) => { RoutingBridge.provider-ignored-changed(provider.id, v); }
+                        if !RoutingBridge.providers-collapsed : VerticalLayout {
+                            spacing: 10px;
+                            if !RoutingBridge.has-providers : Text {
+                                text: "В ваших подписках нет маршрутизации провайдера";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            for provider in RoutingBridge.providers : ProviderRow {
+                                name: provider.name;
+                                rules-text: provider.rules-text;
+                                enabled: provider.enabled;
+                                ignored: provider.ignored;
+                                enabled-changed(v) => { RoutingBridge.provider-enabled-changed(provider.id, v); }
+                                ignored-changed(v) => { RoutingBridge.provider-ignored-changed(provider.id, v); }
+                            }
                         }
                     }
                 }
