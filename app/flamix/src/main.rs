@@ -8,6 +8,7 @@ mod controller;
 mod demo;
 mod flags;
 mod instance;
+mod pages;
 mod persist;
 mod view;
 
@@ -22,6 +23,8 @@ slint::include_modules!();
 struct Args {
     demo: bool,
     light: bool,
+    /// `--page N` for `--screenshot`: which page to render (0 servers .. 5 about).
+    page: i32,
     minimized: bool,
     screenshot: Option<String>,
     import: Option<String>,
@@ -34,6 +37,7 @@ fn parse_args(raw: &[String]) -> Args {
         match arg.as_str() {
             "--screenshot" => args.screenshot = it.next().cloned(),
             "--light" => args.light = true,
+            "--page" => args.page = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--demo" => args.demo = true,
             "--minimized" => args.minimized = true,
             other if other.starts_with('-') => {
@@ -125,7 +129,7 @@ fn main() -> anyhow::Result<()> {
         } else {
             Some(persist::load(&data_dir)?)
         };
-        return demo::screenshot(Path::new(path), args.light, state.as_ref());
+        return demo::screenshot(Path::new(path), args.light, args.page, state.as_ref());
     }
 
     // Hand our arguments to a running instance (unless this is the demo).
@@ -145,6 +149,7 @@ fn main() -> anyhow::Result<()> {
     let ui = AppWindow::new()?;
     let _controller = if args.demo {
         demo::setup(&ui)?;
+        pages::init(&ui, None);
         None
     } else {
         let rt = build_runtime()?;
@@ -157,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             })
             .await;
         });
+        pages::init(&ui, Some(&controller));
         Some(controller)
     };
 

@@ -443,7 +443,12 @@ fn apply_state(ui: &AppWindow, state: &AppState) {
 ///
 /// `state` is `Some` for the real data path (loaded from `FLAMIX_HOME`) and `None` for the
 /// `--demo` screenshot.
-pub fn screenshot(path: &Path, light: bool, state: Option<&AppState>) -> anyhow::Result<()> {
+pub fn screenshot(
+    path: &Path,
+    light: bool,
+    page: i32,
+    state: Option<&AppState>,
+) -> anyhow::Result<()> {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
     struct ShotPlatform {
@@ -468,12 +473,13 @@ pub fn screenshot(path: &Path, light: bool, state: Option<&AppState>) -> anyhow:
         Some(state) => apply_state(&ui, state),
         None => setup(&ui)?,
     }
+    crate::pages::init(&ui, None);
 
     // The build host has no system fonts; use the bundled DejaVu family for the shot.
     ui.set_font_family("DejaVu Sans".into());
     ui.set_dark(!light);
     ui.global::<crate::Theme>().set_dark(!light);
-    ui.set_page(0);
+    ui.set_page(page);
     ui.set_state(ConnState::Connected);
     ui.set_status_text("Подключено".into());
     ui.set_speed_text("↑ 1.2 MB/s   ↓ 3.4 MB/s".into());

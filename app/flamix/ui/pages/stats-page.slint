@@ -1,0 +1,12 @@
+// Page "Статистика". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Rust side: src/pages/stats.rs talks to the page ONLY through the global StatsBridge.
+import { PlaceholderPage } from "placeholder-page.slint";
+
+export global StatsBridge {
+}
+
+export component StatsPage inherits Rectangle {
+    PlaceholderPage {
+        title: "Статистика";
+    }
+}

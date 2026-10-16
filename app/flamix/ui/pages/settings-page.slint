@@ -1,0 +1,12 @@
+// Page "Настройки". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Rust side: src/pages/settings.rs talks to the page ONLY through the global SettingsBridge.
+import { PlaceholderPage } from "placeholder-page.slint";
+
+export global SettingsBridge {
+}
+
+export component SettingsPage inherits Rectangle {
+    PlaceholderPage {
+        title: "Настройки";
+    }
+}

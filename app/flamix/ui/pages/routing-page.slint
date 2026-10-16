@@ -1,0 +1,12 @@
+// Page "Маршрутизация". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Rust side: src/pages/routing.rs talks to the page ONLY through the global RoutingBridge.
+import { PlaceholderPage } from "placeholder-page.slint";
+
+export global RoutingBridge {
+}
+
+export component RoutingPage inherits Rectangle {
+    PlaceholderPage {
+        title: "Маршрутизация";
+    }
+}

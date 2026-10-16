@@ -706,7 +706,10 @@ impl Controller {
                 socks_port: settings.socks_port,
                 bypass: settings.proxy_bypass.clone(),
             };
+            // Marker first: if we die between set and the marker, the next start must still clear it.
+            mark_proxy_set(&self.data_dir);
             if let Err(err) = set_system_proxy(spec).await {
+                clear_proxy_marker(&self.data_dir);
                 let _ = running.stop().await;
                 self.set_conn_state(
                     ConnState::Error,
@@ -714,7 +717,6 @@ impl Controller {
                 );
                 return;
             }
-            mark_proxy_set(&self.data_dir);
         }
 
         *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(Connection {
@@ -1178,6 +1180,56 @@ impl Controller {
             }
         }
         self.persist_and_render();
+    }
+}
+
+/// API for the secondary pages (`src/pages/*`). Pages must not touch private fields.
+#[allow(dead_code)] // filled in by the page tasks (docs/tasks/T17-pages.md)
+impl Controller {
+    /// Read the state (clone what you need; never hold the lock across await/UI calls).
+    pub fn with_state<R>(&self, f: impl FnOnce(&AppState) -> R) -> R {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f(&state)
+    }
+
+    /// Mutate the state, then persist (debounced) and re-render the servers view.
+    pub fn mutate(self: &Arc<Self>, f: impl FnOnce(&mut AppState)) {
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            f(&mut state);
+        }
+        self.persist_and_render();
+    }
+
+    /// Import a subscription URL / share links / deep link exactly like the clipboard import.
+    pub fn import(self: &Arc<Self>, text: &str) {
+        self.import_text(text);
+    }
+
+    /// True while a core is running.
+    pub fn is_connected(&self) -> bool {
+        self.conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
+    /// Apply changed settings/routing: reconnect if connected (no-op otherwise).
+    pub fn reconnect_if_connected(self: &Arc<Self>) {
+        let selected = self.with_state(|s| s.selected_server.clone());
+        if let (true, Some(id)) = (self.is_connected(), selected) {
+            self.start_connect(id);
+        }
+    }
+
+    /// Tokio runtime handle for page background work.
+    pub fn runtime(&self) -> tokio::runtime::Handle {
+        self.rt.clone()
+    }
+
+    /// Show a line in the status text of the connection panel.
+    pub fn status(&self, text: impl Into<String>) {
+        self.set_status(text);
     }
 }
 

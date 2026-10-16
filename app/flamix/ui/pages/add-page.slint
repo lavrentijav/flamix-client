@@ -1,0 +1,12 @@
+// Page "Добавить". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Rust side: src/pages/add.rs talks to the page ONLY through the global AddBridge.
+import { PlaceholderPage } from "placeholder-page.slint";
+
+export global AddBridge {
+}
+
+export component AddPage inherits Rectangle {
+    PlaceholderPage {
+        title: "Добавить";
+    }
+}

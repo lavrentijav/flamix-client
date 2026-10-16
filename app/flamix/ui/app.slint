@@ -8,7 +8,12 @@ export { Theme } from "theme.slint";
 import { Rail } from "components/rail.slint";
 import { ServersPanel } from "components/servers-panel.slint";
 import { ConnectionPanel } from "components/connection-panel.slint";
-import { PlaceholderPage } from "pages/placeholder-page.slint";
+import { AddPage, AddBridge } from "pages/add-page.slint";
+import { RoutingPage, RoutingBridge } from "pages/routing-page.slint";
+import { SettingsPage, SettingsBridge } from "pages/settings-page.slint";
+import { StatsPage, StatsBridge } from "pages/stats-page.slint";
+import { AboutPage, AboutBridge } from "pages/about-page.slint";
+export { AddBridge, RoutingBridge, SettingsBridge, StatsBridge, AboutBridge }
 import { ServerItem, SubscriptionItem, ConnState } from "model.slint";
 export { ServerItem, SubscriptionItem, ConnState } from "model.slint";
 
@@ -94,10 +99,11 @@ export component AppWindow inherits Window {
                 open-server(id) => { root.open-server(id); }
                 delete-server(id) => { root.delete-server(id); }
             }
-            if root.page != 0 : PlaceholderPage {
-                horizontal-stretch: 1;
-                title: root.page == 1 ? "Добавить" : root.page == 2 ? "Маршрутизация" : root.page == 3 ? "Настройки" : root.page == 4 ? "Статистика" : root.page == 5 ? "О программе" : "Серверы";
-            }
+            if root.page == 1 : AddPage { horizontal-stretch: 1; }
+            if root.page == 2 : RoutingPage { horizontal-stretch: 1; }
+            if root.page == 3 : SettingsPage { horizontal-stretch: 1; }
+            if root.page == 4 : StatsPage { horizontal-stretch: 1; }
+            if root.page == 5 : AboutPage { horizontal-stretch: 1; }
 
             ConnectionPanel {
                 selected-flag: root.selected-flag;

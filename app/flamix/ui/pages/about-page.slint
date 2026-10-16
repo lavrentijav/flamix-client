@@ -1,0 +1,12 @@
+// Page "О программе". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Rust side: src/pages/about.rs talks to the page ONLY through the global AboutBridge.
+import { PlaceholderPage } from "placeholder-page.slint";
+
+export global AboutBridge {
+}
+
+export component AboutPage inherits Rectangle {
+    PlaceholderPage {
+        title: "О программе";
+    }
+}
