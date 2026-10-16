@@ -1,12 +1,457 @@
 // Page "Статистика". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
 // Rust side: src/pages/stats.rs talks to the page ONLY through the global StatsBridge.
-import { PlaceholderPage } from "placeholder-page.slint";
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Icon } from "../components/icon.slint";
+
+// One header summary card (session / today / 30 days).
+export struct StatCard {
+    title: string,
+    value: string,
+    up: string,
+    down: string,
+    highlight: bool,
+}
+
+// One column of the 30-day chart. Fractions are relative to the tallest day (0..=1).
+export struct DayBar {
+    /// "12.05" axis label.
+    label: string,
+    /// "12.05.2026" full date for the tooltip.
+    day: string,
+    up: string,
+    down: string,
+    up-fraction: float,
+    down-fraction: float,
+}
+
+// One row of "Топ серверов".
+export struct TopServer {
+    name: string,
+    flag: image,
+    total: string,
+    fraction: float,
+}
+
+// One subscription summary row.
+export struct SubStat {
+    name: string,
+    traffic: string,
+    fraction: float,
+    expire: string,
+    quotas: int,
+}
 
 export global StatsBridge {
+    in property <[StatCard]> cards;
+    in property <[DayBar]> bars;
+    in property <[TopServer]> top-servers;
+    in property <[SubStat]> subscriptions;
+    /// Clear `daily_traffic` and every `local_traffic`.
+    callback reset-requested();
+}
+
+component StatCardView inherits Rectangle {
+    in property <StatCard> card;
+
+    background: card.highlight ? Theme.accent.with-alpha(0.14) : Theme.card-body;
+    border-radius: 12px;
+    height: content.preferred-height;
+    horizontal-stretch: 1;
+
+    content := VerticalLayout {
+        padding: 14px;
+        spacing: 4px;
+        Text {
+            text: card.title;
+            color: Theme.muted;
+            font-size: 12px;
+        }
+        Text {
+            text: card.value;
+            color: card.highlight ? Theme.accent : Theme.text;
+            font-size: 22px;
+            font-weight: 700;
+        }
+        HorizontalLayout {
+            spacing: 10px;
+            Text {
+                text: card.up;
+                color: Theme.accent-strong;
+                font-size: 12px;
+            }
+            Text {
+                text: card.down;
+                color: Theme.accent;
+                font-size: 12px;
+            }
+        }
+    }
 }
 
 export component StatsPage inherits Rectangle {
-    PlaceholderPage {
-        title: "Статистика";
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    // Local UI state of the destructive "reset" confirm row.
+    in-out property <bool> confirm-reset: false;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            height: 34px;
+            Text {
+                text: "Статистика";
+                color: Theme.text;
+                font-size: 24px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text {
+                text: "обновляется автоматически";
+                color: Theme.muted;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 12px;
+
+                // --- header cards -------------------------------------------------
+                HorizontalLayout {
+                    spacing: 12px;
+                    for card in StatsBridge.cards : StatCardView { card: card; }
+                }
+
+                // --- 30-day chart -------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    height: chart-content.preferred-height;
+                    chart-content := VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+
+                        HorizontalLayout {
+                            Text {
+                                text: "Трафик за 30 дней";
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 2px;
+                                background: Theme.accent-strong;
+                            }
+                            Text { text: "отдача"; color: Theme.muted; font-size: 11px; }
+                            Rectangle {
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 2px;
+                                background: Theme.accent;
+                            }
+                            Text { text: "загрузка"; color: Theme.muted; font-size: 11px; }
+                        }
+
+                        // Chart area: 30 stacked columns, tallest = full height.
+                        chart := Rectangle {
+                            height: 170px;
+                            HorizontalLayout {
+                                spacing: 3px;
+                                alignment: end;
+                                for b in StatsBridge.bars : Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: parent.height;
+                                    background: bar-ta.has-hover ? Theme.hover : transparent;
+                                    bar-ta := TouchArea { mouse-cursor: pointer; }
+                                    column := Rectangle {
+                                        width: parent.width;
+                                        y: parent.height - self.height;
+                                        height: min(parent.height * (b.up-fraction + b.down-fraction), parent.height);
+                                        background: transparent;
+                                        // Download (bottom, accent).
+                                        Rectangle {
+                                            y: parent.height - self.height;
+                                            width: parent.width;
+                                            height: (b.up-fraction + b.down-fraction) <= 0 ? 0px
+                                                : parent.height * b.down-fraction / (b.up-fraction + b.down-fraction);
+                                            border-radius: 2px;
+                                            background: Theme.accent;
+                                        }
+                                        // Upload (top, darker accent).
+                                        Rectangle {
+                                            y: 0px;
+                                            width: parent.width;
+                                            height: (b.up-fraction + b.down-fraction) <= 0 ? 0px
+                                                : parent.height * b.up-fraction / (b.up-fraction + b.down-fraction);
+                                            border-radius: 2px;
+                                            background: Theme.accent-strong;
+                                        }
+                                    }
+                                    // Tooltip on hover / tap.
+                                    if bar-ta.has-hover : Rectangle {
+                                        x: (parent.width - self.width) / 2;
+                                        y: 0px;
+                                        width: 96px;
+                                        height: 46px;
+                                        border-radius: 8px;
+                                        background: Theme.panel-bg;
+                                        border-width: 1px;
+                                        border-color: Theme.stroke;
+                                        z: 3;
+                                        VerticalLayout {
+                                            padding: 6px;
+                                            spacing: 1px;
+                                            Text { text: b.day; color: Theme.text; font-size: 10px; }
+                                            Text { text: "↓ " + b.down; color: Theme.accent; font-size: 10px; }
+                                            Text { text: "↑ " + b.up; color: Theme.accent-strong; font-size: 10px; }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Axis labels (first / last day).
+                        HorizontalLayout {
+                            Text {
+                                text: StatsBridge.bars.length > 0 ? StatsBridge.bars[0].label : "";
+                                color: Theme.muted;
+                                font-size: 10px;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text {
+                                text: StatsBridge.bars.length > 0 ? StatsBridge.bars[StatsBridge.bars.length - 1].label : "";
+                                color: Theme.muted;
+                                font-size: 10px;
+                            }
+                        }
+                    }
+                }
+
+                // --- top servers --------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    height: top-content.preferred-height;
+                    top-content := VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        Text {
+                            text: "Топ серверов";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        if StatsBridge.top-servers.length == 0 : Text {
+                            text: "Пока нет данных о трафике";
+                            color: Theme.muted;
+                            font-size: 12px;
+                        }
+                        for server in StatsBridge.top-servers : Rectangle {
+                            height: 46px;
+                            background: transparent;
+                            Image {
+                                x: 0px;
+                                y: (parent.height - self.height) / 2;
+                                width: 24px;
+                                height: 18px;
+                                source: server.flag;
+                            }
+                            Text {
+                                x: 34px;
+                                y: 3px;
+                                width: parent.width - 34px - 90px;
+                                text: server.name;
+                                color: Theme.text;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: parent.width - 90px;
+                                y: 3px;
+                                width: 90px;
+                                text: server.total;
+                                color: Theme.muted;
+                                font-size: 12px;
+                                horizontal-alignment: right;
+                            }
+                            Rectangle {
+                                x: 34px;
+                                y: 28px;
+                                width: parent.width - 34px;
+                                height: 4px;
+                                border-radius: 2px;
+                                background: Theme.track;
+                                Rectangle {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: min(parent.width * server.fraction, parent.width);
+                                    height: parent.height;
+                                    border-radius: 2px;
+                                    background: Theme.accent;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // --- subscriptions ------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    height: subs-content.preferred-height;
+                    subs-content := VerticalLayout {
+                        padding: 14px;
+                        spacing: 8px;
+                        Text {
+                            text: "Подписки";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        if StatsBridge.subscriptions.length == 0 : Text {
+                            text: "Нет подписок";
+                            color: Theme.muted;
+                            font-size: 12px;
+                        }
+                        for sub in StatsBridge.subscriptions : Rectangle {
+                            height: 50px;
+                            background: transparent;
+                            Text {
+                                x: 0px;
+                                y: 2px;
+                                width: parent.width - 150px;
+                                text: sub.name;
+                                color: Theme.text;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: parent.width - 150px;
+                                y: 2px;
+                                width: 150px;
+                                text: sub.traffic;
+                                color: Theme.muted;
+                                font-size: 12px;
+                                horizontal-alignment: right;
+                            }
+                            Rectangle {
+                                x: 0px;
+                                y: 26px;
+                                width: parent.width;
+                                height: 4px;
+                                border-radius: 2px;
+                                background: Theme.track;
+                                Rectangle {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: min(parent.width * sub.fraction, parent.width);
+                                    height: parent.height;
+                                    border-radius: 2px;
+                                    background: sub.fraction > 0.9 ? Theme.danger : Theme.accent;
+                                }
+                            }
+                            Text {
+                                x: 0px;
+                                y: 34px;
+                                text: sub.expire;
+                                color: Theme.muted;
+                                font-size: 11px;
+                            }
+                            if sub.quotas > 0 : Text {
+                                x: parent.width - 220px;
+                                y: 34px;
+                                width: 220px;
+                                text: "серверов с лимитом: " + sub.quotas;
+                                color: Theme.muted;
+                                font-size: 11px;
+                                horizontal-alignment: right;
+                            }
+                        }
+                    }
+                }
+
+                // --- reset --------------------------------------------------------
+                Rectangle {
+                    background: transparent;
+                    height: 40px;
+                    if !root.confirm-reset : Rectangle {
+                        width: 220px;
+                        height: 38px;
+                        border-radius: 8px;
+                        background: reset-ta.has-hover ? Theme.danger.with-alpha(0.22) : Theme.control-bg;
+                        Text {
+                            text: "Сбросить статистику";
+                            color: Theme.danger;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        reset-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.confirm-reset = true; }
+                        }
+                    }
+                    if root.confirm-reset : HorizontalLayout {
+                        spacing: 10px;
+                        Text {
+                            text: "Сбросить всю статистику?";
+                            color: Theme.danger;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle {
+                            width: 110px;
+                            height: 38px;
+                            border-radius: 8px;
+                            background: yes-ta.has-hover ? Theme.danger : Theme.danger.with-alpha(0.85);
+                            Text {
+                                text: "Сбросить";
+                                color: Theme.on-accent;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            yes-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.confirm-reset = false;
+                                    StatsBridge.reset-requested();
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 100px;
+                            height: 38px;
+                            border-radius: 8px;
+                            background: no-ta.has-hover ? Theme.hover : Theme.control-bg;
+                            Text {
+                                text: "Отмена";
+                                color: Theme.text;
+                                font-size: 13px;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            no-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.confirm-reset = false; }
+                            }
+                        }
+                    }
+                }
+
+                Rectangle { height: 4px; background: transparent; }
+            }
+        }
     }
 }
