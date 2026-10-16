@@ -8,7 +8,7 @@ use crate::flags;
 use crate::{ServerItem, SubscriptionItem};
 use flamix_core::model::{AppState, Server, Subscription, TrafficInfo};
 use slint::{ModelRc, VecModel};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 /// `ServerItem.ping`: not tested yet.
 pub const PING_UNTESTED: i32 = -2;
@@ -98,8 +98,60 @@ pub fn server_iso(server: &Server) -> String {
         .unwrap_or_else(|| "UN".to_string())
 }
 
-/// Convert one server to the UI model.
-pub fn server_item(server: &Server, selected: bool) -> ServerItem {
+/// Exit-IP display data of one server: the measured egress IP and the size of its group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExitInfo {
+    /// Measured public exit IP, empty when never probed.
+    pub ip: String,
+    /// 0 = no measured exit or a unique exit, otherwise the number of servers (>1) sharing it.
+    pub group: i32,
+}
+
+/// Group servers by their **measured** exit IP: `ip -> sorted server ids`.
+///
+/// Only servers with a successful probe (`exit_ips[id].ip` non-empty) are included, so an
+/// input address shared by two servers is irrelevant — the egress must have been observed.
+pub fn exit_groups(state: &AppState) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for server in state.servers() {
+        let Some(exit) = state.exit_ips.get(&server.id) else {
+            continue;
+        };
+        if exit.ip.is_empty() {
+            continue;
+        }
+        out.entry(exit.ip.clone())
+            .or_default()
+            .push(server.id.clone());
+    }
+    for ids in out.values_mut() {
+        ids.sort();
+    }
+    out
+}
+
+/// Exit-IP display data for one server, resolved through the precomputed group map.
+pub fn exit_info(state: &AppState, groups: &BTreeMap<String, Vec<String>>, id: &str) -> ExitInfo {
+    let Some(exit) = state.exit_ips.get(id) else {
+        return ExitInfo::default();
+    };
+    if exit.ip.is_empty() {
+        return ExitInfo::default();
+    }
+    // A group of one is not a shared exit: report 0 so only real sharing shows a badge.
+    let group = groups
+        .get(&exit.ip)
+        .map(|ids| ids.len() as i32)
+        .filter(|count| *count > 1)
+        .unwrap_or(0);
+    ExitInfo {
+        ip: exit.ip.clone(),
+        group,
+    }
+}
+
+/// Convert one server to the UI model, including the measured exit IP and its group size.
+pub fn server_item_with_exit(server: &Server, selected: bool, exit: ExitInfo) -> ServerItem {
     let (has_quota, quota_fraction, quota_text) = server_quota(server);
     ServerItem {
         id: server.id.clone().into(),
@@ -112,6 +164,8 @@ pub fn server_item(server: &Server, selected: bool) -> ServerItem {
         quota_fraction,
         quota_text: quota_text.into(),
         selected,
+        exit_ip: exit.ip.into(),
+        exit_group: exit.group,
     }
 }
 
@@ -187,11 +241,15 @@ pub fn build_subscriptions(
     // Pinned subscriptions first, otherwise keep the stored order.
     subs.sort_by_key(|sub| !sub.pinned);
 
+    let groups = exit_groups(state);
     subs.into_iter()
         .map(|sub| {
             let servers: Vec<ServerItem> = filter_servers(&sub.servers, &query_lower, sort_by_ping)
                 .into_iter()
-                .map(|s| server_item(s, state.selected_server.as_deref() == Some(&s.id)))
+                .map(|s| {
+                    let exit = exit_info(state, &groups, &s.id);
+                    server_item_with_exit(s, state.selected_server.as_deref() == Some(&s.id), exit)
+                })
                 .collect();
             let traffic = sub.traffic;
             SubscriptionItem {
@@ -218,9 +276,13 @@ pub fn build_subscriptions(
 /// Build the standalone (local) server list. `query` filters by name.
 pub fn build_local_servers(state: &AppState, query: &str, sort_by_ping: bool) -> Vec<ServerItem> {
     let query_lower = query.to_lowercase();
+    let groups = exit_groups(state);
     filter_servers(&state.local_servers, &query_lower, sort_by_ping)
         .into_iter()
-        .map(|s| server_item(s, state.selected_server.as_deref() == Some(&s.id)))
+        .map(|s| {
+            let exit = exit_info(state, &groups, &s.id);
+            server_item_with_exit(s, state.selected_server.as_deref() == Some(&s.id), exit)
+        })
         .collect()
 }
 
@@ -494,6 +556,110 @@ mod tests {
             ..HwidStatus::default()
         });
         assert_eq!(subscription_error(&sub), "Достигнут лимит устройств");
+    }
+
+    #[test]
+    fn exit_groups_only_measured_and_sorted() {
+        use flamix_core::model::ExitIp;
+        let mut state = AppState {
+            local_servers: vec![server("b", "B", None), server("a", "A", None)],
+            ..AppState::default()
+        };
+        state.exit_ips.insert(
+            "a".to_string(),
+            ExitIp {
+                ip: "203.0.113.7".to_string(),
+                checked: 1,
+            },
+        );
+        state.exit_ips.insert(
+            "b".to_string(),
+            ExitIp {
+                ip: "203.0.113.7".to_string(),
+                checked: 1,
+            },
+        );
+        // Unmeasured and empty-ip entries are excluded.
+        state.exit_ips.insert(
+            "c".to_string(),
+            ExitIp {
+                ip: String::new(),
+                checked: 1,
+            },
+        );
+
+        let groups = exit_groups(&state);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(
+            groups.get("203.0.113.7").unwrap(),
+            &vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn server_item_carries_exit_ip_and_group() {
+        use flamix_core::model::ExitIp;
+        let mut state = AppState {
+            local_servers: vec![server("a", "A", None), server("b", "B", None)],
+            ..AppState::default()
+        };
+        state.exit_ips.insert(
+            "a".to_string(),
+            ExitIp {
+                ip: "203.0.113.7".to_string(),
+                checked: 1,
+            },
+        );
+        state.exit_ips.insert(
+            "b".to_string(),
+            ExitIp {
+                ip: "203.0.113.7".to_string(),
+                checked: 1,
+            },
+        );
+
+        let items = build_local_servers(&state, "", false);
+        for item in &items {
+            assert_eq!(item.exit_ip.as_str(), "203.0.113.7");
+            assert_eq!(item.exit_group, 2);
+        }
+    }
+
+    #[test]
+    fn singleton_exit_group_is_zero() {
+        use flamix_core::model::ExitIp;
+        let mut state = AppState {
+            local_servers: vec![server("a", "A", None), server("b", "B", None)],
+            ..AppState::default()
+        };
+        // Only "a" is measured and unique: no shared exit, so no badge.
+        state.exit_ips.insert(
+            "a".to_string(),
+            ExitIp {
+                ip: "203.0.113.9".to_string(),
+                checked: 1,
+            },
+        );
+
+        let items = build_local_servers(&state, "", false);
+        let a = items.iter().find(|i| i.id.as_str() == "a").unwrap();
+        assert_eq!(a.exit_ip.as_str(), "203.0.113.9");
+        assert_eq!(a.exit_group, 0);
+
+        let b = items.iter().find(|i| i.id.as_str() == "b").unwrap();
+        assert_eq!(b.exit_ip.as_str(), "");
+        assert_eq!(b.exit_group, 0);
+    }
+
+    #[test]
+    fn server_item_without_measurement_has_empty_exit() {
+        let state = AppState {
+            local_servers: vec![server("a", "A", None)],
+            ..AppState::default()
+        };
+        let items = build_local_servers(&state, "", false);
+        assert_eq!(items[0].exit_ip.as_str(), "");
+        assert_eq!(items[0].exit_group, 0);
     }
 
     #[test]

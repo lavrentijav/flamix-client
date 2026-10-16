@@ -9,7 +9,7 @@ export component ServerRow inherits Rectangle {
     callback open();
     callback delete-clicked();
 
-    height: item.has-quota ? 64px : 50px;
+    height: (item.has-quota ? 64px : 50px) + (item.exit-ip == "" ? 0px : 18px);
     border-radius: 8px;
     background: item.selected ? Theme.accent.with-alpha(0.18) : (ta.has-hover ? Theme.hover : transparent);
     animate background { duration: 140ms; }
@@ -39,7 +39,7 @@ export component ServerRow inherits Rectangle {
     }
     Text {
         x: 48px;
-        y: item.has-quota ? 27px : 25px;
+        y: 25px;
         width: parent.width - 48px - 104px;
         text: item.summary;
         color: Theme.muted;
@@ -50,7 +50,7 @@ export component ServerRow inherits Rectangle {
     // Per-server quota: thin bar + remaining text.
     if item.has-quota : Rectangle {
         x: 48px;
-        y: 47px;
+        y: 52px;
         width: 150px;
         height: 3px;
         border-radius: 2px;
@@ -66,10 +66,23 @@ export component ServerRow inherits Rectangle {
     }
     if item.has-quota : Text {
         x: 204px;
-        y: 41px;
+        y: 40px;
         text: item.quota-text;
         color: Theme.muted;
         font-size: 11px;
+    }
+
+    // Measured egress IP (muted, small), with a badge when several servers share it.
+    // The row reserves a dedicated 18px slot at its bottom (see `height`), below the
+    // summary and the quota bar, so nothing overlaps.
+    if item.exit-ip != "" : Text {
+        x: 48px;
+        y: parent.height - 18px;
+        height: 16px;
+        text: item.exit-group > 1 ? "\{item.exit-ip}   IP ×\{item.exit-group}" : item.exit-ip;
+        color: item.exit-group > 1 ? Theme.accent : Theme.muted;
+        font-size: 11px;
+        vertical-alignment: center;
     }
 
     // Ping badge.

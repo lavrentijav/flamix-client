@@ -36,7 +36,7 @@ fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {
     ModelRc::new(VecModel::from(items))
 }
 
-fn server(id: &str, iso: &str, name: &str, summary: &str, ping: i32) -> ServerItem {
+fn server(id: &str, iso: &str, name: &str, summary: &str, ping: i32, exit_ip: &str) -> ServerItem {
     ServerItem {
         id: id.into(),
         name: name.into(),
@@ -48,6 +48,34 @@ fn server(id: &str, iso: &str, name: &str, summary: &str, ping: i32) -> ServerIt
         quota_fraction: 0.0,
         quota_text: "".into(),
         selected: false,
+        exit_ip: exit_ip.into(),
+        exit_group: 0,
+    }
+}
+
+/// Fill `exit-group` on the demo servers: the size of the set sharing each measured exit IP.
+fn assign_exit_groups(subs: &mut [SubData], locals: &mut [ServerItem]) {
+    let mut counts: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for item in subs
+        .iter()
+        .flat_map(|s| s.servers.iter())
+        .chain(locals.iter())
+    {
+        if !item.exit_ip.is_empty() {
+            *counts.entry(item.exit_ip.to_string()).or_default() += 1;
+        }
+    }
+    for item in subs
+        .iter_mut()
+        .flat_map(|s| s.servers.iter_mut())
+        .chain(locals.iter_mut())
+    {
+        // A group of one is not a shared exit: only sizes > 1 get a badge.
+        item.exit_group = counts
+            .get(item.exit_ip.as_str())
+            .copied()
+            .filter(|count| *count > 1)
+            .unwrap_or(0);
     }
 }
 
@@ -141,11 +169,40 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
             "Frankfurt · Reality",
             "vless / tcp / reality",
             42,
+            "203.0.113.7",
         ),
-        server("de-2", "DE", "Берлин · WebSocket", "vless / ws / tls", 88),
-        server("nl-1", "NL", "Amsterdam · gRPC", "vless / grpc / tls", 121),
-        server("ru-1", "RU", "Москва · WS", "vmess / ws / tls", 15),
-        server("fi-1", "FI", "Helsinki · xhttp", "vless / xhttp / tls", 214),
+        server(
+            "de-2",
+            "DE",
+            "Берлин · WebSocket",
+            "vless / ws / tls",
+            88,
+            "203.0.113.7",
+        ),
+        server(
+            "nl-1",
+            "NL",
+            "Amsterdam · gRPC",
+            "vless / grpc / tls",
+            121,
+            "203.0.113.7",
+        ),
+        server(
+            "ru-1",
+            "RU",
+            "Москва · WS",
+            "vmess / ws / tls",
+            15,
+            "198.51.100.42",
+        ),
+        server(
+            "fi-1",
+            "FI",
+            "Helsinki · xhttp",
+            "vless / xhttp / tls",
+            214,
+            "198.51.100.42",
+        ),
     ];
     // One server with its own quota.
     premium[3].has_quota = true;
@@ -154,9 +211,23 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
     premium[3].selected = true;
 
     let basic = vec![
-        server("us-1", "US", "New York", "trojan / tcp / tls", 321),
-        server("ru-2", "RU", "Санкт-Петербург", "vmess / ws / tls", -1),
-        server("sg-1", "SG", "Singapore", "hysteria2", -2),
+        server(
+            "us-1",
+            "US",
+            "New York",
+            "trojan / tcp / tls",
+            321,
+            "192.0.2.10",
+        ),
+        server(
+            "ru-2",
+            "RU",
+            "Санкт-Петербург",
+            "vmess / ws / tls",
+            -1,
+            "203.0.113.7",
+        ),
+        server("sg-1", "SG", "Singapore", "hysteria2", -2, ""),
     ];
 
     let subs = vec![
@@ -190,9 +261,19 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
         },
     ];
 
-    let mut local = server("local-1", "RU", "Локальный сервер", "vless / tcp / tls", 7);
+    let mut local = server(
+        "local-1",
+        "RU",
+        "Локальный сервер",
+        "vless / tcp / tls",
+        7,
+        "192.0.2.10",
+    );
     local.selected = false;
-    (subs, vec![local])
+    let mut subs = subs;
+    let mut locals = vec![local];
+    assign_exit_groups(&mut subs, &mut locals);
+    (subs, locals)
 }
 
 /// Fill the window with demo data and wire all callbacks (temporary until the controller exists).
@@ -271,6 +352,14 @@ pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
                     }
                 }
                 rebuild(&ui, &s, &l);
+            }
+        });
+    }
+    {
+        let w = ui.as_weak();
+        ui.on_check_exit_ips(move || {
+            if let Some(ui) = w.upgrade() {
+                ui.set_status_text("Демо: IP уже измерены".into());
             }
         });
     }
