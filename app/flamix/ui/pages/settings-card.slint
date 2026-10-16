@@ -1,0 +1,90 @@
+// Card + row helpers for the "Настройки" page. OWNER: T17B.
+import { Theme } from "../theme.slint";
+
+/// A settings card: header strip with a title and a body with the rows.
+export component SettingsCard inherits Rectangle {
+    in property <string> title: "";
+    background: Theme.card-body;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.stroke;
+    clip: true;
+
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            height: 40px;
+            background: Theme.card-header;
+            Text {
+                x: 14px;
+                y: (parent.height - self.height) / 2;
+                text: root.title;
+                color: Theme.text;
+                font-size: 14px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
+        VerticalLayout {
+            padding: 14px;
+            spacing: 10px;
+            @children
+        }
+    }
+}
+
+/// A row with a label (and optional hint) on the left and the control on the right.
+export component SettingsRow inherits HorizontalLayout {
+    in property <string> label: "";
+    in property <string> hint: "";
+    spacing: 12px;
+    alignment: center;
+
+    VerticalLayout {
+        spacing: 1px;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: 13px;
+        }
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: Theme.muted;
+            font-size: 11px;
+        }
+    }
+    Rectangle { horizontal-stretch: 1; background: transparent; }
+    @children
+}
+
+/// A full-width field: label above the control, optional inline error below.
+export component SettingsField inherits VerticalLayout {
+    in property <string> label: "";
+    in property <string> hint: "";
+    in property <string> error: "";
+    spacing: 4px;
+
+    HorizontalLayout {
+        spacing: 6px;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: Theme.muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+    @children
+    if root.error != "" : Text {
+        text: root.error;
+        color: Theme.danger;
+        font-size: 11px;
+    }
+}
