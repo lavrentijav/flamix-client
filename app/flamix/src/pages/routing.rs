@@ -92,22 +92,27 @@ fn kind_from_index(index: i32) -> Option<usize> {
     }
 }
 
-/// Split a comma-separated UI value into trimmed, non-empty entries.
+/// Split a UI value into trimmed, non-empty entries.
+///
+/// Entries are separated by commas **or** newlines (`\n`/`\r`, so CRLF works too): the user may
+/// type a comma-separated line and it is re-rendered one entry per line on the next refresh.
+/// Order is preserved and duplicates are kept.
 fn split_values(text: &str) -> Vec<String> {
-    text.split(',')
+    text.split([',', '\n', '\r'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
 }
 
+/// Render a rule's value list as one entry per line (the multi-line input format).
 fn join_values(rule: &RoutingRule, kind: usize) -> String {
     let list = match kind {
         1 => &rule.ips,
         2 => &rule.processes,
         _ => &rule.domains,
     };
-    list.join(", ")
+    list.join("\n")
 }
 
 /// Replace the rule's values with `text`, keeping exactly one kind populated.
@@ -728,8 +733,31 @@ mod tests {
         );
         assert!(split_values("  ,  ").is_empty());
         let rule = demo_rule(RuleAction::Direct, &[], &["geoip:ru", "geoip:cn"], &[]);
-        assert_eq!(join_values(&rule, 1), "geoip:ru, geoip:cn");
+        assert_eq!(join_values(&rule, 1), "geoip:ru\ngeoip:cn");
         assert_eq!(join_values(&rule, 0), "");
+    }
+
+    #[test]
+    fn split_values_normalizes_commas_to_newlines() {
+        // Commas, newlines and blank lines all yield the same ordered list ...
+        assert_eq!(
+            split_values("a.com,b.com\nc.com"),
+            vec!["a.com", "b.com", "c.com"]
+        );
+        // ... and the rule is re-rendered one entry per line.
+        let mut rule = demo_rule(RuleAction::Proxy, &[], &[], &[]);
+        set_rule_values(&mut rule, 0, "a.com, b.com\n\n ,c.com\r\nd.com\r\n");
+        assert_eq!(rule.domains, vec!["a.com", "b.com", "c.com", "d.com"]);
+        assert_eq!(join_values(&rule, 0), "a.com\nb.com\nc.com\nd.com");
+    }
+
+    #[test]
+    fn split_values_handles_crlf_and_blank_lines() {
+        assert_eq!(
+            split_values("geosite:ru\r\n\r\ngeoip:ru\r\n"),
+            vec!["geosite:ru", "geoip:ru"]
+        );
+        assert!(split_values("\n\r\n,\n").is_empty());
     }
 
     #[test]
@@ -747,9 +775,16 @@ mod tests {
         change_rule_kind(&mut rule, 1);
         assert!(rule.domains.is_empty());
         assert_eq!(rule.ips, vec!["a.com", "b.com"]);
+        // The moved values survive the multi-line round-trip.
+        assert_eq!(join_values(&rule, 1), "a.com\nb.com");
         // Switching to the same kind is a no-op.
         change_rule_kind(&mut rule, 1);
         assert_eq!(rule.ips, vec!["a.com", "b.com"]);
+        // And a differently-shaped list moves just as well.
+        let mut mixed = demo_rule(RuleAction::Proxy, &[], &[], &["p.exe"]);
+        change_rule_kind(&mut mixed, 0);
+        assert!(mixed.processes.is_empty());
+        assert_eq!(mixed.domains, vec!["p.exe"]);
     }
 
     #[test]
@@ -818,6 +853,19 @@ mod tests {
         assert_eq!(item.kind, 0);
         assert_eq!(item.values.as_str(), "geosite:ads");
         assert!(item.enabled);
+    }
+
+    #[test]
+    fn rule_item_renders_values_one_per_line() {
+        let rule = demo_rule(
+            RuleAction::Direct,
+            &[],
+            &["geoip:ru", "10.0.0.0/8", "192.168.0.0/16"],
+            &[],
+        );
+        let item = rule_item(0, &rule, 0);
+        assert_eq!(item.kind, 1);
+        assert_eq!(item.values.as_str(), "geoip:ru\n10.0.0.0/8\n192.168.0.0/16");
     }
 
     #[test]

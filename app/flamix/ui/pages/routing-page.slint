@@ -1,6 +1,6 @@
 // Page "Маршрутизация" (page 2). OWNER: T17C (docs/tasks/T17-pages.md).
 // Rust side: src/pages/routing.rs talks to the page ONLY through the global RoutingBridge.
-import { ScrollView, ComboBox, Switch, LineEdit } from "std-widgets.slint";
+import { ScrollView, ComboBox, Switch, TextEdit } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { Icon } from "../components/icon.slint";
 
@@ -173,15 +173,19 @@ component RuleRow inherits Rectangle {
             Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
         }
 
+        // One value per line (commas typed by the user become line breaks on refresh). Full width.
+        TextEdit {
+            horizontal-stretch: 1;
+            height: 64px;
+            text: root.values;
+            placeholder-text: "geosite:category-ru\ndomain:example.com\ndomain:example.org";
+            edited(t) => { root.values-changed(root.kind, t); }
+        }
+
         HorizontalLayout {
             spacing: 6px;
             alignment: center;
-            LineEdit {
-                horizontal-stretch: 1;
-                text: root.values;
-                placeholder-text: "geosite:category-ru, domain:example.com, geoip:ru, 10.0.0.0/8, telegram.exe";
-                edited(t) => { root.values-changed(root.kind, t); }
-            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
             IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
             IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
             IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
