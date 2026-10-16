@@ -1,12 +1,429 @@
-// Page "Маршрутизация". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Page "Маршрутизация" (page 2). OWNER: T17C (docs/tasks/T17-pages.md).
 // Rust side: src/pages/routing.rs talks to the page ONLY through the global RoutingBridge.
-import { PlaceholderPage } from "placeholder-page.slint";
+import { ScrollView, ComboBox, Switch, LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Icon } from "../components/icon.slint";
+
+// One custom routing rule as shown/edited in the list. `action`/`kind` are indices into the
+// fixed chip sets (proxy/direct/block, domains/ip/processes); the label text lives in the UI.
+export struct RoutingRuleItem {
+    index: int,
+    action: int,
+    kind: int,
+    values: string,
+    enabled: bool,
+}
+
+// One subscription that ships its own routing profile.
+export struct ProviderRoutingItem {
+    id: string,
+    name: string,
+    rules-text: string,
+    enabled: bool,
+    ignored: bool,
+}
 
 export global RoutingBridge {
+    // 0 = Global, 1 = Обход РФ, 2 = Свои правила.
+    in-out property <int> preset: 1;
+    // 0 = AsIs, 1 = IPIfNonMatch, 2 = IPOnDemand.
+    in-out property <int> domain-strategy: 1;
+    in-out property <bool> block-quic: false;
+    in property <[RoutingRuleItem]> rules;
+    in property <[ProviderRoutingItem]> providers;
+    in property <bool> has-providers: false;
+    in property <string> error-text: "";
+
+    callback preset-selected(int);
+    callback rule-action-changed(int, int);
+    callback rule-kind-changed(int, int);
+    callback rule-values-changed(int, int, string);
+    callback rule-enabled-changed(int, bool);
+    callback rule-move(int, int);
+    callback rule-delete(int);
+    callback rule-add();
+    callback domain-strategy-changed(string);
+    callback block-quic-changed(bool);
+    callback provider-enabled-changed(string, bool);
+    callback provider-ignored-changed(string, bool);
+}
+
+// Small selectable pill used for the rule action and kind.
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    in property <color> tint: Theme.accent;
+    callback clicked();
+
+    height: 28px;
+    width: label.preferred-width + 22px;
+    border-radius: 14px;
+    background: root.selected ? root.tint : Theme.track;
+    border-width: 1px;
+    border-color: root.selected ? root.tint : Theme.stroke;
+
+    label := Text {
+        x: 11px;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: root.selected ? Theme.on-accent : Theme.muted;
+        font-size: 12px;
+        vertical-alignment: center;
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component PresetCard inherits Rectangle {
+    in property <string> title;
+    in property <string> description;
+    in property <bool> selected: false;
+    callback clicked();
+
+    height: 100px;
+    border-radius: 12px;
+    background: root.selected ? Theme.control-bg : Theme.card-body;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : Theme.stroke;
+
+    VerticalLayout {
+        padding: 14px;
+        spacing: 6px;
+        Text {
+            text: root.title;
+            color: root.selected ? Theme.accent : Theme.text;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        Text {
+            text: root.description;
+            color: Theme.muted;
+            font-size: 12px;
+            wrap: word-wrap;
+            vertical-stretch: 1;
+        }
+    }
+    if root.selected : Icon {
+        x: root.width - 26px;
+        y: 10px;
+        width: 16px;
+        height: 16px;
+        source: @image-url("../../assets/icons/check.svg");
+        tint: Theme.accent;
+    }
+    TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint: Theme.muted;
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    Icon {
+        x: (parent.width - 14px) / 2;
+        y: (parent.height - 14px) / 2;
+        width: 14px;
+        height: 14px;
+        source: root.icon;
+        tint: root.tint;
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+component RuleRow inherits Rectangle {
+    in property <int> index;
+    // Local copies so the chip click updates the visuals instantly even before Rust refreshes.
+    in-out property <int> action: 0;
+    in-out property <int> kind: 0;
+    in property <string> values;
+    in property <bool> enabled;
+
+    callback action-changed(int);
+    callback kind-changed(int);
+    // (kind, values): the current kind is sent along so empty rules keep the chosen kind.
+    callback values-changed(int, string);
+    callback enabled-changed(bool);
+    callback move-up();
+    callback move-down();
+    callback remove();
+
+    border-radius: 10px;
+    background: Theme.card-body;
+    border-width: 1px;
+    border-color: Theme.stroke;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: center;
+            Chip { text: "Прокси"; selected: root.action == 0; tint: Theme.accent; clicked => { root.action = 0; root.action-changed(0); } }
+            Chip { text: "Напрямую"; selected: root.action == 1; tint: Theme.success; clicked => { root.action = 1; root.action-changed(1); } }
+            Chip { text: "Блок"; selected: root.action == 2; tint: Theme.danger; clicked => { root.action = 2; root.action-changed(2); } }
+            Rectangle { width: 1px; height: 20px; background: Theme.stroke; }
+            Chip { text: "Домены"; selected: root.kind == 0; clicked => { root.kind = 0; root.kind-changed(0); } }
+            Chip { text: "IP"; selected: root.kind == 1; clicked => { root.kind = 1; root.kind-changed(1); } }
+            Chip { text: "Процессы"; selected: root.kind == 2; clicked => { root.kind = 2; root.kind-changed(2); } }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: center;
+            LineEdit {
+                horizontal-stretch: 1;
+                text: root.values;
+                placeholder-text: "geosite:category-ru, domain:example.com, geoip:ru, 10.0.0.0/8, telegram.exe";
+                edited(t) => { root.values-changed(root.kind, t); }
+            }
+            IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
+            IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
+            IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
+        }
+    }
+}
+
+component ProviderRow inherits Rectangle {
+    in property <string> name;
+    in property <string> rules-text;
+    in property <bool> enabled;
+    in property <bool> ignored;
+    callback enabled-changed(bool);
+    callback ignored-changed(bool);
+
+    border-radius: 10px;
+    background: Theme.card-body;
+    border-width: 1px;
+    border-color: Theme.stroke;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: root.name;
+                color: Theme.text;
+                font-size: 13px;
+                font-weight: 600;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.rules-text;
+                color: Theme.muted;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: center;
+            Text { text: "Маршрутизация"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+            Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text { text: "Игнорировать"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
+            Switch { checked: root.ignored; toggled => { root.ignored-changed(self.checked); } }
+        }
+    }
 }
 
 export component RoutingPage inherits Rectangle {
-    PlaceholderPage {
-        title: "Маршрутизация";
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: "Маршрутизация";
+            color: Theme.text;
+            font-size: 22px;
+            font-weight: 600;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 14px;
+
+                // Preset selector.
+                HorizontalLayout {
+                    spacing: 10px;
+                    PresetCard {
+                        horizontal-stretch: 1;
+                        title: "Global";
+                        description: "Весь трафик через прокси";
+                        selected: RoutingBridge.preset == 0;
+                        clicked => { RoutingBridge.preset-selected(0); }
+                    }
+                    PresetCard {
+                        horizontal-stretch: 1;
+                        title: "Обход РФ";
+                        description: "РФ-сайты напрямую, реклама блокируется";
+                        selected: RoutingBridge.preset == 1;
+                        clicked => { RoutingBridge.preset-selected(1); }
+                    }
+                    PresetCard {
+                        horizontal-stretch: 1;
+                        title: "Свои правила";
+                        description: "Только ваши правила, остальное через прокси";
+                        selected: RoutingBridge.preset == 2;
+                        clicked => { RoutingBridge.preset-selected(2); }
+                    }
+                }
+
+                // Custom rules.
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Text {
+                                text: "Свои правила";
+                                color: Theme.text;
+                                font-size: 15px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                            }
+                            Rectangle {
+                                width: 170px;
+                                height: 32px;
+                                border-radius: 8px;
+                                background: add-ta.has-hover ? Theme.accent-strong : Theme.accent;
+                                Text {
+                                    text: "+ Добавить правило";
+                                    color: Theme.on-accent;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                                add-ta := TouchArea { mouse-cursor: pointer; clicked => { RoutingBridge.rule-add(); } }
+                            }
+                        }
+                        if RoutingBridge.rules.length == 0 : Text {
+                            text: "Нет правил — трафик пойдёт по выбранному пресету";
+                            color: Theme.muted;
+                            font-size: 12px;
+                        }
+                        for rule in RoutingBridge.rules : RuleRow {
+                            index: rule.index;
+                            action: rule.action;
+                            kind: rule.kind;
+                            values: rule.values;
+                            enabled: rule.enabled;
+                            action-changed(a) => { RoutingBridge.rule-action-changed(rule.index, a); }
+                            kind-changed(k) => { RoutingBridge.rule-kind-changed(rule.index, k); }
+                            values-changed(k, t) => { RoutingBridge.rule-values-changed(rule.index, k, t); }
+                            enabled-changed(v) => { RoutingBridge.rule-enabled-changed(rule.index, v); }
+                            move-up => { RoutingBridge.rule-move(rule.index, -1); }
+                            move-down => { RoutingBridge.rule-move(rule.index, 1); }
+                            remove => { RoutingBridge.rule-delete(rule.index); }
+                        }
+                        if RoutingBridge.error-text != "" : Text {
+                            text: RoutingBridge.error-text;
+                            color: Theme.danger;
+                            font-size: 12px;
+                        }
+                        Text {
+                            text: "Формат Xray: geosite:category-ru · domain:example.com · geoip:ru · 10.0.0.0/8 · telegram.exe";
+                            color: Theme.muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // Domain strategy + QUIC.
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: "Дополнительно";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: 600;
+                        }
+                        HorizontalLayout {
+                            spacing: 12px;
+                            alignment: center;
+                            Text {
+                                text: "Стратегия доменов";
+                                color: Theme.text;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                            ComboBox {
+                                width: 180px;
+                                model: ["AsIs", "IPIfNonMatch", "IPOnDemand"];
+                                current-index: RoutingBridge.domain-strategy;
+                                selected(label) => { RoutingBridge.domain-strategy-changed(label); }
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Text {
+                                text: "Блокировать QUIC";
+                                color: Theme.text;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                            }
+                            Switch {
+                                checked: RoutingBridge.block-quic;
+                                toggled => { RoutingBridge.block-quic-changed(self.checked); }
+                            }
+                        }
+                    }
+                }
+
+                // Provider routing.
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 10px;
+                        Text {
+                            text: "Маршрутизация провайдера";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: 600;
+                        }
+                        if !RoutingBridge.has-providers : Text {
+                            text: "В ваших подписках нет маршрутизации провайдера";
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        for provider in RoutingBridge.providers : ProviderRow {
+                            name: provider.name;
+                            rules-text: provider.rules-text;
+                            enabled: provider.enabled;
+                            ignored: provider.ignored;
+                            enabled-changed(v) => { RoutingBridge.provider-enabled-changed(provider.id, v); }
+                            ignored-changed(v) => { RoutingBridge.provider-ignored-changed(provider.id, v); }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
