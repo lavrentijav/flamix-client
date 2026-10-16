@@ -27,6 +27,13 @@ export global SettingsBridge {
     in-out property <string> dns-direct: "";
     in-out property <bool> dns-fake-ip: false;
 
+    // --- Основные · Геоданные --------------------------------------------
+    in-out property <int> geo-source-index: 0; // 0 Freedom for Russia, 1 Loyalsoldier, 2 Свой URL
+    in-out property <string> geo-geosite-url: "";
+    in-out property <string> geo-geoip-url: "";
+    in property <string> geo-updated-text: "никогда";
+    in property <string> geo-urls-error: "";
+
     // --- Основные · Пинг --------------------------------------------------
     in-out property <string> ping-method: "url";
     in-out property <string> ping-url: "";
@@ -73,6 +80,7 @@ export global SettingsBridge {
 
     callback changed();
     callback mode-changed(bool);
+    callback update-geo();
     callback reset-confirmed();
     callback reset-cancelled();
 }
@@ -350,6 +358,65 @@ export component SettingsPage inherits Rectangle {
                             checked <=> SettingsBridge.dns-fake-ip;
                             toggled => { SettingsBridge.changed(); }
                         }
+                    }
+                }
+
+                // ---------------- Геоданные ----------------
+                SettingsCard {
+                    title: "Геоданные";
+
+                    SettingsRow {
+                        label: "Источник";
+                        hint: "какие списки RU/geo используют ядра";
+                        ComboBox {
+                            width: 200px;
+                            model: ["Freedom for Russia", "Loyalsoldier", "Свой URL"];
+                            current-index <=> SettingsBridge.geo-source-index;
+                            selected => { SettingsBridge.changed(); }
+                        }
+                    }
+                    if SettingsBridge.geo-source-index == 2 : VerticalLayout {
+                        spacing: 10px;
+                        SettingsField {
+                            label: "geosite.dat URL";
+                            LineEdit {
+                                text <=> SettingsBridge.geo-geosite-url;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "geoip.dat URL";
+                            LineEdit {
+                                text <=> SettingsBridge.geo-geoip-url;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        if SettingsBridge.geo-urls-error != "" : Text {
+                            text: SettingsBridge.geo-urls-error;
+                            color: Theme.danger;
+                            font-size: 11px;
+                        }
+                    }
+                    Text {
+                        text: "Источник определяет, какие базы RU/geo-правил скачивают ядра. По умолчанию — Freedom for Russia.";
+                        color: Theme.muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        spacing: 10px;
+                        alignment: center;
+                        Button {
+                            text: "Обновить геоданные";
+                            clicked => { SettingsBridge.update-geo(); }
+                        }
+                        Text {
+                            text: "Обновлено: " + SettingsBridge.geo-updated-text;
+                            color: Theme.muted;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
                 }
 

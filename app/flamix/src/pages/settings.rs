@@ -6,7 +6,10 @@
 
 use crate::controller::Controller;
 use crate::{AppWindow, SettingsBridge};
-use flamix_core::model::{ConnectionMode, Dns, Settings, Theme as SettingsTheme};
+use chrono::TimeZone;
+use flamix_core::model::{
+    ConnectionMode, Dns, GeoData, GeoSource, Settings, Theme as SettingsTheme,
+};
 use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -18,6 +21,17 @@ use std::time::Duration;
 const SAVE_DEBOUNCE: Duration = Duration::from_millis(500);
 /// How long "Сохранено" stays on screen.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(2);
+/// `AppWindow.page` value of this page (used to poll the geo-updated label while visible).
+const PAGE_INDEX: i32 = 3;
+/// How often the "Обновлено" label is re-read from the controller state while the page is shown.
+const GEO_REFRESH: Duration = Duration::from_secs(2);
+/// Static timestamp shown for the `--demo`/screenshot build.
+const DEMO_GEO_UPDATED: &str = "16.10.2026 14:30";
+
+thread_local! {
+    /// Keeps the repeating geo-label timer alive for the lifetime of the process.
+    static GEO_TIMER: RefCell<Option<Timer>> = const { RefCell::new(None) };
+}
 
 pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     let bridge = ui.global::<SettingsBridge>();
@@ -30,6 +44,11 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     apply_theme(ui, initial.theme);
     bridge.set_save_status("".into());
     bridge.set_reset_confirm(false);
+    let geo_updated = match ctrl {
+        Some(ctrl) => ctrl.with_state(|state| geo_updated_text(state.geo_updated)),
+        None => DEMO_GEO_UPDATED.to_string(),
+    };
+    bridge.set_geo_updated_text(geo_updated.into());
 
     let current = Rc::new(RefCell::new(initial));
     let save_timer = Rc::new(RefCell::new(Timer::default()));
@@ -144,6 +163,42 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
             }
         }
     });
+
+    // "Обновить геоданные": the controller downloads asynchronously and bumps `geo_updated`
+    // when it finishes, so the label is refreshed by the polling timer below (and here in
+    // demo mode there is no controller, so we only show a demo status line).
+    bridge.on_update_geo({
+        let ui_weak = ui.as_weak();
+        let ctrl = ctrl.cloned();
+        move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            match ctrl.as_ref() {
+                Some(ctrl) => ctrl.update_geo(),
+                None => ui
+                    .global::<SettingsBridge>()
+                    .set_save_status("Демо: геоданные обновлены".into()),
+            }
+        }
+    });
+
+    // Re-read "Обновлено" from the controller: `update_geo` and a connect both finish on the
+    // runtime thread, so the label would otherwise stay stale. The timer runs process-wide and
+    // early-returns unless this page (index 3) is visible (same pattern as the stats page).
+    let ui_weak = ui.as_weak();
+    let ctrl = ctrl.cloned();
+    let timer = Timer::default();
+    timer.start(TimerMode::Repeated, GEO_REFRESH, move || {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        if ui.get_page() != PAGE_INDEX {
+            return;
+        }
+        if let Some(ctrl) = ctrl.as_ref() {
+            let text = ctrl.with_state(|state| geo_updated_text(state.geo_updated));
+            ui.global::<SettingsBridge>()
+                .set_geo_updated_text(text.into());
+        }
+    });
+    GEO_TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
 }
 
 /// Persist the fields this page owns through the controller and reconnect when the core must be
@@ -158,9 +213,20 @@ fn save(ui: &AppWindow, ctrl: Option<&Arc<Controller>>, settings: &Settings) {
     let reconnect = core_affecting_changed(&live_before, &effective);
     let launch_changed = live_before.launch_at_login != effective.launch_at_login;
     let launch_at_login = effective.launch_at_login;
+    // Changing the source (or a custom URL) invalidates the databases downloaded for the
+    // previous source, so reset `geo_updated` to mark the data stale (the label then reads
+    // "никогда"). Note: `flamix_core::geo` decides freshness from the file mtime, so this reset
+    // is a UI/marker only; the re-download itself is forced by the "Обновить геоданные"
+    // button (`max_age = 0`) or by the connect-time refresh once the files age out.
+    let geo_changed = live_before.geo != effective.geo;
 
     let src = settings.clone();
-    ctrl.mutate(move |state| apply_owned_in_place(&mut state.settings, &src));
+    ctrl.mutate(move |state| {
+        apply_owned_in_place(&mut state.settings, &src);
+        if geo_changed {
+            state.geo_updated = 0;
+        }
+    });
     if reconnect {
         ctrl.reconnect_if_connected();
     }
@@ -189,6 +255,7 @@ fn apply_owned_in_place(live: &mut Settings, src: &Settings) {
     live.local_auth_user = src.local_auth_user.clone();
     live.local_auth_pass = src.local_auth_pass.clone();
     live.dns = src.dns.clone();
+    live.geo = src.geo.clone();
     live.tun_mtu = src.tun_mtu;
     live.tun_stack = src.tun_stack.clone();
     live.tun_ipv6 = src.tun_ipv6;
@@ -276,6 +343,9 @@ fn write_bridge(bridge: &SettingsBridge, s: &Settings) {
     bridge.set_dns_parallel(s.dns.parallel);
     bridge.set_dns_serve_stale(s.dns.serve_stale);
     bridge.set_dns_hosts(hosts_to_text(&s.dns.hosts).into());
+    bridge.set_geo_source_index(source_index(s.geo.source));
+    bridge.set_geo_geosite_url(s.geo.geosite_url.clone().into());
+    bridge.set_geo_geoip_url(s.geo.geoip_url.clone().into());
     bridge.set_ping_method(s.ping_method.clone().into());
     bridge.set_ping_url(s.ping_url.clone().into());
     bridge.set_launch_at_login(s.launch_at_login);
@@ -312,7 +382,15 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         local_auth_pass: bridge.get_local_auth_pass().to_string(),
         routing: base.routing.clone(),
         failover: base.failover.clone(),
-        geo: base.geo.clone(),
+        geo: {
+            let mut geo = GeoData {
+                source: source_from_index(bridge.get_geo_source_index()),
+                geosite_url: bridge.get_geo_geosite_url().to_string(),
+                geoip_url: bridge.get_geo_geoip_url().to_string(),
+            };
+            trim_geo_urls(&mut geo);
+            geo
+        },
         dns: Dns {
             remote: bridge.get_dns_remote().to_string(),
             direct: bridge.get_dns_direct().to_string(),
@@ -361,6 +439,7 @@ struct Errors {
     dns: String,
     ping: String,
     route_exclude: String,
+    geo: String,
 }
 
 impl Errors {
@@ -369,6 +448,7 @@ impl Errors {
             && self.dns.is_empty()
             && self.ping.is_empty()
             && self.route_exclude.is_empty()
+            && self.geo.is_empty()
     }
 }
 
@@ -408,6 +488,22 @@ fn validate(s: &Settings) -> Errors {
     if s.ping_method == "url" && !is_valid_url(&s.ping_url) {
         errors.ping = "Укажите корректный URL (http:// или https://)".into();
     }
+
+    // Custom geo URLs only matter for `GeoSource::Custom` and may stay empty (= misconfigured,
+    // but the controller reports "не настроены" instead of us blocking the save).
+    if s.geo.source == GeoSource::Custom {
+        let bad: Vec<&str> = [("geosite", &s.geo.geosite_url), ("geoip", &s.geo.geoip_url)]
+            .into_iter()
+            .filter(|(_, url)| !url.trim().is_empty() && !is_valid_url(url))
+            .map(|(name, _)| name)
+            .collect();
+        if !bad.is_empty() {
+            errors.geo = format!(
+                "Некорректный URL геоданных (http:// или https://): {}",
+                bad.join(", ")
+            );
+        }
+    }
     errors
 }
 
@@ -416,6 +512,7 @@ fn publish_errors(bridge: &SettingsBridge, errors: &Errors) {
     bridge.set_dns_error(errors.dns.clone().into());
     bridge.set_ping_error(errors.ping.clone().into());
     bridge.set_route_exclude_error(errors.route_exclude.clone().into());
+    bridge.set_geo_urls_error(errors.geo.clone().into());
 }
 
 /// True when a change must be applied by restarting the running core.
@@ -433,6 +530,7 @@ fn core_affecting_changed(a: &Settings, b: &Settings) -> bool {
         || a.local_auth_user != b.local_auth_user
         || a.local_auth_pass != b.local_auth_pass
         || a.dns != b.dns
+        || a.geo != b.geo
         || a.tun_mtu != b.tun_mtu
         || a.tun_stack != b.tun_stack
         || a.tun_ipv6 != b.tun_ipv6
@@ -564,6 +662,41 @@ fn is_valid_cidr(value: &str) -> bool {
             }
         }
         None => value.parse::<std::net::IpAddr>().is_ok(),
+    }
+}
+
+/// `geo.source` <-> the "Источник" ComboBox index; order matches the widget model.
+fn source_index(source: GeoSource) -> i32 {
+    match source {
+        GeoSource::FreedomForRussia => 0,
+        GeoSource::Loyalsoldier => 1,
+        GeoSource::Custom => 2,
+    }
+}
+
+fn source_from_index(index: i32) -> GeoSource {
+    match index {
+        1 => GeoSource::Loyalsoldier,
+        2 => GeoSource::Custom,
+        _ => GeoSource::FreedomForRussia,
+    }
+}
+
+/// Trim the custom geo URLs so a whitespace-only value is stored as empty (a spaces-only URL
+/// would otherwise look non-empty to `flamix_core::geo::urls` and make the download fail).
+fn trim_geo_urls(geo: &mut GeoData) {
+    geo.geosite_url = geo.geosite_url.trim().to_string();
+    geo.geoip_url = geo.geoip_url.trim().to_string();
+}
+
+/// Human label for `AppState.geo_updated` (unix seconds): "никогда" at 0, else local date/time.
+fn geo_updated_text(updated: i64) -> String {
+    if updated <= 0 {
+        return "никогда".into();
+    }
+    match chrono::Local.timestamp_opt(updated, 0).single() {
+        Some(dt) => dt.format("%d.%m.%Y %H:%M").to_string(),
+        None => "никогда".into(),
     }
 }
 
@@ -885,5 +1018,124 @@ mod tests {
         let mut failover = base.clone();
         failover.failover.enabled = true;
         assert!(core_affecting_changed(&base, &failover));
+    }
+
+    #[test]
+    fn geo_source_index_mapping_roundtrips() {
+        for (index, source) in [
+            (0, GeoSource::FreedomForRussia),
+            (1, GeoSource::Loyalsoldier),
+            (2, GeoSource::Custom),
+        ] {
+            assert_eq!(source_index(source), index);
+            assert_eq!(source_from_index(index), source);
+        }
+        // Out-of-range indices fall back to the default source.
+        assert_eq!(source_from_index(7), GeoSource::FreedomForRussia);
+        assert_eq!(source_from_index(-1), GeoSource::FreedomForRussia);
+    }
+
+    #[test]
+    fn geo_updated_text_handles_never_and_dates() {
+        assert_eq!(geo_updated_text(0), "никогда");
+        assert_eq!(geo_updated_text(-5), "никогда");
+        // A positive timestamp formats as a non-empty local date/time.
+        let text = geo_updated_text(1_700_000_000);
+        assert!(text.contains('.') && text.contains(':'), "got {text:?}");
+    }
+
+    #[test]
+    fn custom_geo_urls_are_validated() {
+        let mut s = settings();
+        s.geo.source = GeoSource::Custom;
+        // Empty custom URLs are allowed (the controller reports "не настроены").
+        assert!(validate(&s).geo.is_empty());
+
+        s.geo.geosite_url = "https://example.com/geosite.dat".into();
+        s.geo.geoip_url = "http://example.com/geoip.dat".into();
+        assert!(validate(&s).geo.is_empty());
+
+        s.geo.geosite_url = "example.com/geosite.dat".into();
+        assert!(!validate(&s).geo.is_empty());
+
+        // The same bad URL is ignored while the source is not Custom.
+        let mut preset = s;
+        preset.geo.source = GeoSource::Loyalsoldier;
+        assert!(validate(&preset).geo.is_empty());
+    }
+
+    #[test]
+    fn whitespace_only_geo_urls_validate_and_normalize_to_empty() {
+        let mut s = settings();
+        s.geo.source = GeoSource::Custom;
+        s.geo.geosite_url = "   ".into();
+        s.geo.geoip_url = "\t \n".into();
+        // A spaces-only URL is treated as empty: no validation error...
+        assert!(validate(&s).geo.is_empty());
+
+        // ...and normalization (read_bridge) trims it to a real empty string, so `geo::urls`
+        // will not treat it as a URL to download.
+        trim_geo_urls(&mut s.geo);
+        assert_eq!(s.geo.geosite_url, "");
+        assert_eq!(s.geo.geoip_url, "");
+
+        // Surrounding whitespace on a valid URL is also removed.
+        s.geo.geosite_url = "  https://example.com/geosite.dat  ".into();
+        trim_geo_urls(&mut s.geo);
+        assert_eq!(s.geo.geosite_url, "https://example.com/geosite.dat");
+    }
+
+    #[test]
+    fn geo_change_is_core_affecting_and_merged() {
+        let base = settings();
+        let custom = Settings {
+            geo: GeoData {
+                source: GeoSource::Custom,
+                geosite_url: "https://example.com/geosite.dat".into(),
+                geoip_url: String::new(),
+            },
+            ..base.clone()
+        };
+        assert!(core_affecting_changed(&base, &custom));
+
+        // merge_owned/apply_owned_in_place carry `geo` like the other networking fields.
+        let mut live = base.clone();
+        live.geo.source = GeoSource::Loyalsoldier;
+        let merged = merge_owned(&live, &custom);
+        assert_eq!(merged.geo, custom.geo);
+
+        let mut target = base.clone();
+        apply_owned_in_place(&mut target, &custom);
+        assert_eq!(target.geo, custom.geo);
+    }
+
+    #[test]
+    fn custom_geosite_only_change_is_core_affecting_and_merged() {
+        // Source stays Custom: changing only `geosite_url` must still be a core-affecting edit
+        // and must survive merge_owned/apply_owned_in_place.
+        let base = Settings {
+            geo: GeoData {
+                source: GeoSource::Custom,
+                geosite_url: "https://a.example/geosite.dat".into(),
+                geoip_url: "https://a.example/geoip.dat".into(),
+            },
+            ..settings()
+        };
+        let edited = Settings {
+            geo: GeoData {
+                source: GeoSource::Custom,
+                geosite_url: "https://b.example/geosite.dat".into(),
+                geoip_url: "https://a.example/geoip.dat".into(),
+            },
+            ..base.clone()
+        };
+        assert!(core_affecting_changed(&base, &edited));
+
+        let merged = merge_owned(&base, &edited);
+        assert_eq!(merged.geo, edited.geo);
+
+        let mut target = base.clone();
+        apply_owned_in_place(&mut target, &edited);
+        assert_eq!(target.geo, edited.geo);
     }
 }
