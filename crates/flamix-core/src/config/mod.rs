@@ -62,21 +62,56 @@ pub fn local_auth_enabled(overrides: Option<&BTreeMap<String, String>>) -> bool 
     local_auth("socks", overrides).is_some() || local_auth("http", overrides).is_some()
 }
 
+/// Fallback probe URL for the core balancer when neither configured URL is set.
+pub(crate) const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// Lower bound for the balancer probe interval; a smaller (or zero) value would flood the
+/// health probes, so it is clamped up.
+pub(crate) const MIN_PROBE_INTERVAL_MS: u32 = 15000;
+
 /// Probe URL used by the core-level failover balancer (`observatory` / `urltest`).
 ///
-/// `settings.failover.probe_url` when set (non-blank), otherwise `settings.ping_url`.
+/// `settings.failover.probe_url` when set (non-blank), else `settings.ping_url`, else a
+/// non-empty constant so the generated config always carries a valid URL.
 pub(crate) fn failover_probe_url(settings: &Settings) -> String {
     let url = settings.failover.probe_url.trim();
-    if url.is_empty() {
-        settings.ping_url.clone()
-    } else {
-        url.to_string()
+    if !url.is_empty() {
+        return url.to_string();
     }
+    let ping = settings.ping_url.trim();
+    if !ping.is_empty() {
+        return ping.to_string();
+    }
+    DEFAULT_PROBE_URL.to_string()
+}
+
+/// Probe interval clamped to at least [`MIN_PROBE_INTERVAL_MS`].
+pub(crate) fn probe_interval_ms(settings: &Settings) -> u32 {
+    settings
+        .failover
+        .probe_interval_ms
+        .max(MIN_PROBE_INTERVAL_MS)
 }
 
 /// Go-style duration string for a millisecond interval (accepted by both cores).
 pub(crate) fn duration_ms(ms: u32) -> String {
     format!("{ms}ms")
+}
+
+/// True when `kind` can run `server` as a proxy outbound inside a failover cluster.
+///
+/// Xray cannot run hysteria2/tuic — [`xray::outbound`] would emit a `freedom`/direct hop, and
+/// `leastPing` would then rank that leak as the fastest node, so such a node is never
+/// included. sing-box cannot run xhttp/kcp/quic and needs WireGuard as an endpoint, not a
+/// urltest member.
+fn node_supports(kind: CoreKind, server: &Server, settings: &Settings) -> bool {
+    match kind {
+        CoreKind::Xray => supported_by(server).contains(&CoreKind::Xray),
+        CoreKind::SingBox => {
+            supported_by(server).contains(&CoreKind::SingBox)
+                && singbox::clusterable(server, settings)
+        }
+    }
 }
 
 /// Which external core binary to run.
@@ -149,9 +184,15 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
 /// Plan the processes for a primary server plus its ordered backups.
 ///
 /// `nodes[0]` is the primary; the rest are ordered backups. Core-level failover is applied
-/// only when `settings.failover.enabled && nodes.len() > 1 && settings.mode == Proxy`;
-/// otherwise the generated config is exactly the single-server config of [`plan_with`]
-/// (so the disabled path never regresses). TUN mode never uses failover.
+/// only when `settings.failover.enabled && settings.mode == Proxy` and, after filtering,
+/// more than one node remains; otherwise the generated config is exactly the single-server
+/// config of [`plan_with`] (so the disabled path never regresses). TUN mode never uses failover.
+///
+/// Unsupported-node policy (identical for both cores): backups the chosen core cannot proxy
+/// are **dropped, and the compatible ones are kept**, with a `tracing::warn!` naming the
+/// dropped nodes. The chosen core is the one that can run the primary, so it is always kept;
+/// if no compatible backup remains, the cluster collapses back to the single-server config.
+/// A node is *never* emitted as a `direct`/`freedom` hop inside a cluster (that would leak).
 ///
 /// Provider routing/overrides ([`ConnectContext`]) belong to the subscription that owns the
 /// **primary** node and are applied to the whole generated config; per-node provider context
@@ -160,37 +201,72 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
     let Some(primary) = nodes.first() else {
         return Vec::new();
     };
-    let failover =
-        settings.failover.enabled && nodes.len() > 1 && settings.mode == ConnectionMode::Proxy;
 
     match settings.mode {
         ConnectionMode::Proxy => {
-            if supported_by(primary).contains(&CoreKind::Xray) {
-                let api_port = api_port(CoreKind::Xray, settings);
-                let config = if failover {
-                    xray::full_config_cluster_with(nodes, settings, api_port, ctx)
-                } else {
-                    xray::full_config_with(primary, settings, api_port, ctx)
-                };
-                vec![CorePlan {
-                    core: CoreKind::Xray,
-                    config,
-                    elevated: false,
-                    api_port,
-                }]
+            // The core is picked from the primary; backups it cannot proxy are dropped so a
+            // cluster never includes a `direct`/`freedom` node that `leastPing` would prefer.
+            let kind = if supported_by(primary).contains(&CoreKind::Xray) {
+                CoreKind::Xray
             } else {
-                let api_port = api_port(CoreKind::SingBox, settings);
-                let config = if failover {
-                    singbox::full_config_cluster_with(nodes, settings, false, None, api_port, ctx)
-                } else {
-                    singbox::full_config_with(primary, settings, false, None, api_port, ctx)
-                };
-                vec![CorePlan {
-                    core: CoreKind::SingBox,
-                    config,
-                    elevated: false,
-                    api_port,
-                }]
+                CoreKind::SingBox
+            };
+            let compatible: Vec<Server> = nodes
+                .iter()
+                .filter(|node| node_supports(kind, node, settings))
+                .cloned()
+                .collect();
+            let dropped: Vec<&str> = nodes
+                .iter()
+                .filter(|node| !node_supports(kind, node, settings))
+                .map(|node| node.name.as_str())
+                .collect();
+            if !dropped.is_empty() {
+                tracing::warn!(
+                    "failover: dropping {} node(s) that {} cannot proxy: {}",
+                    dropped.len(),
+                    kind.binary_name(),
+                    dropped.join(", ")
+                );
+            }
+            // `compatible[0]` is the primary: `kind` was chosen because the primary supports it.
+            let failover = settings.failover.enabled && compatible.len() > 1;
+            match kind {
+                CoreKind::Xray => {
+                    let api_port = api_port(CoreKind::Xray, settings);
+                    let config = if failover {
+                        xray::full_config_cluster_with(&compatible, settings, api_port, ctx)
+                    } else {
+                        xray::full_config_with(primary, settings, api_port, ctx)
+                    };
+                    vec![CorePlan {
+                        core: CoreKind::Xray,
+                        config,
+                        elevated: false,
+                        api_port,
+                    }]
+                }
+                CoreKind::SingBox => {
+                    let api_port = api_port(CoreKind::SingBox, settings);
+                    let config = if failover {
+                        singbox::full_config_cluster_with(
+                            &compatible,
+                            settings,
+                            false,
+                            None,
+                            api_port,
+                            ctx,
+                        )
+                    } else {
+                        singbox::full_config_with(primary, settings, false, None, api_port, ctx)
+                    };
+                    vec![CorePlan {
+                        core: CoreKind::SingBox,
+                        config,
+                        elevated: false,
+                        api_port,
+                    }]
+                }
             }
         }
         ConnectionMode::Tun => {
@@ -487,7 +563,7 @@ mod tests {
     fn failover_settings() -> Settings {
         let mut settings = Settings::default();
         settings.failover.enabled = true;
-        settings.failover.probe_interval_ms = 2000;
+        settings.failover.probe_interval_ms = 15000;
         settings
     }
 
@@ -574,7 +650,7 @@ mod tests {
             cfg["observatory"]["probeUrl"],
             json!("https://probe.example/204")
         );
-        assert_eq!(cfg["observatory"]["probeInterval"], json!("2000ms"));
+        assert_eq!(cfg["observatory"]["probeInterval"], json!("15000ms"));
         assert_eq!(cfg["observatory"]["enableConcurrency"], json!(true));
 
         // LoadBalance -> roundRobin.
@@ -616,13 +692,104 @@ mod tests {
         assert_eq!(outbounds[0]["tag"], json!("proxy"));
         assert_eq!(outbounds[0]["outbounds"], json!(["node-0", "node-1"]));
         assert_eq!(outbounds[0]["url"], json!(settings.ping_url));
-        assert_eq!(outbounds[0]["interval"], json!("2000ms"));
+        assert_eq!(outbounds[0]["interval"], json!("15000ms"));
         assert_eq!(outbounds[0]["tolerance"], json!(80));
         assert_eq!(outbounds[1]["tag"], json!("node-0"));
         assert_eq!(outbounds[2]["tag"], json!("node-1"));
         // route.final and DNS detour keep pointing at `proxy`.
         assert_eq!(cfg["route"]["final"], json!("proxy"));
         assert_eq!(cfg["dns"]["servers"][0]["detour"], json!("proxy"));
+    }
+
+    #[test]
+    fn plan_cluster_drops_incompatible_backups_xray() {
+        // Xray primary + Xray backup + a sing-box-only backup (hysteria2).
+        let nodes = [vless_xhttp(), trojan_ws(), hy2()];
+        let settings = failover_settings();
+        let plans = plan_cluster(&nodes, &settings, &ConnectContext::default());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        let cfg = &plans[0].config;
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        let tags: Vec<&str> = outbounds.iter().filter_map(|o| o["tag"].as_str()).collect();
+        // hysteria2 dropped: only the two Xray-capable nodes remain.
+        assert_eq!(tags, ["node-0", "node-1", "direct", "block"]);
+        assert_eq!(
+            cfg["routing"]["balancers"][0]["selector"],
+            json!(["node-0", "node-1"])
+        );
+        // No proxy-capable core would ever leak via a `freedom` node (the `direct` outbound
+        // is legitimately `freedom`).
+        let is_direct = |o: &serde_json::Value| o["tag"] == json!("direct");
+        assert!(
+            !outbounds
+                .iter()
+                .any(|o| o["protocol"] == json!("freedom") && !is_direct(o)),
+            "cluster must not contain a leaked direct/freedom node"
+        );
+
+        // Defensive: the generator itself never emits a freedom backup either.
+        let cfg = xray::full_config_cluster_with(
+            &[vless_xhttp(), hy2()],
+            &settings,
+            10818,
+            &ConnectContext::default(),
+        );
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert!(!outbounds
+            .iter()
+            .any(|o| o["protocol"] == json!("freedom") && !is_direct(o)));
+        // Only the primary survives -> single-node config, no balancer.
+        assert!(cfg["routing"].get("balancers").is_none());
+        assert_eq!(cfg["outbounds"][0]["tag"], json!("proxy"));
+    }
+
+    #[test]
+    fn plan_cluster_singbox_only_primary_drops_incompatible_backup() {
+        // sing-box-only primary (hysteria2) + an xhttp backup sing-box cannot express.
+        let nodes = [hy2(), vless_xhttp()];
+        let settings = failover_settings();
+        let plans = plan_cluster(&nodes, &settings, &ConnectContext::default());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::SingBox);
+        let outbounds = plans[0].config["outbounds"].as_array().unwrap();
+        // xhttp backup dropped, so no urltest: the plain single `proxy` outbound.
+        assert_eq!(outbounds[0]["tag"], json!("proxy"));
+        assert_eq!(outbounds[0]["type"], json!("hysteria2"));
+
+        // A sing-box-capable backup (trojan/ws) is kept and gets the urltest balancer.
+        let nodes = [hy2(), trojan_ws()];
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds[0]["type"], json!("urltest"));
+        assert_eq!(outbounds[0]["outbounds"], json!(["node-0", "node-1"]));
+        assert_eq!(outbounds[1]["type"], json!("hysteria2"));
+        assert_eq!(outbounds[2]["type"], json!("trojan"));
+    }
+
+    #[test]
+    fn failover_probe_fallbacks_are_non_empty() {
+        let nodes = [vless_xhttp(), trojan_ws()];
+        let mut settings = failover_settings();
+        settings.ping_url = String::new();
+        settings.failover.probe_url = "   ".into();
+        settings.failover.probe_interval_ms = 0;
+
+        // Xray: constant probe URL + clamped interval.
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        assert_eq!(cfg["observatory"]["probeUrl"], json!(DEFAULT_PROBE_URL));
+        assert_eq!(cfg["observatory"]["probeInterval"], json!("15000ms"));
+
+        // sing-box: same fallbacks.
+        let nodes = [hy2(), trojan_ws()];
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        assert_eq!(cfg["outbounds"][0]["url"], json!(DEFAULT_PROBE_URL));
+        assert_eq!(cfg["outbounds"][0]["interval"], json!("15000ms"));
+
+        // A tiny interval is clamped up too.
+        settings.failover.probe_interval_ms = 1;
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        assert_eq!(cfg["outbounds"][0]["interval"], json!("15000ms"));
     }
 }
 

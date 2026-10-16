@@ -5,10 +5,10 @@
 //! DNS `servers` array takes `{address, domains}` objects.
 
 use crate::config::routing::{self, Rule};
-use crate::config::{local_auth, ConnectContext};
+use crate::config::{local_auth, supported_by, ConnectContext, CoreKind};
 use crate::model::{
-    Credentials, FailoverMode, Network, ProviderRouting, RuleAction, Security, Server, Settings,
-    Transport,
+    ConnectionMode, Credentials, FailoverMode, Network, ProviderRouting, RuleAction, Security,
+    Server, Settings, Transport,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -177,23 +177,32 @@ pub fn full_config_with(
 
 /// Full config for a primary node plus ordered backups (`node-0` is the primary).
 ///
-/// With one node this is exactly [`full_config_with`]. With `settings.failover.enabled`
-/// and more than one node, every node becomes an outbound tagged `node-N`, `direct`/`block`
-/// stay, and a balancer named `proxy` is added under `routing.balancers` (`leastPing` for
-/// [`FailoverMode::Failover`], `roundRobin` for [`FailoverMode::LoadBalance`]) together with
-/// a top-level `observatory` probing the nodes. The routing generator is unchanged: its
-/// rules keep naming the tag `proxy`. Provider routing/overrides belong to the primary node
-/// and are applied to the whole config.
+/// With one proxy-capable node this is exactly [`full_config_with`]. With
+/// `settings.failover.enabled`, Proxy mode, and more than one node, every node becomes an
+/// outbound tagged `node-N`, `direct`/`block` stay, and a balancer named `proxy` is added
+/// under `routing.balancers` (`leastPing` for [`FailoverMode::Failover`], `roundRobin` for
+/// [`FailoverMode::LoadBalance`]) together with a top-level `observatory` probing the nodes.
+/// The routing generator is unchanged: its rules keep naming the tag `proxy`. Provider
+/// routing/overrides belong to the primary node and are applied to the whole config.
+///
+/// Defensive: nodes Xray cannot proxy (hysteria2/tuic) are skipped, so a cluster never
+/// contains a `freedom`/direct node (see [`crate::config::plan_cluster`], which also drops
+/// them with a warning).
 pub(crate) fn full_config_cluster_with(
     nodes: &[Server],
     settings: &Settings,
     api_port: u16,
     ctx: &ConnectContext,
 ) -> Value {
-    let Some(primary) = nodes.first() else {
+    let supported: Vec<&Server> = nodes
+        .iter()
+        .filter(|node| supported_by(node).contains(&CoreKind::Xray))
+        .collect();
+    let Some(primary) = supported.first().copied() else {
         return Value::Object(Map::new());
     };
-    let failover = settings.failover.enabled && nodes.len() > 1;
+    let failover =
+        settings.mode == ConnectionMode::Proxy && settings.failover.enabled && supported.len() > 1;
     let provider = ctx.provider.filter(|p| p.enabled);
     if let Some(provider) = provider {
         if provider.geoip_url.is_some() || provider.geosite_url.is_some() {
@@ -210,7 +219,7 @@ pub(crate) fn full_config_cluster_with(
 
     let mut outbounds = Vec::new();
     if failover {
-        for (i, node) in nodes.iter().enumerate() {
+        for (i, node) in supported.iter().copied().enumerate() {
             outbounds.push(outbound_with_tag(node, settings, &format!("node-{i}")));
         }
     } else {
@@ -235,7 +244,7 @@ pub(crate) fn full_config_cluster_with(
         "routing": routing_config(settings, provider, failover),
     });
     if failover {
-        let selector: Vec<String> = (0..nodes.len()).map(|i| format!("node-{i}")).collect();
+        let selector: Vec<String> = (0..supported.len()).map(|i| format!("node-{i}")).collect();
         let strategy = match settings.failover.mode {
             FailoverMode::Failover => "leastPing",
             FailoverMode::LoadBalance => "roundRobin",
@@ -243,7 +252,7 @@ pub(crate) fn full_config_cluster_with(
         config["observatory"] = json!({
             "subjectSelector": selector.clone(),
             "probeUrl": crate::config::failover_probe_url(settings),
-            "probeInterval": crate::config::duration_ms(settings.failover.probe_interval_ms),
+            "probeInterval": crate::config::duration_ms(crate::config::probe_interval_ms(settings)),
             "enableConcurrency": true,
         });
         config["routing"]["balancers"] = json!([{
