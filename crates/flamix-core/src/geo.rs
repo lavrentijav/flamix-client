@@ -2,7 +2,9 @@
 //!
 //! Resolves [`GeoData`] (which source to use, plus the custom URLs) to the concrete download
 //! URLs: the Xray `geosite.dat`/`geoip.dat` files and the sing-box `.srs` rule-set **bases**.
-//! This is pure — no network, no filesystem; the app performs the actual downloads.
+//! [`urls`] itself is pure — no network, no filesystem. This module also provides the runtime
+//! download/cache helpers ([`download_file`], [`is_fresh`], [`ensure`]) that fetch the `.dat`
+//! files into a local directory.
 //!
 //! ## Pinned versions
 //!
@@ -21,6 +23,10 @@
 //!   but only inside a single `sing-box.zip` release asset / on its rolling `release` branch,
 //!   so those bases are not tag-pinnable either.
 
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::error::{Error, Result};
 use crate::model::{GeoData, GeoSource};
 
 /// Xray `geosite.dat` — "Freedom for Russia" lists, release tag 202610161855.
@@ -102,6 +108,146 @@ pub fn urls(geo: &GeoData) -> GeoUrls {
             }
         }
     }
+}
+
+/// Timeout for a single geo database download.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Local paths of the two Xray databases inside `dir`: `(geosite.dat, geoip.dat)`.
+pub fn file_paths(dir: &Path) -> (PathBuf, PathBuf) {
+    (dir.join("geosite.dat"), dir.join("geoip.dat"))
+}
+
+/// Age of a file's modification time in seconds, or `None` when it cannot be read.
+///
+/// A modification time in the future (clock skew) is treated as age zero, i.e. brand new.
+fn mtime_age_secs(path: &Path) -> Option<i64> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    match modified.elapsed() {
+        Ok(age) => Some(age.as_secs() as i64),
+        Err(_) => Some(0),
+    }
+}
+
+/// `true` when both databases exist and were modified less than `max_age_secs` ago.
+///
+/// Uses the file mtime — no timestamp is stored separately.
+pub fn is_fresh(dir: &Path, max_age_secs: i64) -> bool {
+    let (geosite, geoip) = file_paths(dir);
+    let fresh = |path: &Path| matches!(mtime_age_secs(path), Some(age) if age < max_age_secs);
+    fresh(&geosite) && fresh(&geoip)
+}
+
+/// `<dest>.part` — the temporary file a download is written to before the atomic rename.
+fn part_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+/// A client for database downloads: a 60 s timeout and normal redirects, but no redirects to
+/// non-http(s) schemes (e.g. `file://`).
+fn download_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error("too many redirects")
+            } else if matches!(attempt.url().scheme(), "http" | "https") {
+                attempt.follow()
+            } else {
+                attempt.error("redirect to a non-http(s) scheme is not allowed")
+            }
+        }))
+        .build()
+        .map_err(|e| Error::Http(e.to_string()))
+}
+
+/// Write the response body to `part`, streaming chunk by chunk.
+async fn write_response(mut response: reqwest::Response, part: &Path) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = tokio::fs::File::create(part).await?;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?
+    {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    file.sync_all().await?;
+    Ok(())
+}
+
+/// Download `url` to `dest`, creating the parent directory if needed.
+///
+/// The body is streamed to `<dest>.part` and then atomically renamed over `dest`, so a partial
+/// or failed download never replaces an existing good file. A non-2xx response is
+/// [`Error::Http`]; the temporary file is removed on any failure.
+pub async fn download_file(url: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    let response = download_client()?
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(Error::Http(format!("HTTP {}", status.as_u16())));
+    }
+
+    let part = part_path(dest);
+    if let Err(err) = write_response(response, &part).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(err);
+    }
+    if let Err(err) = tokio::fs::rename(&part, dest).await {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+/// Outcome of [`ensure`]: whether files were (re)downloaded and the target directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeoStatus {
+    pub downloaded: bool,
+    pub dir: PathBuf,
+}
+
+/// Ensure the Xray databases in `dir` are present and not older than `max_age_secs`.
+///
+/// When [`is_fresh`] already holds this is a no-op (`downloaded: false`). Otherwise the resolved
+/// [`urls`] are fetched — geosite first, then geoip — skipping an empty URL. On a download error
+/// the error is propagated; a previously downloaded good file is left in place.
+pub async fn ensure(dir: &Path, geo: &GeoData, max_age_secs: i64) -> Result<GeoStatus> {
+    if is_fresh(dir, max_age_secs) {
+        return Ok(GeoStatus {
+            downloaded: false,
+            dir: dir.to_path_buf(),
+        });
+    }
+
+    let urls = urls(geo);
+    let (geosite_path, geoip_path) = file_paths(dir);
+    for (url, dest) in [
+        (&urls.xray_geosite, &geosite_path),
+        (&urls.xray_geoip, &geoip_path),
+    ] {
+        if url.is_empty() {
+            continue;
+        }
+        download_file(url, dest).await?;
+    }
+
+    Ok(GeoStatus {
+        downloaded: true,
+        dir: dir.to_path_buf(),
+    })
 }
 
 #[cfg(test)]
@@ -194,5 +340,105 @@ mod tests {
         let urls = urls(&custom("", ""));
         assert!(urls.xray_geosite.is_empty());
         assert!(urls.xray_geoip.is_empty());
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("flamix-geo-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch(path: &Path, body: &[u8]) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn set_mtime(path: &Path, age_secs: u64) {
+        let old = std::time::SystemTime::now() - Duration::from_secs(age_secs);
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(old).unwrap();
+    }
+
+    #[test]
+    fn file_paths_are_named_inside_dir() {
+        let dir = Path::new("/tmp/flamix-geo-paths");
+        let (geosite, geoip) = file_paths(dir);
+        assert_eq!(geosite, dir.join("geosite.dat"));
+        assert_eq!(geoip, dir.join("geoip.dat"));
+    }
+
+    #[test]
+    fn is_fresh_true_for_recent_files() {
+        let dir = temp_dir("fresh");
+        let (geosite, geoip) = file_paths(&dir);
+        touch(&geosite, b"site");
+        touch(&geoip, b"ip");
+        assert!(is_fresh(&dir, 3600));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_fresh_false_when_one_file_missing() {
+        let dir = temp_dir("missing");
+        let (geosite, _geoip) = file_paths(&dir);
+        touch(&geosite, b"site");
+        assert!(!is_fresh(&dir, 3600));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_fresh_false_for_old_files() {
+        let dir = temp_dir("old");
+        let (geosite, geoip) = file_paths(&dir);
+        touch(&geosite, b"site");
+        touch(&geoip, b"ip");
+        set_mtime(&geosite, 10_000);
+        set_mtime(&geoip, 10_000);
+        assert!(!is_fresh(&dir, 60));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_short_circuits_when_fresh() {
+        let dir = temp_dir("ensure-fresh");
+        let (geosite, geoip) = file_paths(&dir);
+        touch(&geosite, b"site");
+        touch(&geoip, b"ip");
+        // URLs that would fail if `ensure` actually tried to download them.
+        let geo = custom(
+            "http://127.0.0.1:1/geosite.dat",
+            "http://127.0.0.1:1/geoip.dat",
+        );
+        let status = ensure(&dir, &geo, 3600).await.unwrap();
+        assert!(!status.downloaded);
+        assert_eq!(status.dir, dir);
+        std::fs::remove_dir_all(&status.dir).ok();
+    }
+
+    #[tokio::test]
+    async fn ensure_skips_empty_urls() {
+        let dir = temp_dir("ensure-empty");
+        let geo = custom("", "");
+        let status = ensure(&dir, &geo, 3600).await.unwrap();
+        assert!(status.downloaded);
+        let (geosite, geoip) = file_paths(&status.dir);
+        assert!(!geosite.exists());
+        assert!(!geoip.exists());
+        std::fs::remove_dir_all(&status.dir).ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access to GitHub"]
+    async fn download_file_downloads_geosite() {
+        let dir = temp_dir("net");
+        let (geosite, _geoip) = file_paths(&dir);
+        let url = urls(&GeoData::default()).xray_geosite;
+        download_file(&url, &geosite).await.unwrap();
+        assert!(std::fs::metadata(&geosite).unwrap().len() > 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
