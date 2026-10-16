@@ -72,7 +72,10 @@ mod tests {
         let ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        std::env::temp_dir().join(format!("flamix-persist-{tag}-{}-{ns}-{n}", std::process::id()))
+        std::env::temp_dir().join(format!(
+            "flamix-persist-{tag}-{}-{ns}-{n}",
+            std::process::id()
+        ))
     }
 
     #[test]

@@ -37,7 +37,9 @@ pub fn human_bytes(bytes: u64) -> String {
 /// "used / total" or "∞" when the quota is unlimited.
 pub fn traffic_text(info: &TrafficInfo) -> String {
     match info.total {
-        Some(total) if total > 0 => format!("{} / {}", human_bytes(info.used()), human_bytes(total)),
+        Some(total) if total > 0 => {
+            format!("{} / {}", human_bytes(info.used()), human_bytes(total))
+        }
         _ => "∞".to_string(),
     }
 }
@@ -119,7 +121,11 @@ fn matches(query_lower: &str, text: &str) -> bool {
 }
 
 /// Servers of a subscription visible under `query`, sorted by ping when requested.
-fn filter_servers<'a>(servers: &'a [Server], query_lower: &str, sort_by_ping: bool) -> Vec<&'a Server> {
+fn filter_servers<'a>(
+    servers: &'a [Server],
+    query_lower: &str,
+    sort_by_ping: bool,
+) -> Vec<&'a Server> {
     let mut out: Vec<&Server> = servers
         .iter()
         .filter(|s| matches(query_lower, &s.name))
@@ -175,10 +181,7 @@ pub fn build_subscriptions(
         .iter()
         .filter(|sub| {
             matches(&query_lower, &sub.name)
-                || sub
-                    .servers
-                    .iter()
-                    .any(|s| matches(&query_lower, &s.name))
+                || sub.servers.iter().any(|s| matches(&query_lower, &s.name))
         })
         .collect();
     // Pinned subscriptions first, otherwise keep the stored order.
@@ -203,10 +206,7 @@ pub fn build_subscriptions(
                     .map(|t| traffic_text(&t))
                     .unwrap_or_else(|| "∞".to_string())
                     .into(),
-                expire_text: traffic
-                    .map(|t| expire_text(&t))
-                    .unwrap_or_default()
-                    .into(),
+                expire_text: traffic.map(|t| expire_text(&t)).unwrap_or_default().into(),
                 announce: subscription_announce(sub).into(),
                 error: subscription_error(sub).into(),
                 servers: model(servers),
@@ -233,7 +233,11 @@ pub fn visible_servers<'a>(state: &'a AppState, query: &str) -> Vec<&'a Server> 
         if matches(&query_lower, &sub.name) {
             out.extend(sub.servers.iter());
         } else {
-            out.extend(sub.servers.iter().filter(|s| matches(&query_lower, &s.name)));
+            out.extend(
+                sub.servers
+                    .iter()
+                    .filter(|s| matches(&query_lower, &s.name)),
+            );
         }
     }
     out.extend(
@@ -247,10 +251,7 @@ pub fn visible_servers<'a>(state: &'a AppState, query: &str) -> Vec<&'a Server> 
 
 /// Name of the selected server, empty when nothing is selected.
 pub fn selected_name(state: &AppState) -> String {
-    state
-        .selected()
-        .map(|s| s.name.clone())
-        .unwrap_or_default()
+    state.selected().map(|s| s.name.clone()).unwrap_or_default()
 }
 
 /// ISO code of the selected server, empty when nothing is selected.
@@ -333,10 +334,7 @@ mod tests {
             expire: None,
         };
         assert_eq!(traffic_text(&t), "15 B / 2.0 TB");
-        let unlimited = TrafficInfo {
-            total: None,
-            ..t
-        };
+        let unlimited = TrafficInfo { total: None, ..t };
         assert_eq!(traffic_text(&unlimited), "∞");
     }
 

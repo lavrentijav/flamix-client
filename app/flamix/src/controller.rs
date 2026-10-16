@@ -108,7 +108,10 @@ pub fn apply_import(state: &mut AppState, import: deeplink::Import) -> ImportOut
     }
 }
 
-fn apply_routing(state: &mut AppState, action: provider_routing::RoutingLinkAction) -> ImportOutcome {
+fn apply_routing(
+    state: &mut AppState,
+    action: provider_routing::RoutingLinkAction,
+) -> ImportOutcome {
     let Some(index) = subscription_of_selected(state) else {
         return ImportOutcome::Unsupported;
     };
@@ -127,7 +130,12 @@ fn apply_routing(state: &mut AppState, action: provider_routing::RoutingLinkActi
             }
         }
     }
-    let enabled = sub.provider.routing.as_ref().map(|r| r.enabled).unwrap_or(false);
+    let enabled = sub
+        .provider
+        .routing
+        .as_ref()
+        .map(|r| r.enabled)
+        .unwrap_or(false);
     ImportOutcome::Routing {
         subscription: sub.id.clone(),
         enabled,
@@ -310,7 +318,9 @@ impl Controller {
             controller.import_text(&text);
         }
         let auto = Arc::clone(&controller);
-        controller.rt.spawn(async move { auto.run_auto_update().await });
+        controller
+            .rt
+            .spawn(async move { auto.run_auto_update().await });
         let cleanup = Arc::clone(&controller);
         controller
             .rt
@@ -463,21 +473,12 @@ impl Controller {
         };
         let (mut sub, hwid, socks_port) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(sub) = state
-                .subscriptions
-                .iter()
-                .find(|s| s.id == id)
-                .cloned()
-            else {
+            let Some(sub) = state.subscriptions.iter().find(|s| s.id == id).cloned() else {
                 return;
             };
             (sub, state.device_id.clone(), state.settings.socks_port)
         };
-        let connected = self
-            .conn
-            .lock()
-            .map(|c| c.is_some())
-            .unwrap_or(false);
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false);
         let opts = FetchOptions {
             proxy: connected.then(|| format!("socks5h://127.0.0.1:{socks_port}")),
             hwid,
@@ -594,7 +595,11 @@ impl Controller {
     }
 
     fn set_speed(&self, up: u64, down: u64) {
-        let text = format!("↑ {}/s   ↓ {}/s", view::human_bytes(up), view::human_bytes(down));
+        let text = format!(
+            "↑ {}/s   ↓ {}/s",
+            view::human_bytes(up),
+            view::human_bytes(down)
+        );
         let _ = self
             .ui
             .upgrade_in_event_loop(move |ui| ui.set_speed_text(text.into()));
@@ -722,11 +727,7 @@ impl Controller {
     }
 
     async fn disconnect_internal(self: &Arc<Self>) {
-        let conn = self
-            .conn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(conn) = conn else {
             return;
         };
@@ -746,7 +747,8 @@ impl Controller {
 
     fn start_ticker(self: &Arc<Self>, server_id: String) {
         let this = Arc::clone(self);
-        self.rt.spawn(async move { this.run_ticker(server_id).await });
+        self.rt
+            .spawn(async move { this.run_ticker(server_id).await });
     }
 
     async fn run_ticker(self: Arc<Self>, server_id: String) {
@@ -1021,11 +1023,7 @@ impl Controller {
         let this = Arc::clone(self);
         self.rt.spawn(async move {
             this.disconnect_internal().await;
-            let snapshot = this
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
+            let snapshot = this.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Err(err) = this.persist.save_now(&snapshot) {
                 tracing::warn!(%err, "could not save state on exit");
             }
@@ -1156,11 +1154,7 @@ impl Controller {
     fn toggle_pin(self: &Arc<Self>, id: &str) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(sub) = state
-                .subscriptions
-                .iter_mut()
-                .find(|s| s.id == id)
-            {
+            if let Some(sub) = state.subscriptions.iter_mut().find(|s| s.id == id) {
                 sub.pinned = !sub.pinned;
             } else {
                 return;
@@ -1172,11 +1166,7 @@ impl Controller {
     fn toggle_collapse(self: &Arc<Self>, id: &str) {
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(sub) = state
-                .subscriptions
-                .iter_mut()
-                .find(|s| s.id == id)
-            {
+            if let Some(sub) = state.subscriptions.iter_mut().find(|s| s.id == id) {
                 sub.collapsed = !sub.collapsed;
             } else {
                 return;
@@ -1305,7 +1295,12 @@ mod tests {
         );
         assert!(state.subscriptions[0].provider.routing.is_none());
         assert_eq!(
-            state.subscriptions[1].provider.routing.as_ref().unwrap().name,
+            state.subscriptions[1]
+                .provider
+                .routing
+                .as_ref()
+                .unwrap()
+                .name,
             "P"
         );
 
@@ -1320,12 +1315,14 @@ mod tests {
                 enabled: false
             }
         );
-        assert!(!state.subscriptions[1]
-            .provider
-            .routing
-            .as_ref()
-            .unwrap()
-            .enabled);
+        assert!(
+            !state.subscriptions[1]
+                .provider
+                .routing
+                .as_ref()
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]
@@ -1354,12 +1351,14 @@ mod tests {
             &mut state,
             deeplink::Import::Routing(provider_routing::RoutingLinkAction::AddAndActivate(routing)),
         );
-        assert!(state.subscriptions[0]
-            .provider
-            .routing
-            .as_ref()
-            .unwrap()
-            .enabled);
+        assert!(
+            state.subscriptions[0]
+                .provider
+                .routing
+                .as_ref()
+                .unwrap()
+                .enabled
+        );
     }
 
     #[test]

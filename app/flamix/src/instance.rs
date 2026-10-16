@@ -60,7 +60,8 @@ pub fn decode_message(token: &str, text: &str) -> Option<Vec<String>> {
 pub fn forward(info: &InstanceInfo, args: &[String]) -> std::io::Result<()> {
     use std::io::Write;
     let addr = SocketAddr::from(([127, 0, 0, 1], info.port));
-    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))?;
+    let mut stream =
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2))?;
     stream.write_all(encode_message(&info.token, args).as_bytes())?;
     stream.flush()?;
     Ok(())

@@ -152,7 +152,10 @@ fn main() -> anyhow::Result<()> {
         let controller = Controller::new(&ui, data_dir, rt.clone(), state, args.import.clone());
         let handler = Arc::clone(&controller);
         rt.spawn(async move {
-            instance::serve(listener, token, move |args| handler.handle_remote_args(args)).await;
+            instance::serve(listener, token, move |args| {
+                handler.handle_remote_args(args)
+            })
+            .await;
         });
         Some(controller)
     };
