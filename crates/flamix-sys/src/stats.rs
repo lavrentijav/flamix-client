@@ -1,4 +1,4 @@
-//! Traffic counters of the running cores. OWNER: task T05.
+//! Traffic counters of the running cores. OWNER: task T23 (T05 original; controller/failover wiring).
 //!
 //! Communication is deliberately tiny: Xray through its `xray api statsquery` CLI and sing-box
 //! through a raw HTTP/1.1 request to the clash API, so no extra HTTP client is pulled in here.
@@ -8,12 +8,44 @@ use std::path::Path;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Query Xray for the proxy outbound traffic since the previous call.
+/// Which Xray outbound counters to query.
 ///
-/// Runs `xray api statsquery --server=127.0.0.1:<port> -pattern "outbound>>>proxy>>>traffic"
-/// -reset`, which resets the counters after reading them, so the returned pair already is the
-/// delta since the last call. Returns `(uplink, downlink)` in bytes.
-pub async fn xray_traffic(xray_bin: &Path, api_port: u16) -> crate::Result<(u64, u64)> {
+/// Single-server configs route everything through one outbound tagged `proxy`. Failover
+/// clusters have no `proxy` *outbound* (that name is only the balancer tag, which owns no
+/// counters): each node is a separate outbound tagged `node-N`, so the prefix match
+/// `outbound>>>node-` sums all of them (`parse_xray_stats` sums every matching name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XrayPattern {
+    /// Single-server config: the `proxy` outbound.
+    Proxy,
+    /// Failover cluster: every `node-N` outbound.
+    ///
+    /// Known limitation (accepted): the observatory health probes to `node-N` are counted
+    /// here too, so per-server/daily traffic is slightly inflated even when idle.
+    Cluster,
+}
+
+impl XrayPattern {
+    /// The `-pattern` value passed to `xray api statsquery`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Proxy => "outbound>>>proxy>>>traffic",
+            Self::Cluster => "outbound>>>node-",
+        }
+    }
+}
+
+/// Query Xray for the outbound traffic since the previous call.
+///
+/// Runs `xray api statsquery --server=127.0.0.1:<port> -pattern <pattern> -reset`, which
+/// resets the counters after reading them, so the returned pair already is the delta since
+/// the last call. `pattern` selects the single `proxy` outbound or the `node-N` cluster
+/// ([`XrayPattern`]). Returns `(uplink, downlink)` in bytes.
+pub async fn xray_traffic(
+    xray_bin: &Path,
+    api_port: u16,
+    pattern: XrayPattern,
+) -> crate::Result<(u64, u64)> {
     let server = format!("--server=127.0.0.1:{api_port}");
     let output = tokio::process::Command::new(xray_bin)
         .args([
@@ -21,7 +53,7 @@ pub async fn xray_traffic(xray_bin: &Path, api_port: u16) -> crate::Result<(u64,
             "statsquery",
             &server,
             "-pattern",
-            "outbound>>>proxy>>>traffic",
+            pattern.as_str(),
             "-reset",
         ])
         .output()
@@ -172,6 +204,30 @@ mod tests {
     #[test]
     fn rejects_bad_stats_json() {
         assert!(parse_xray_stats("not json").is_err());
+    }
+
+    #[test]
+    fn xray_patterns_select_single_proxy_or_cluster() {
+        assert_eq!(XrayPattern::Proxy.as_str(), "outbound>>>proxy>>>traffic");
+        assert_eq!(XrayPattern::Cluster.as_str(), "outbound>>>node-");
+        assert_ne!(XrayPattern::Proxy, XrayPattern::Cluster);
+    }
+
+    #[test]
+    fn cluster_pattern_sums_every_node() {
+        // What `-pattern "outbound>>>node-"` returns from a failover cluster: only node
+        // counters; `direct`/`block`/`api` never match the prefix.
+        let sample = r#"{"stat":[
+            {"name":"outbound>>>node-0>>>traffic>>>uplink","value":"100"},
+            {"name":"outbound>>>node-1>>>traffic>>>uplink","value":"5"},
+            {"name":"outbound>>>node-0>>>traffic>>>downlink","value":"200"},
+            {"name":"outbound>>>node-2>>>traffic>>>downlink","value":50}
+        ]}"#;
+        assert_eq!(parse_xray_stats(sample).unwrap(), (105, 250));
+        for excluded in ["direct", "block", "api"] {
+            let name = format!("outbound>>>{excluded}>>>traffic");
+            assert!(!name.starts_with(XrayPattern::Cluster.as_str()));
+        }
     }
 
     #[test]
