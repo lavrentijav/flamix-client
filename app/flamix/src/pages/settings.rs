@@ -312,6 +312,7 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         local_auth_pass: bridge.get_local_auth_pass().to_string(),
         routing: base.routing.clone(),
         failover: base.failover.clone(),
+        geo: base.geo.clone(),
         dns: Dns {
             remote: bridge.get_dns_remote().to_string(),
             direct: bridge.get_dns_direct().to_string(),

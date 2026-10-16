@@ -652,6 +652,45 @@ pub enum Theme {
     Light,
 }
 
+/// Where the geosite/geoip rule data is downloaded from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GeoSource {
+    /// `runetfreedom/russia-v2ray-rules-dat` — the "Freedom for Russia" lists (RU-focused),
+    /// the default for the "Обход РФ" preset.
+    #[default]
+    FreedomForRussia,
+    /// `Loyalsoldier/v2ray-rules-dat` (general-purpose lists).
+    Loyalsoldier,
+    /// Use the URLs in [`GeoData::geosite_url`] / [`GeoData::geoip_url`].
+    Custom,
+}
+
+/// Geo rule databases: which source to download and (for [`GeoSource::Custom`]) the URLs.
+///
+/// The app downloads the Xray `.dat` files and, for sing-box, uses the matching `.srs`
+/// rule-set URLs. `geosite.dat`/`geoip.dat` are placed in a per-user directory and pointed to
+/// with `XRAY_LOCATION_ASSET`; empty URLs mean "use the source preset".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeoData {
+    pub source: GeoSource,
+    /// Xray `geosite.dat` URL (used only when `source == Custom`).
+    pub geosite_url: String,
+    /// Xray `geoip.dat` URL (used only when `source == Custom`).
+    pub geoip_url: String,
+}
+
+impl Default for GeoData {
+    fn default() -> Self {
+        Self {
+            source: GeoSource::FreedomForRussia,
+            geosite_url: String::new(),
+            geoip_url: String::new(),
+        }
+    }
+}
+
 /// User settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -679,6 +718,8 @@ pub struct Settings {
     pub local_auth_pass: String,
     pub routing: Routing,
     pub dns: Dns,
+    /// Geo rule databases (source + custom URLs).
+    pub geo: GeoData,
     /// Core-level failover (proxy mode only, stage 1).
     pub failover: Failover,
     /// TUN interface MTU and stack ("system", "gvisor", "mixed").
@@ -739,6 +780,7 @@ impl Default for Settings {
             local_auth_pass: String::new(),
             routing: Routing::default(),
             dns: Dns::default(),
+            geo: GeoData::default(),
             failover: Failover::default(),
             tun_mtu: 9000,
             tun_stack: "mixed".into(),
@@ -782,6 +824,8 @@ pub struct AppState {
     pub device_id: Option<String>,
     /// Measured public exit IP per server id (see [`ExitIp`]).
     pub exit_ips: BTreeMap<String, ExitIp>,
+    /// Unix seconds of the last successful geo database download (0 = never).
+    pub geo_updated: i64,
 }
 
 /// Public exit IP of a server as measured by actually connecting through it (the egress
