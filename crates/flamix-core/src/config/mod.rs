@@ -11,7 +11,56 @@ mod routing;
 pub mod singbox;
 pub mod xray;
 
-use crate::model::{ConnectionMode, Protocol, Server, Settings};
+use crate::model::{ConnectionMode, Protocol, ProviderRouting, Server, Settings};
+use std::collections::BTreeMap;
+
+/// Extra, provider-controlled inputs of one connect call.
+///
+/// `provider` is the routing profile of the subscription that owns the server (applied when
+/// enabled); `overrides` are the Happ app-management keys (`socks-auth-*`, `http-auth-*`, ...).
+/// The default context applies neither.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectContext<'a> {
+    pub provider: Option<&'a ProviderRouting>,
+    pub overrides: Option<&'a BTreeMap<String, String>>,
+}
+
+/// Local inbound credentials (`socks-auth-*` / `http-auth-*`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalAuth {
+    pub user: String,
+    pub password: String,
+}
+
+/// Parse `<prefix>-auth-mode`/`-user`/`-password`. `prefix` is `socks` or `http`.
+///
+/// Happ's `<prefix>-auth-mode` is `auto` \| `manual` \| `from-json` \| `disable`; only
+/// `manual` carries explicit credentials, and both user and password must be non-empty
+/// (otherwise auth is treated as off, e.g. `auto`/`from-json`/`disable` or blank keys).
+pub(crate) fn local_auth(
+    prefix: &str,
+    overrides: Option<&BTreeMap<String, String>>,
+) -> Option<LocalAuth> {
+    let map = overrides?;
+    let mode = map.get(&format!("{prefix}-auth-mode"))?;
+    if !mode.eq_ignore_ascii_case("manual") {
+        return None;
+    }
+    let user = map.get(&format!("{prefix}-auth-user"))?;
+    let password = map.get(&format!("{prefix}-auth-password"))?;
+    if user.is_empty() || password.is_empty() {
+        return None;
+    }
+    Some(LocalAuth {
+        user: user.clone(),
+        password: password.clone(),
+    })
+}
+
+/// True when any Happ app override turns on local inbound authentication.
+pub fn local_auth_enabled(overrides: Option<&BTreeMap<String, String>>) -> bool {
+    local_auth("socks", overrides).is_some() || local_auth("http", overrides).is_some()
+}
 
 /// Which external core binary to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,13 +115,24 @@ pub fn supported_by(server: &Server) -> &'static [CoreKind] {
 ///   (xhttp transport, or anything sing-box can't express) an extra Xray process provides a
 ///   local SOCKS inbound that sing-box's outbound points to.
 pub fn plan(server: &Server, settings: &Settings) -> Vec<CorePlan> {
+    plan_with(server, settings, &ConnectContext::default())
+}
+
+/// Plan the processes for connecting to `server` with `settings` and a [`ConnectContext`]
+/// carrying the selected subscription's provider routing and Happ app-overrides.
+///
+/// Provider routing (when present and enabled) is applied by [`xray::full_config_with`] /
+/// [`singbox::full_config_with`]: its rules go before the user's custom rules, they replace
+/// the user's preset, `global_proxy == false` sends unmatched traffic `direct`, and the
+/// profile's DNS/hosts/fake-DNS/domain-strategy override the user settings.
+pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> Vec<CorePlan> {
     match settings.mode {
         ConnectionMode::Proxy => {
             if supported_by(server).contains(&CoreKind::Xray) {
                 let api_port = api_port(CoreKind::Xray, settings);
                 vec![CorePlan {
                     core: CoreKind::Xray,
-                    config: xray::full_config(server, settings, api_port),
+                    config: xray::full_config_with(server, settings, api_port, ctx),
                     elevated: false,
                     api_port,
                 }]
@@ -80,7 +140,7 @@ pub fn plan(server: &Server, settings: &Settings) -> Vec<CorePlan> {
                 let api_port = api_port(CoreKind::SingBox, settings);
                 vec![CorePlan {
                     core: CoreKind::SingBox,
-                    config: singbox::full_config(server, settings, false, None, api_port),
+                    config: singbox::full_config_with(server, settings, false, None, api_port, ctx),
                     elevated: false,
                     api_port,
                 }]
@@ -95,9 +155,18 @@ pub fn plan(server: &Server, settings: &Settings) -> Vec<CorePlan> {
             let mut plans = Vec::new();
             if upstream_socks.is_some() {
                 let api_port = api_port(CoreKind::Xray, settings);
+                // This Xray process is an internal hop: sing-box (which captured the TUN)
+                // owns routing and dials its local SOCKS inbound without credentials, so
+                // provider routing/auth must NOT be applied here — only to the user-facing
+                // inbounds of the TUN sing-box process below.
                 plans.push(CorePlan {
                     core: CoreKind::Xray,
-                    config: xray::full_config(server, settings, api_port),
+                    config: xray::full_config_with(
+                        server,
+                        settings,
+                        api_port,
+                        &ConnectContext::default(),
+                    ),
                     elevated: false,
                     api_port,
                 });
@@ -105,7 +174,14 @@ pub fn plan(server: &Server, settings: &Settings) -> Vec<CorePlan> {
             let api_port = api_port(CoreKind::SingBox, settings);
             plans.push(CorePlan {
                 core: CoreKind::SingBox,
-                config: singbox::full_config(server, settings, true, upstream_socks, api_port),
+                config: singbox::full_config_with(
+                    server,
+                    settings,
+                    true,
+                    upstream_socks,
+                    api_port,
+                    ctx,
+                ),
                 elevated: true,
                 api_port,
             });
@@ -230,6 +306,106 @@ mod tests {
         assert_eq!(plan[0].core, CoreKind::SingBox);
         assert!(plan[0].elevated);
         assert_eq!(plan[0].config["inbounds"][0]["type"], "tun");
+    }
+
+    fn overrides(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn local_auth_only_for_manual_with_credentials() {
+        let manual = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        let auth = local_auth("socks", Some(&manual)).unwrap();
+        assert_eq!(auth.user, "u");
+        assert_eq!(auth.password, "p");
+        assert!(local_auth_enabled(Some(&manual)));
+
+        // Case-insensitive mode.
+        let upper = overrides(&[
+            ("socks-auth-mode", "MANUAL"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        assert!(local_auth("socks", Some(&upper)).is_some());
+
+        // auto / from-json / disable do not enable auth.
+        for mode in ["auto", "from-json", "disable"] {
+            let m = overrides(&[
+                ("socks-auth-mode", mode),
+                ("socks-auth-user", "u"),
+                ("socks-auth-password", "p"),
+            ]);
+            assert!(local_auth("socks", Some(&m)).is_none(), "mode={mode}");
+            assert!(!local_auth_enabled(Some(&m)), "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn local_auth_requires_non_empty_credentials() {
+        let missing = overrides(&[("socks-auth-mode", "manual")]);
+        assert!(local_auth("socks", Some(&missing)).is_none());
+
+        let blank_user = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", ""),
+            ("socks-auth-password", "p"),
+        ]);
+        assert!(local_auth("socks", Some(&blank_user)).is_none());
+
+        let blank_password = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", ""),
+        ]);
+        assert!(local_auth("socks", Some(&blank_password)).is_none());
+        assert!(!local_auth_enabled(Some(&blank_password)));
+
+        assert!(local_auth("http", None).is_none());
+        assert!(!local_auth_enabled(None));
+    }
+
+    #[test]
+    fn tun_chain_xray_ignores_provider_routing_and_auth() {
+        // The provider asks for global-direct routing and local auth.
+        let provider = ProviderRouting {
+            name: "p".into(),
+            enabled: true,
+            global_proxy: false,
+            domain_strategy: Some("AsIs".into()),
+            ..ProviderRouting::default()
+        };
+        let ov = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: Some(&ov),
+        };
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            ..Settings::default()
+        };
+        let plans = plan_with(&vless_xhttp(), &settings, &ctx);
+        assert_eq!(plans.len(), 2);
+        // Chained Xray must be built with the default context: no provider routing, no auth.
+        let expected = xray::full_config(&vless_xhttp(), &settings, plans[0].api_port);
+        assert_eq!(plans[0].config, expected);
+        assert_eq!(plans[0].config["inbounds"][0]["settings"]["auth"], "noauth");
+        // No conditionless provider catch-all rule, and no provider domain strategy.
+        let rules = plans[0].config["routing"]["rules"].as_array().unwrap();
+        assert!(!rules.iter().any(|r| r.get("domain").is_none()
+            && r.get("ip").is_none()
+            && r.get("inboundTag").is_none()));
+        assert_eq!(plans[0].config["routing"]["domainStrategy"], "IPIfNonMatch");
     }
 }
 
@@ -756,6 +932,192 @@ mod validation {
                     &plan.config,
                     &format!("vless-xhttp/{pname}/tun-chain/{}", plan.core.binary_name()),
                 ));
+            }
+        }
+        report(problems);
+    }
+
+    /// Provider routing profiles with every feature (rules, final, dns, hosts, fake-dns, geo).
+    fn provider_routings() -> Vec<(&'static str, ProviderRouting)> {
+        let global_direct = ProviderRouting {
+            name: "global-direct".into(),
+            enabled: true,
+            global_proxy: false,
+            rules: vec![
+                RoutingRule {
+                    domains: vec!["geosite:google".into(), "domain:ads.example".into()],
+                    ips: vec![],
+                    processes: vec![],
+                    network: None,
+                    ports: None,
+                    action: RuleAction::Direct,
+                    enabled: true,
+                },
+                RoutingRule {
+                    domains: vec![],
+                    ips: vec!["geoip:ru".into()],
+                    processes: vec![],
+                    network: Some("tcp".into()),
+                    ports: Some("443".into()),
+                    action: RuleAction::Proxy,
+                    enabled: true,
+                },
+                RoutingRule {
+                    domains: vec!["geosite:category-ads-all".into()],
+                    ips: vec![],
+                    processes: vec![],
+                    network: None,
+                    ports: None,
+                    action: RuleAction::Block,
+                    enabled: true,
+                },
+            ],
+            domain_strategy: Some("IPIfNonMatch".into()),
+            dns: Some(Dns {
+                remote: "https://1.1.1.1/dns-query".into(),
+                direct: "https://77.88.8.8/dns-query".into(),
+                fake_ip: false,
+            }),
+            dns_hosts: BTreeMap::from([("host.example".into(), "10.0.0.7".into())]),
+            geoip_url: Some("https://cdn.example/geoip.dat".into()),
+            geosite_url: Some("https://cdn.example/geosite.dat".into()),
+            ..ProviderRouting::default()
+        };
+        let global_proxy = ProviderRouting {
+            name: "global-proxy-fake".into(),
+            enabled: true,
+            global_proxy: true,
+            rules: vec![RoutingRule {
+                domains: vec!["geosite:private".into()],
+                ips: vec!["geoip:private".into()],
+                processes: vec![],
+                network: None,
+                ports: None,
+                action: RuleAction::Direct,
+                enabled: true,
+            }],
+            dns: Some(Dns {
+                remote: "https://9.9.9.9/dns-query".into(),
+                direct: "https://77.88.8.8/dns-query".into(),
+                fake_ip: true,
+            }),
+            fake_dns: true,
+            ..ProviderRouting::default()
+        };
+        vec![
+            ("global-direct", global_direct),
+            ("global-proxy-fake", global_proxy),
+        ]
+    }
+
+    /// Happ app-override sets: none, and local inbound auth.
+    fn override_sets() -> Vec<(&'static str, Option<BTreeMap<String, String>>)> {
+        vec![
+            ("no-override", None),
+            (
+                "auth",
+                Some(BTreeMap::from([
+                    ("socks-auth-mode".to_string(), "manual".to_string()),
+                    ("socks-auth-user".to_string(), "user".to_string()),
+                    ("socks-auth-password".to_string(), "pass".to_string()),
+                    ("http-auth-mode".to_string(), "manual".to_string()),
+                    ("http-auth-user".to_string(), "user".to_string()),
+                    ("http-auth-password".to_string(), "pass".to_string()),
+                ])),
+            ),
+        ]
+    }
+
+    #[test]
+    fn provider_routing_configs_are_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let mut problems = Vec::new();
+        let mut validated = 0;
+        for (sname, srv) in samples() {
+            for (pname, provider) in provider_routings() {
+                for (oname, overrides) in override_sets() {
+                    for mode in [ConnectionMode::Proxy, ConnectionMode::Tun] {
+                        let settings = settings(mode, Routing::default());
+                        let ctx = ConnectContext {
+                            provider: Some(&provider),
+                            overrides: overrides.as_ref(),
+                        };
+                        let mode_name = if mode == ConnectionMode::Tun {
+                            "tun"
+                        } else {
+                            "proxy"
+                        };
+                        if xray_supports(&srv) {
+                            let api = api_port(CoreKind::Xray, &settings);
+                            let cfg = xray::full_config_with(&srv, &settings, api, &ctx);
+                            problems.extend(check_core(
+                                CoreKind::Xray,
+                                &cfg,
+                                &format!("{sname}/{pname}/{oname}/{mode_name}/xray"),
+                            ));
+                            validated += 1;
+                        }
+                        if singbox_supports(&srv, &settings) {
+                            let api = api_port(CoreKind::SingBox, &settings);
+                            let cfg = singbox::full_config_with(
+                                &srv,
+                                &settings,
+                                mode == ConnectionMode::Tun,
+                                None,
+                                api,
+                                &ctx,
+                            );
+                            problems.extend(check_core(
+                                CoreKind::SingBox,
+                                &cfg,
+                                &format!("{sname}/{pname}/{oname}/{mode_name}/sing-box"),
+                            ));
+                            validated += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(validated > 0, "no provider configs validated");
+        report(problems);
+    }
+
+    #[test]
+    fn provider_tun_chain_configs_are_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let Some((_, srv)) = samples().into_iter().find(|(n, _)| *n == "vless-xhttp") else {
+            return;
+        };
+        let mut problems = Vec::new();
+        for (pname, provider) in provider_routings() {
+            for (oname, overrides) in override_sets() {
+                let ctx = ConnectContext {
+                    provider: Some(&provider),
+                    overrides: overrides.as_ref(),
+                };
+                let settings = settings(ConnectionMode::Tun, Routing::default());
+                let plans = super::plan_with(&srv, &settings, &ctx);
+                assert_eq!(
+                    plans.len(),
+                    2,
+                    "{pname}/{oname}: xhttp chain must be xray + sing-box"
+                );
+                for plan in &plans {
+                    problems.extend(check_core(
+                        plan.core,
+                        &plan.config,
+                        &format!(
+                            "vless-xhttp/{pname}/{oname}/tun-chain/{}",
+                            plan.core.binary_name()
+                        ),
+                    ));
+                }
             }
         }
         report(problems);

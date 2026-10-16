@@ -8,7 +8,7 @@
 //! the first Xray outbound / the sing-box `route.final`, so unmatched traffic
 //! always reaches the proxy.
 
-use crate::model::{Routing, RoutingPreset, RuleAction};
+use crate::model::{ProviderRouting, Routing, RoutingPreset, RuleAction};
 
 /// One core-neutral routing rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +39,25 @@ impl Rule {
 pub(crate) fn custom_rules(routing: &Routing) -> Vec<Rule> {
     routing
         .custom_rules
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| Rule {
+            domains: r.domains.clone(),
+            ips: r.ips.clone(),
+            processes: r.processes.clone(),
+            network: r.network.clone(),
+            ports: r.ports.clone(),
+            action: r.action,
+        })
+        .collect()
+}
+
+/// Enabled rules of a provider routing profile, in profile order.
+///
+/// These go *before* the user's custom rules and replace the built-in preset.
+pub(crate) fn provider_rules(provider: &ProviderRouting) -> Vec<Rule> {
+    provider
+        .rules
         .iter()
         .filter(|r| r.enabled)
         .map(|r| Rule {
