@@ -8,6 +8,7 @@ use crate::flags;
 use crate::{ServerItem, SubscriptionItem};
 use flamix_core::model::{AppState, Server, Subscription, TrafficInfo};
 use slint::{ModelRc, VecModel};
+use std::collections::HashSet;
 
 /// `ServerItem.ping`: not tested yet.
 pub const PING_UNTESTED: i32 = -2;
@@ -159,11 +160,13 @@ fn subscription_error(sub: &Subscription) -> String {
 
 /// Build the subscription cards for the server list.
 ///
-/// `sort_by_ping` also re-orders servers inside every card (untested/failed last).
+/// `updating` holds the ids of subscriptions with an update in flight; `sort_by_ping` also
+/// re-orders servers inside every card (untested/failed last).
 pub fn build_subscriptions(
     state: &AppState,
     query: &str,
     sort_by_ping: bool,
+    updating: &HashSet<String>,
 ) -> Vec<SubscriptionItem> {
     let query_lower = query.to_lowercase();
 
@@ -193,7 +196,7 @@ pub fn build_subscriptions(
                 name: sub.name.clone().into(),
                 pinned: sub.pinned,
                 collapsed: sub.collapsed,
-                updating: false,
+                updating: updating.contains(&sub.id),
                 has_traffic: traffic.is_some(),
                 traffic_fraction: traffic.map(|t| traffic_fraction(&t)).unwrap_or(0.0),
                 traffic_text: traffic
@@ -381,13 +384,13 @@ mod tests {
             ],
             ..AppState::default()
         };
-        let items = build_subscriptions(&state, "ber", false);
+        let items = build_subscriptions(&state, "ber", false, &HashSet::new());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Premium");
         assert_eq!(items[0].servers.row_count(), 1);
         assert_eq!(items[0].servers.row_data(0).unwrap().name, "Berlin");
 
-        let all = build_subscriptions(&state, "", false);
+        let all = build_subscriptions(&state, "", false, &HashSet::new());
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].name, "Premium");
         assert_eq!(all[1].name, "Basic");
@@ -402,7 +405,7 @@ mod tests {
         let mut pinned = subscription("s2", "Pinned", vec![server("b", "B", None)]);
         pinned.pinned = true;
         state.subscriptions.push(pinned);
-        let items = build_subscriptions(&state, "", false);
+        let items = build_subscriptions(&state, "", false, &HashSet::new());
         assert_eq!(items[0].name, "Pinned");
         assert!(items[0].pinned);
         assert_eq!(items[1].name, "First");
@@ -423,7 +426,7 @@ mod tests {
             )],
             ..AppState::default()
         };
-        let items = build_subscriptions(&state, "", true);
+        let items = build_subscriptions(&state, "", true, &HashSet::new());
         let names: Vec<String> = (0..items[0].servers.row_count())
             .map(|i| items[0].servers.row_data(i).unwrap().name.to_string())
             .collect();

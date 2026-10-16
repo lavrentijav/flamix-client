@@ -7,11 +7,20 @@
 use crate::view;
 use crate::{flags, AppWindow, ConnState};
 use flamix_core::model::{AppState, ConnectionMode, Subscription};
+use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, link, provider_routing};
 use slint::{ComponentHandle, Weak};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Maximum number of subscription fetches running at once.
+const MAX_PARALLEL_UPDATES: usize = 3;
+
+/// Interval between the periodic auto-update checks.
+const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Everything needed to talk to the running cores (filled in when connected).
 pub struct Connection {}
@@ -121,6 +130,20 @@ fn links_status(added: usize, skipped: usize) -> String {
     text
 }
 
+/// Should this subscription be refreshed now? (`update_always` or its interval elapsed.)
+fn should_update(sub: &Subscription, now: i64) -> bool {
+    if sub.provider.update_always {
+        return true;
+    }
+    if sub.update_interval_hours == 0 {
+        return false;
+    }
+    match sub.last_update {
+        None => true,
+        Some(last) => now.saturating_sub(last) >= i64::from(sub.update_interval_hours) * 3600,
+    }
+}
+
 /// Random hex string of `bytes` bytes (16 chars for 8 bytes).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -159,6 +182,10 @@ pub struct Controller {
     pub(crate) conn: Arc<Mutex<Option<Connection>>>,
     pub(crate) persist: crate::persist::Persist,
     pub(crate) sort_by_ping: AtomicBool,
+    /// Ids of subscriptions with an update in flight (drives the spinner in the UI).
+    pub(crate) updating: Arc<Mutex<HashSet<String>>>,
+    /// Bounds the number of concurrent subscription fetches.
+    pub(crate) updates: Arc<tokio::sync::Semaphore>,
 }
 
 impl Controller {
@@ -179,12 +206,16 @@ impl Controller {
             conn: Arc::new(Mutex::new(None)),
             persist,
             sort_by_ping: AtomicBool::new(false),
+            updating: Arc::new(Mutex::new(HashSet::new())),
+            updates: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPDATES)),
         });
         controller.wire(ui);
         controller.apply_now();
         if let Some(text) = startup_import {
             controller.import_text(&text);
         }
+        let auto = Arc::clone(&controller);
+        controller.rt.spawn(async move { auto.run_auto_update().await });
         controller
     }
 
@@ -192,10 +223,11 @@ impl Controller {
     pub(crate) fn apply_to(&self, ui: &AppWindow) {
         let (subs, locals, name, iso, tun) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let updating = self.updating.lock().unwrap_or_else(|e| e.into_inner());
             let query = ui.get_search_text().to_string();
             let sort = self.sort_by_ping.load(Ordering::Relaxed);
             (
-                view::build_subscriptions(&state, &query, sort),
+                view::build_subscriptions(&state, &query, sort, &updating),
                 view::build_local_servers(&state, &query, sort),
                 view::selected_name(&state),
                 view::selected_iso(&state),
@@ -256,8 +288,11 @@ impl Controller {
         };
         match outcome {
             ImportOutcome::SubscriptionAdded { id, name } => {
-                let label = if name.is_empty() { id } else { name };
+                let label = if name.is_empty() { id.clone() } else { name };
                 self.set_status(format!("Подписка добавлена: {label}"));
+                self.persist_and_render();
+                self.spawn_update(id);
+                return;
             }
             ImportOutcome::LinksAdded { added, skipped } => {
                 self.set_status(links_status(added, skipped));
@@ -285,6 +320,149 @@ impl Controller {
         });
     }
 
+    /// Queue a fetch for one subscription (bounded by the global semaphore).
+    fn spawn_update(self: &Arc<Self>, id: String) {
+        let this = Arc::clone(self);
+        self.rt.spawn(async move { this.update_one(id).await });
+    }
+
+    /// Queue a fetch for every subscription.
+    fn update_all(self: &Arc<Self>) {
+        let ids: Vec<String> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.subscriptions.iter().map(|s| s.id.clone()).collect()
+        };
+        for id in ids {
+            self.spawn_update(id);
+        }
+    }
+
+    async fn update_one(self: Arc<Self>, id: String) {
+        let _permit = match self.updates.acquire().await {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+        let (mut sub, hwid, socks_port) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(sub) = state
+                .subscriptions
+                .iter()
+                .find(|s| s.id == id)
+                .cloned()
+            else {
+                return;
+            };
+            (sub, state.device_id.clone(), state.settings.socks_port)
+        };
+        let connected = self
+            .conn
+            .lock()
+            .map(|c| c.is_some())
+            .unwrap_or(false);
+        let opts = FetchOptions {
+            proxy: connected.then(|| format!("socks5h://127.0.0.1:{socks_port}")),
+            hwid,
+            timeout: None,
+        };
+
+        self.mark_updating(&id, true);
+        let name = sub.name.clone();
+        let result = subscription::update(&mut sub, &opts).await;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = state.subscriptions.iter_mut().find(|s| s.id == id) {
+                // Preserve UI-only flags a concurrent toggle may have changed.
+                sub.pinned = existing.pinned;
+                sub.collapsed = existing.collapsed;
+                *existing = sub;
+            }
+        }
+        self.mark_updating(&id, false);
+        self.persist_and_render();
+        match result {
+            Ok(()) => self.set_status(format!("Подписка обновлена: {name}")),
+            Err(err) => self.set_status(format!("Ошибка обновления: {err}")),
+        }
+    }
+
+    fn mark_updating(self: &Arc<Self>, id: &str, on: bool) {
+        {
+            let mut updating = self.updating.lock().unwrap_or_else(|e| e.into_inner());
+            if on {
+                updating.insert(id.to_string());
+            } else {
+                updating.remove(id);
+            }
+        }
+        self.request_render();
+    }
+
+    fn delete_subscription(self: &Arc<Self>, id: &str) {
+        let removed = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let before = state.subscriptions.len();
+            state.subscriptions.retain(|s| s.id != id);
+            if state.selected_server.as_deref() == Some(id) {
+                state.selected_server = None;
+            }
+            before != state.subscriptions.len()
+        };
+        if removed {
+            self.set_status("Подписка удалена");
+            self.persist_and_render();
+        }
+    }
+
+    fn delete_server(self: &Arc<Self>, id: &str) {
+        let removed = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let before = state.local_servers.len();
+            state.local_servers.retain(|s| s.id != id);
+            if state.selected_server.as_deref() == Some(id) {
+                state.selected_server = None;
+            }
+            if before == state.local_servers.len() {
+                let in_subscription = state.servers().any(|s| s.id == id);
+                if in_subscription {
+                    self.set_status("Скрытие серверов подписки не поддерживается");
+                    return;
+                }
+            }
+            before != state.local_servers.len()
+        };
+        if removed {
+            self.persist_and_render();
+        }
+    }
+
+    /// Startup fetch for out-of-date subscriptions, then a check every ten minutes.
+    async fn run_auto_update(self: Arc<Self>) {
+        self.auto_update_tick(true).await;
+        loop {
+            tokio::time::sleep(AUTO_UPDATE_INTERVAL).await;
+            self.auto_update_tick(false).await;
+        }
+    }
+
+    async fn auto_update_tick(self: &Arc<Self>, startup: bool) {
+        let ids: Vec<String> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !startup && !state.settings.auto_update_subscriptions {
+                return;
+            }
+            let now = chrono::Utc::now().timestamp();
+            state
+                .subscriptions
+                .iter()
+                .filter(|s| should_update(s, now))
+                .map(|s| s.id.clone())
+                .collect()
+        };
+        for id in ids {
+            self.spawn_update(id);
+        }
+    }
+
     fn wire(self: &Arc<Self>, ui: &AppWindow) {
         {
             let this = Arc::clone(self);
@@ -305,6 +483,22 @@ impl Controller {
         {
             let this = Arc::clone(self);
             ui.on_import_clipboard(move || this.import_clipboard());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_update_subscription(move |id| this.spawn_update(id.to_string()));
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_update_all(move || this.update_all());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_delete_subscription(move |id| this.delete_subscription(&id));
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_delete_server(move |id| this.delete_server(&id));
         }
         {
             let this = Arc::clone(self);
@@ -563,5 +757,26 @@ mod tests {
         let id = random_hex(8);
         assert_eq!(id.len(), 16);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn should_update_follows_interval_and_update_always() {
+        let mut sub = subscription("s");
+        let now = 1_000_000i64;
+        // Manual, never updated.
+        assert!(!should_update(&sub, now));
+
+        sub.update_interval_hours = 6;
+        assert!(should_update(&sub, now));
+
+        sub.last_update = Some(now - 3600);
+        assert!(!should_update(&sub, now));
+
+        sub.last_update = Some(now - 6 * 3600);
+        assert!(should_update(&sub, now));
+
+        sub.update_interval_hours = 0;
+        sub.provider.update_always = true;
+        assert!(should_update(&sub, now));
     }
 }

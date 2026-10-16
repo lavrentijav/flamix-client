@@ -424,7 +424,12 @@ pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
 
 /// Fill the window from the real persisted state (used by `--screenshot` without `--demo`).
 fn apply_state(ui: &AppWindow, state: &AppState) {
-    ui.set_subscriptions(view::model(view::build_subscriptions(state, "", false)));
+    ui.set_subscriptions(view::model(view::build_subscriptions(
+        state,
+        "",
+        false,
+        &std::collections::HashSet::new(),
+    )));
     ui.set_local_servers(view::model(view::build_local_servers(state, "", false)));
     ui.set_selected_name(view::selected_name(state).into());
     let iso = view::selected_iso(state);
