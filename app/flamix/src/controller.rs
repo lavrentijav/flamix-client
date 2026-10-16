@@ -9,7 +9,7 @@ use crate::{flags, AppWindow, ConnState};
 use flamix_core::config::{self, CoreKind};
 use flamix_core::model::{AppState, ConnectionMode, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
-use flamix_core::{deeplink, link, provider_routing};
+use flamix_core::{deeplink, link, ping, provider_routing};
 use flamix_sys::sysproxy::ProxySpec;
 use flamix_sys::{elevation, runner, stats, sysproxy};
 use slint::{ComponentHandle, Weak};
@@ -880,6 +880,89 @@ impl Controller {
         }
     }
 
+    // --- ping ----------------------------------------------------------------
+
+    fn set_ping_result(&self, text: String) {
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_ping_result(text.into()));
+    }
+
+    /// TCP-ping every visible server (concurrency 16, 3 s timeout).
+    fn ping_all(self: &Arc<Self>) {
+        let query = self
+            .ui
+            .upgrade()
+            .map(|ui| ui.get_search_text().to_string())
+            .unwrap_or_default();
+        let targets: Vec<(String, String, u16)> = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            view::visible_servers(&state, &query)
+                .iter()
+                .map(|s| (s.id.clone(), s.address.clone(), s.port))
+                .collect()
+        };
+        if targets.is_empty() {
+            self.set_status("Нет серверов для проверки");
+            return;
+        }
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            let results = ping::tcp_ping_many(targets, Duration::from_secs(3), 16).await;
+            {
+                let mut state = this.state.lock().unwrap_or_else(|e| e.into_inner());
+                for (id, ms) in results {
+                    if let Some(server) = state.server_mut(&id) {
+                        server.last_ping_ms = Some(ms);
+                    }
+                }
+            }
+            this.persist_and_render();
+        });
+    }
+
+    /// Ping the selected server: URL through the proxy when connected, else TCP connect.
+    fn ping_selected(self: &Arc<Self>) {
+        let (id, address, port, ping_url, ping_method, socks_port) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(id) = state.selected_server.clone() else {
+                return;
+            };
+            let Some(server) = state.server(&id) else {
+                return;
+            };
+            (
+                id,
+                server.address.clone(),
+                server.port,
+                state.settings.ping_url.clone(),
+                state.settings.ping_method.clone(),
+                state.settings.socks_port,
+            )
+        };
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false);
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            let ms = if connected && ping_method == "url" {
+                let proxy = format!("socks5h://127.0.0.1:{socks_port}");
+                ping::url_ping(&ping_url, &proxy, Duration::from_secs(5)).await
+            } else {
+                ping::tcp_ping(&address, port, Duration::from_secs(3)).await
+            };
+            {
+                let mut state = this.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(server) = state.server_mut(&id) {
+                    server.last_ping_ms = Some(ms);
+                }
+            }
+            this.set_ping_result(match ms {
+                Some(ms) => format!(" · {ms} ms"),
+                None => " · нет ответа".to_string(),
+            });
+            this.persist_and_render();
+        });
+    }
+
     /// Disconnect, save synchronously and quit (window close / Ctrl+C).
     fn initiate_shutdown(self: &Arc<Self>) {
         let this = Arc::clone(self);
@@ -948,6 +1031,14 @@ impl Controller {
         }
         {
             let this = Arc::clone(self);
+            ui.on_ping_all(move || this.ping_all());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_ping_selected(move || this.ping_selected());
+        }
+        {
+            let this = Arc::clone(self);
             ui.window().on_close_requested(move || {
                 this.initiate_shutdown();
                 slint::CloseRequestResponse::KeepWindowShown
@@ -994,6 +1085,7 @@ impl Controller {
         if !changed {
             return;
         }
+        self.set_ping_result(String::new());
         self.persist_and_render();
         // Selecting another server while connected reconnects to it.
         let connected_other = self

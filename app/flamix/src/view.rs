@@ -119,7 +119,7 @@ fn matches(query_lower: &str, text: &str) -> bool {
 }
 
 /// Servers of a subscription visible under `query`, sorted by ping when requested.
-fn visible_servers<'a>(servers: &'a [Server], query_lower: &str, sort_by_ping: bool) -> Vec<&'a Server> {
+fn filter_servers<'a>(servers: &'a [Server], query_lower: &str, sort_by_ping: bool) -> Vec<&'a Server> {
     let mut out: Vec<&Server> = servers
         .iter()
         .filter(|s| matches(query_lower, &s.name))
@@ -186,7 +186,7 @@ pub fn build_subscriptions(
 
     subs.into_iter()
         .map(|sub| {
-            let servers: Vec<ServerItem> = visible_servers(&sub.servers, &query_lower, sort_by_ping)
+            let servers: Vec<ServerItem> = filter_servers(&sub.servers, &query_lower, sort_by_ping)
                 .into_iter()
                 .map(|s| server_item(s, state.selected_server.as_deref() == Some(&s.id)))
                 .collect();
@@ -218,10 +218,31 @@ pub fn build_subscriptions(
 /// Build the standalone (local) server list. `query` filters by name.
 pub fn build_local_servers(state: &AppState, query: &str, sort_by_ping: bool) -> Vec<ServerItem> {
     let query_lower = query.to_lowercase();
-    visible_servers(&state.local_servers, &query_lower, sort_by_ping)
+    filter_servers(&state.local_servers, &query_lower, sort_by_ping)
         .into_iter()
         .map(|s| server_item(s, state.selected_server.as_deref() == Some(&s.id)))
         .collect()
+}
+
+/// All servers visible under `query` (subscriptions first, then local), matching the same
+/// rules as the server list. Used by "ping all".
+pub fn visible_servers<'a>(state: &'a AppState, query: &str) -> Vec<&'a Server> {
+    let query_lower = query.to_lowercase();
+    let mut out: Vec<&Server> = Vec::new();
+    for sub in &state.subscriptions {
+        if matches(&query_lower, &sub.name) {
+            out.extend(sub.servers.iter());
+        } else {
+            out.extend(sub.servers.iter().filter(|s| matches(&query_lower, &s.name)));
+        }
+    }
+    out.extend(
+        state
+            .local_servers
+            .iter()
+            .filter(|s| matches(&query_lower, &s.name)),
+    );
+    out
 }
 
 /// Name of the selected server, empty when nothing is selected.
@@ -437,6 +458,25 @@ mod tests {
         let items = build_local_servers(&state, "local", false);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].name, "Local One");
+    }
+
+    #[test]
+    fn visible_servers_honours_query() {
+        let state = AppState {
+            subscriptions: vec![subscription(
+                "s1",
+                "Premium",
+                vec![server("a", "Frankfurt", None), server("b", "Berlin", None)],
+            )],
+            local_servers: vec![server("l1", "Local One", None)],
+            ..AppState::default()
+        };
+        assert_eq!(visible_servers(&state, "").len(), 3);
+        let filtered = visible_servers(&state, "ber");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, "b");
+        // Subscription name match keeps all its servers.
+        assert_eq!(visible_servers(&state, "premium").len(), 2);
     }
 
     #[test]
