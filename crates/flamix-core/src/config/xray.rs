@@ -232,7 +232,7 @@ pub(crate) fn full_config_cluster_with(
         "dns": dns_config(settings, provider),
         "inbounds": inbounds(settings, listen, api_port, ctx.overrides),
         "outbounds": outbounds,
-        "routing": routing_config(settings, provider),
+        "routing": routing_config(settings, provider, failover),
     });
     if failover {
         let selector: Vec<String> = (0..nodes.len()).map(|i| format!("node-{i}")).collect();
@@ -350,7 +350,14 @@ fn dns_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Value 
     Value::Object(config)
 }
 
-fn routing_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Value {
+/// Routing block. `balancer` = failover is on and the tag `proxy` names the balancer, so
+/// every Proxy rule must target it via `balancerTag` (an `outboundTag: "proxy"` rule would
+/// resolve to a non-existent outbound). Without a balancer the output is unchanged.
+fn routing_config(
+    settings: &Settings,
+    provider: Option<&ProviderRouting>,
+    balancer: bool,
+) -> Value {
     let mut rules = vec![json!({
         "type": "field",
         "inboundTag": ["api"],
@@ -359,11 +366,11 @@ fn routing_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Va
     // Provider rules replace the user's preset and go before the user's custom rules.
     if let Some(provider) = provider {
         for rule in routing::provider_rules(provider) {
-            rules.push(rule_json(&rule));
+            rules.push(rule_json(&rule, balancer));
         }
     }
     for rule in routing::custom_rules(&settings.routing) {
-        rules.push(rule_json(&rule));
+        rules.push(rule_json(&rule, balancer));
     }
     if settings.routing.block_quic {
         rules.push(json!({
@@ -373,10 +380,11 @@ fn routing_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Va
             "outboundTag": "block",
         }));
     }
+    // `global_proxy == false`: unmatched traffic goes direct via a catch-all rule
+    // (Xray drops rules with no matcher fields, so match every transport).
+    let direct_final = matches!(provider, Some(p) if !p.global_proxy);
     match provider {
-        // `global_proxy == false`: unmatched traffic goes direct via a catch-all rule
-        // (Xray drops rules with no matcher fields, so match every transport).
-        Some(provider) if !provider.global_proxy => {
+        Some(_) if direct_final => {
             rules.push(json!({
                 "type": "field",
                 "network": "tcp,udp",
@@ -386,9 +394,19 @@ fn routing_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Va
         Some(_) => {}
         None => {
             for rule in routing::preset_rules(settings.routing.preset) {
-                rules.push(rule_json(&rule));
+                rules.push(rule_json(&rule, balancer));
             }
         }
+    }
+    // With a balancer, unmatched traffic would otherwise fall to the first outbound
+    // (`node-0`); send it through the balancer too. The `global_proxy == false` direct
+    // catch-all above already handles it, so it is not added there.
+    if balancer && !direct_final {
+        rules.push(json!({
+            "type": "field",
+            "network": "tcp,udp",
+            "balancerTag": "proxy",
+        }));
     }
     let domain_strategy = provider
         .and_then(|p| p.domain_strategy.clone())
@@ -399,7 +417,9 @@ fn routing_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Va
     })
 }
 
-fn rule_json(rule: &Rule) -> Value {
+/// One field rule. When `balancer` is set, a Proxy rule targets the balancer tag `proxy`
+/// instead of an outbound with that name.
+fn rule_json(rule: &Rule, balancer: bool) -> Value {
     let mut m = Map::new();
     m.insert("type".into(), json!("field"));
     if !rule.domains.is_empty() {
@@ -415,14 +435,20 @@ fn rule_json(rule: &Rule) -> Value {
         m.insert("port".into(), json!(ports));
     }
     // Process-based rules are ignored by Xray.
-    m.insert(
-        "outboundTag".into(),
-        json!(match rule.action {
-            RuleAction::Proxy => "proxy",
-            RuleAction::Direct => "direct",
-            RuleAction::Block => "block",
-        }),
-    );
+    match rule.action {
+        RuleAction::Proxy if balancer => {
+            m.insert("balancerTag".into(), json!("proxy"));
+        }
+        RuleAction::Proxy => {
+            m.insert("outboundTag".into(), json!("proxy"));
+        }
+        RuleAction::Direct => {
+            m.insert("outboundTag".into(), json!("direct"));
+        }
+        RuleAction::Block => {
+            m.insert("outboundTag".into(), json!("block"));
+        }
+    }
     Value::Object(m)
 }
 
@@ -1081,5 +1107,119 @@ mod tests {
         };
         let cfg = full_config_with(&vless_server(), &Settings::default(), 10818, &ctx);
         assert_eq!(cfg["inbounds"][0]["settings"]["auth"], json!("noauth"));
+    }
+
+    use crate::model::Failover;
+
+    fn failover_settings() -> Settings {
+        Settings {
+            failover: Failover {
+                enabled: true,
+                ..Failover::default()
+            },
+            ..Settings::default()
+        }
+    }
+
+    fn proxy_rule(domain: &str) -> RoutingRule {
+        RoutingRule {
+            domains: vec![format!("domain:{domain}")],
+            ips: Vec::new(),
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Proxy,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn failover_custom_proxy_rule_uses_balancer_tag() {
+        let nodes = [vless_server(), vless_server()];
+        let mut settings = failover_settings();
+        settings.routing.preset = RoutingPreset::Custom;
+        settings.routing.custom_rules = vec![proxy_rule("proxy.example")];
+        let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ConnectContext::default());
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        // api, custom (balancerTag), final balancer catch-all.
+        assert_eq!(rules[0]["outboundTag"], json!("api"));
+        assert_eq!(rules[1]["balancerTag"], json!("proxy"));
+        assert!(rules[1].get("outboundTag").is_none());
+        let last = rules.last().unwrap();
+        assert_eq!(last["balancerTag"], json!("proxy"));
+        assert_eq!(last["network"], json!("tcp,udp"));
+        // No rule may target a non-existent `proxy` outbound.
+        assert!(!rules.iter().any(|r| r["outboundTag"] == json!("proxy")));
+    }
+
+    #[test]
+    fn failover_preset_direct_and_block_rules_unchanged() {
+        let nodes = [vless_server(), vless_server()];
+        let settings = failover_settings(); // BypassRu preset: block + direct rules only.
+        let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ConnectContext::default());
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["outboundTag"] == json!("block")
+            && r["domain"] == json!(["geosite:category-ads-all"])));
+        assert!(rules.iter().any(|r| r["outboundTag"] == json!("direct")
+            && r["ip"] == json!(["geoip:private", "geoip:ru"])));
+        // Only the final catch-all uses the balancer.
+        let last = rules.last().unwrap();
+        assert_eq!(last["balancerTag"], json!("proxy"));
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|r| r.get("balancerTag").is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failover_provider_global_direct_keeps_direct_catch_all() {
+        let nodes = [vless_server(), vless_server()];
+        let settings = failover_settings();
+        // Provider asks for global-direct and contributes a proxy rule.
+        let provider = provider_profile(false, vec![proxy_rule("provider.example")]);
+        let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ctx_of(&provider));
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        // Provider proxy rule -> balancerTag.
+        assert!(rules.iter().any(|r| r["balancerTag"] == json!("proxy")
+            && r["domain"] == json!(["domain:provider.example"])));
+        // The direct catch-all stays LAST; no balancer catch-all after it.
+        let last = rules.last().unwrap();
+        assert_eq!(last["outboundTag"], json!("direct"));
+        assert_eq!(last["network"], json!("tcp,udp"));
+        assert!(last.get("balancerTag").is_none());
+        assert!(!rules.iter().any(|r| r["outboundTag"] == json!("proxy")));
+    }
+
+    #[test]
+    fn failover_provider_global_proxy_adds_balancer_catch_all() {
+        let nodes = [vless_server(), vless_server()];
+        let settings = failover_settings();
+        let provider = provider_profile(true, Vec::new());
+        let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ctx_of(&provider));
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        // api rule + final balancer catch-all.
+        assert_eq!(rules.len(), 2);
+        let last = rules.last().unwrap();
+        assert_eq!(last["balancerTag"], json!("proxy"));
+        assert_eq!(last["network"], json!("tcp,udp"));
+    }
+
+    #[test]
+    fn failover_off_routing_is_unchanged() {
+        let nodes = [vless_server(), vless_server()];
+        let mut settings = Settings::default();
+        settings.routing.preset = RoutingPreset::Custom;
+        settings.routing.custom_rules = vec![proxy_rule("proxy.example")];
+        // Failover disabled: the cluster config's routing equals the single-server one.
+        let cluster =
+            full_config_cluster_with(&nodes, &settings, 10818, &ConnectContext::default());
+        let single = full_config_with(&nodes[0], &settings, 10818, &ConnectContext::default());
+        assert_eq!(cluster["routing"], single["routing"]);
+        let rules = cluster["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["outboundTag"] == json!("proxy")));
+        assert!(rules.iter().all(|r| r.get("balancerTag").is_none()));
     }
 }

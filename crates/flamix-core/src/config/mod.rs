@@ -640,6 +640,7 @@ mod validation {
         Credentials, Dns, FailoverMode, Network, Routing, RoutingPreset, RoutingRule, RuleAction,
         Security, Transport,
     };
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -1183,31 +1184,60 @@ mod validation {
             return;
         }
         let nodes = failover_nodes();
-        let ctx = ConnectContext::default();
         let mut problems = Vec::new();
+        // Routing variants: no provider, and both provider profiles (incl. global-direct).
+        let providers = provider_routings();
+        let mut views: Vec<(&str, Option<&ProviderRouting>)> = vec![("no-provider", None)];
+        for (name, provider) in &providers {
+            views.push((name, Some(provider)));
+        }
         for (label, mode) in [
             ("failover", FailoverMode::Failover),
             ("load-balance", FailoverMode::LoadBalance),
         ] {
-            let mut settings = settings(ConnectionMode::Proxy, Routing::default());
-            settings.failover.enabled = true;
-            settings.failover.mode = mode;
-            let api = api_port(CoreKind::Xray, &settings);
-            let cfg = xray::full_config_cluster_with(&nodes, &settings, api, &ctx);
-            problems.extend(check_core(
-                CoreKind::Xray,
-                &cfg,
-                &format!("multi-node/{label}/xray"),
-            ));
-            let api = api_port(CoreKind::SingBox, &settings);
-            let cfg = singbox::full_config_cluster_with(&nodes, &settings, false, None, api, &ctx);
-            problems.extend(check_core(
-                CoreKind::SingBox,
-                &cfg,
-                &format!("multi-node/{label}/sing-box"),
-            ));
+            for (pname, provider) in &views {
+                let ctx = ConnectContext {
+                    provider: *provider,
+                    overrides: None,
+                };
+                let mut settings = settings(ConnectionMode::Proxy, Routing::default());
+                settings.failover.enabled = true;
+                settings.failover.mode = mode;
+                let api = api_port(CoreKind::Xray, &settings);
+                let cfg = xray::full_config_cluster_with(&nodes, &settings, api, &ctx);
+                // Ordering assertions: proxy rules use the balancer; the final catch-all
+                // is the balancer unless the provider goes direct.
+                let rules = cfg["routing"]["rules"].as_array().unwrap();
+                let direct_final = provider.is_some_and(|p| !p.global_proxy);
+                if direct_final {
+                    let last = rules.last().unwrap();
+                    assert_eq!(last["outboundTag"], json!("direct"), "{pname}/{label}");
+                    assert!(last.get("balancerTag").is_none(), "{pname}/{label}");
+                } else {
+                    let last = rules.last().unwrap();
+                    assert_eq!(last["balancerTag"], json!("proxy"), "{pname}/{label}");
+                }
+                assert!(
+                    !rules.iter().any(|r| r["outboundTag"] == json!("proxy")),
+                    "{pname}/{label}: no rule may target a non-existent proxy outbound"
+                );
+                problems.extend(check_core(
+                    CoreKind::Xray,
+                    &cfg,
+                    &format!("multi-node/{label}/{pname}/xray"),
+                ));
+                let api = api_port(CoreKind::SingBox, &settings);
+                let cfg =
+                    singbox::full_config_cluster_with(&nodes, &settings, false, None, api, &ctx);
+                problems.extend(check_core(
+                    CoreKind::SingBox,
+                    &cfg,
+                    &format!("multi-node/{label}/{pname}/sing-box"),
+                ));
+            }
         }
         // Failover off: byte-for-byte the single-server config.
+        let ctx = ConnectContext::default();
         let settings = settings(ConnectionMode::Proxy, Routing::default());
         let api = api_port(CoreKind::Xray, &settings);
         assert_eq!(
