@@ -29,6 +29,8 @@ component CardTitle inherits Text {
 component Muted inherits Text {
     color: Theme.muted;
     font-size: 12px;
+    horizontal-stretch: 1;
+    wrap: word-wrap;
 }
 
 // One "name ...... license" row inside the licences card.
@@ -75,7 +77,7 @@ export component AboutPage inherits Rectangle {
 
     VerticalLayout {
         padding: 16px;
-        spacing: 12px;
+        spacing: 10px;
 
         Text {
             text: "О программе";
@@ -84,11 +86,14 @@ export component AboutPage inherits Rectangle {
             font-weight: 600;
         }
 
-        ScrollView {
+        scroll := ScrollView {
             vertical-stretch: 1;
+            horizontal-scrollbar-policy: ScrollBarPolicy.always-off;
+            content-width: scroll.visible-width;
 
             VerticalLayout {
-                spacing: 12px;
+                width: scroll.content-width;
+                spacing: 10px;
 
                 // --- Header -----------------------------------------------------------
                 Rectangle {
@@ -98,21 +103,21 @@ export component AboutPage inherits Rectangle {
                     border-color: Theme.stroke;
                     height: header.preferred-height;
                     header := VerticalLayout {
-                        padding: 14px;
-                        spacing: 6px;
+                        padding: 12px;
+                        spacing: 4px;
                         alignment: center;
                         HorizontalLayout {
                             alignment: center;
                             Image {
-                                width: 72px;
-                                height: 72px;
+                                width: 56px;
+                                height: 56px;
                                 source: @image-url("../../assets/app-icon.svg");
                             }
                         }
                         Text {
                             text: "Flamix";
                             color: Theme.text;
-                            font-size: 26px;
+                            font-size: 24px;
                             font-weight: 700;
                             horizontal-alignment: center;
                         }
@@ -127,6 +132,7 @@ export component AboutPage inherits Rectangle {
                             color: Theme.muted;
                             font-size: 12px;
                             horizontal-alignment: center;
+                            horizontal-stretch: 1;
                             wrap: word-wrap;
                         }
                         HorizontalLayout {
@@ -147,8 +153,8 @@ export component AboutPage inherits Rectangle {
                     border-color: Theme.stroke;
                     height: cores.preferred-height;
                     cores := VerticalLayout {
-                        padding: 12px;
-                        spacing: 6px;
+                        padding: 10px;
+                        spacing: 5px;
                         HorizontalLayout {
                             CardTitle { text: "Ядра"; vertical-alignment: center; }
                             Rectangle { horizontal-stretch: 1; }
@@ -173,8 +179,8 @@ export component AboutPage inherits Rectangle {
                     border-color: Theme.stroke;
                     height: licences.preferred-height;
                     licences := VerticalLayout {
-                        padding: 12px;
-                        spacing: 4px;
+                        padding: 10px;
+                        spacing: 3px;
                         CardTitle { text: "Лицензии"; }
                         LicenceRow { name: "Flamix"; licence: "GPL-3.0-or-later"; }
                         LicenceRow { name: "Xray-core"; licence: "MPL-2.0"; }
@@ -192,8 +198,8 @@ export component AboutPage inherits Rectangle {
                     border-color: Theme.stroke;
                     height: backup.preferred-height;
                     backup := VerticalLayout {
-                        padding: 12px;
-                        spacing: 8px;
+                        padding: 10px;
+                        spacing: 6px;
                         CardTitle { text: "Резервная копия"; }
                         Muted {
                             text: "Сохраните все настройки, подписки, локальные серверы и статистику в один JSON-файл и восстановите их на этом или другом компьютере.";
@@ -243,12 +249,13 @@ export component AboutPage inherits Rectangle {
                             text: AboutBridge.backup-status;
                             color: Theme.muted;
                             font-size: 12px;
+                            horizontal-stretch: 1;
                             wrap: word-wrap;
                         }
                     }
                 }
 
-                Rectangle { height: 4px; background: transparent; }
+                Rectangle { height: 12px; background: transparent; }
             }
         }
     }
