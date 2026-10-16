@@ -265,6 +265,7 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         set_system_proxy: bridge.get_set_system_proxy(),
         proxy_bypass: bypass_from_text(&bridge.get_bypass()),
         routing: base.routing.clone(),
+        failover: base.failover.clone(),
         dns: Dns {
             remote: bridge.get_dns_remote().to_string(),
             direct: bridge.get_dns_direct().to_string(),

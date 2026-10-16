@@ -62,6 +62,23 @@ pub fn local_auth_enabled(overrides: Option<&BTreeMap<String, String>>) -> bool 
     local_auth("socks", overrides).is_some() || local_auth("http", overrides).is_some()
 }
 
+/// Probe URL used by the core-level failover balancer (`observatory` / `urltest`).
+///
+/// `settings.failover.probe_url` when set (non-blank), otherwise `settings.ping_url`.
+pub(crate) fn failover_probe_url(settings: &Settings) -> String {
+    let url = settings.failover.probe_url.trim();
+    if url.is_empty() {
+        settings.ping_url.clone()
+    } else {
+        url.to_string()
+    }
+}
+
+/// Go-style duration string for a millisecond interval (accepted by both cores).
+pub(crate) fn duration_ms(ms: u32) -> String {
+    format!("{ms}ms")
+}
+
 /// Which external core binary to run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreKind {
@@ -126,21 +143,51 @@ pub fn plan(server: &Server, settings: &Settings) -> Vec<CorePlan> {
 /// the user's preset, `global_proxy == false` sends unmatched traffic `direct`, and the
 /// profile's DNS/hosts/fake-DNS/domain-strategy override the user settings.
 pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> Vec<CorePlan> {
+    plan_cluster(std::slice::from_ref(server), settings, ctx)
+}
+
+/// Plan the processes for a primary server plus its ordered backups.
+///
+/// `nodes[0]` is the primary; the rest are ordered backups. Core-level failover is applied
+/// only when `settings.failover.enabled && nodes.len() > 1 && settings.mode == Proxy`;
+/// otherwise the generated config is exactly the single-server config of [`plan_with`]
+/// (so the disabled path never regresses). TUN mode never uses failover.
+///
+/// Provider routing/overrides ([`ConnectContext`]) belong to the subscription that owns the
+/// **primary** node and are applied to the whole generated config; per-node provider context
+/// is a later task.
+pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext) -> Vec<CorePlan> {
+    let Some(primary) = nodes.first() else {
+        return Vec::new();
+    };
+    let failover =
+        settings.failover.enabled && nodes.len() > 1 && settings.mode == ConnectionMode::Proxy;
+
     match settings.mode {
         ConnectionMode::Proxy => {
-            if supported_by(server).contains(&CoreKind::Xray) {
+            if supported_by(primary).contains(&CoreKind::Xray) {
                 let api_port = api_port(CoreKind::Xray, settings);
+                let config = if failover {
+                    xray::full_config_cluster_with(nodes, settings, api_port, ctx)
+                } else {
+                    xray::full_config_with(primary, settings, api_port, ctx)
+                };
                 vec![CorePlan {
                     core: CoreKind::Xray,
-                    config: xray::full_config_with(server, settings, api_port, ctx),
+                    config,
                     elevated: false,
                     api_port,
                 }]
             } else {
                 let api_port = api_port(CoreKind::SingBox, settings);
+                let config = if failover {
+                    singbox::full_config_cluster_with(nodes, settings, false, None, api_port, ctx)
+                } else {
+                    singbox::full_config_with(primary, settings, false, None, api_port, ctx)
+                };
                 vec![CorePlan {
                     core: CoreKind::SingBox,
-                    config: singbox::full_config_with(server, settings, false, None, api_port, ctx),
+                    config,
                     elevated: false,
                     api_port,
                 }]
@@ -149,7 +196,7 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
         ConnectionMode::Tun => {
             // sing-box captures the TUN and forwards to the protocol outbound, or to a
             // local SOCKS inbound run by Xray when the transport is Xray-only (xhttp/kcp).
-            let upstream_socks = singbox::outbound(server, settings)
+            let upstream_socks = singbox::outbound(primary, settings)
                 .is_none()
                 .then_some(settings.socks_port);
             let mut plans = Vec::new();
@@ -162,7 +209,7 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
                 plans.push(CorePlan {
                     core: CoreKind::Xray,
                     config: xray::full_config_with(
-                        server,
+                        primary,
                         settings,
                         api_port,
                         &ConnectContext::default(),
@@ -175,7 +222,7 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
             plans.push(CorePlan {
                 core: CoreKind::SingBox,
                 config: singbox::full_config_with(
-                    server,
+                    primary,
                     settings,
                     true,
                     upstream_socks,
@@ -193,7 +240,8 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Credentials, Network, Security, Transport};
+    use crate::model::{Credentials, FailoverMode, Network, Security, Transport};
+    use serde_json::json;
 
     fn server(credentials: Credentials, transport: Transport) -> Server {
         Server {
@@ -407,6 +455,175 @@ mod tests {
             && r.get("inboundTag").is_none()));
         assert_eq!(plans[0].config["routing"]["domainStrategy"], "IPIfNonMatch");
     }
+
+    fn trojan_ws() -> Server {
+        server(
+            Credentials::Trojan {
+                password: "secret".into(),
+            },
+            Transport {
+                network: Network::Ws,
+                path: Some("/ws".into()),
+                host: Some("ws.example".into()),
+                ..Transport::default()
+            },
+        )
+    }
+
+    fn hy2() -> Server {
+        server(
+            Credentials::Hysteria2 {
+                password: "pw".into(),
+                obfs: None,
+                obfs_password: None,
+                ports: None,
+                up_mbps: None,
+                down_mbps: None,
+            },
+            Transport::default(),
+        )
+    }
+
+    fn failover_settings() -> Settings {
+        let mut settings = Settings::default();
+        settings.failover.enabled = true;
+        settings.failover.probe_interval_ms = 2000;
+        settings
+    }
+
+    #[test]
+    fn plan_cluster_one_node_matches_plan() {
+        // One node, failover on or off: byte-for-byte the single-server plan.
+        let single = plan(&vless_xhttp(), &Settings::default());
+        assert_eq!(
+            plan_cluster(
+                &[vless_xhttp()],
+                &Settings::default(),
+                &ConnectContext::default()
+            ),
+            single
+        );
+        assert_eq!(
+            plan_cluster(
+                &[vless_xhttp()],
+                &failover_settings(),
+                &ConnectContext::default()
+            ),
+            single
+        );
+    }
+
+    #[test]
+    fn plan_cluster_empty_is_empty() {
+        assert!(plan_cluster(&[], &failover_settings(), &ConnectContext::default()).is_empty());
+    }
+
+    #[test]
+    fn plan_cluster_disabled_path_is_unchanged() {
+        let nodes = [vless_xhttp(), trojan_ws()];
+        let settings = Settings::default();
+        assert_eq!(
+            plan_cluster(&nodes, &settings, &ConnectContext::default()),
+            plan(&nodes[0], &settings)
+        );
+    }
+
+    #[test]
+    fn plan_cluster_tun_ignores_failover() {
+        let nodes = [vless_xhttp(), trojan_ws()];
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            failover: crate::model::Failover {
+                enabled: true,
+                ..crate::model::Failover::default()
+            },
+            ..Settings::default()
+        };
+        assert_eq!(
+            plan_cluster(&nodes, &settings, &ConnectContext::default()),
+            plan(&nodes[0], &settings)
+        );
+    }
+
+    #[test]
+    fn plan_cluster_xray_balancer_and_observatory() {
+        let nodes = [vless_xhttp(), trojan_ws()];
+        let mut settings = failover_settings();
+        settings.failover.probe_url = "https://probe.example/204".into();
+
+        let plans = plan_cluster(&nodes, &settings, &ConnectContext::default());
+        assert_eq!(plans.len(), 1);
+        let cfg = &plans[0].config;
+        let tags: Vec<&str> = cfg["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|o| o["tag"].as_str())
+            .collect();
+        assert_eq!(tags, ["node-0", "node-1", "direct", "block"]);
+        // The routing generator is unchanged: custom rules still target tag `proxy`.
+        let balancer = &cfg["routing"]["balancers"][0];
+        assert_eq!(balancer["tag"], json!("proxy"));
+        assert_eq!(balancer["selector"], json!(["node-0", "node-1"]));
+        assert_eq!(balancer["strategy"]["type"], json!("leastPing"));
+        assert_eq!(
+            cfg["observatory"]["subjectSelector"],
+            json!(["node-0", "node-1"])
+        );
+        assert_eq!(
+            cfg["observatory"]["probeUrl"],
+            json!("https://probe.example/204")
+        );
+        assert_eq!(cfg["observatory"]["probeInterval"], json!("2000ms"));
+        assert_eq!(cfg["observatory"]["enableConcurrency"], json!(true));
+
+        // LoadBalance -> roundRobin.
+        settings.failover.mode = FailoverMode::LoadBalance;
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        assert_eq!(
+            cfg["routing"]["balancers"][0]["strategy"]["type"],
+            json!("roundRobin")
+        );
+
+        // Blank probe_url falls back to ping_url.
+        settings.failover.probe_url = "  ".into();
+        let cfg = &plan_cluster(&nodes, &settings, &ConnectContext::default())[0].config;
+        assert_eq!(cfg["observatory"]["probeUrl"], json!(settings.ping_url));
+    }
+
+    #[test]
+    fn plan_cluster_singbox_urltest() {
+        let nodes = [
+            hy2(),
+            server(
+                Credentials::Tuic {
+                    uuid: "33333333-3333-3333-3333-333333333333".into(),
+                    password: "secret".into(),
+                    congestion_control: None,
+                    udp_relay_mode: None,
+                },
+                Transport::default(),
+            ),
+        ];
+        let mut settings = failover_settings();
+        settings.failover.tolerance_ms = 80;
+        let plans = plan_cluster(&nodes, &settings, &ConnectContext::default());
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::SingBox);
+        let cfg = &plans[0].config;
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds[0]["type"], json!("urltest"));
+        assert_eq!(outbounds[0]["tag"], json!("proxy"));
+        assert_eq!(outbounds[0]["outbounds"], json!(["node-0", "node-1"]));
+        assert_eq!(outbounds[0]["url"], json!(settings.ping_url));
+        assert_eq!(outbounds[0]["interval"], json!("2000ms"));
+        assert_eq!(outbounds[0]["tolerance"], json!(80));
+        assert_eq!(outbounds[1]["tag"], json!("node-0"));
+        assert_eq!(outbounds[2]["tag"], json!("node-1"));
+        // route.final and DNS detour keep pointing at `proxy`.
+        assert_eq!(cfg["route"]["final"], json!("proxy"));
+        assert_eq!(cfg["dns"]["servers"][0]["detour"], json!("proxy"));
+    }
 }
 
 /// Exhaustive validation of generated configs against the real core binaries.
@@ -420,8 +637,8 @@ mod tests {
 mod validation {
     use super::*;
     use crate::model::{
-        Credentials, Dns, Network, Routing, RoutingPreset, RoutingRule, RuleAction, Security,
-        Transport,
+        Credentials, Dns, FailoverMode, Network, Routing, RoutingPreset, RoutingRule, RuleAction,
+        Security, Transport,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -934,6 +1151,76 @@ mod validation {
                 ));
             }
         }
+        report(problems);
+    }
+
+    /// Primary `vless+reality` + backup `trojan+ws`: two transports for the cluster tests.
+    fn failover_nodes() -> Vec<Server> {
+        let primary = samples()
+            .into_iter()
+            .find(|(name, _)| *name == "vless-reality")
+            .map(|(_, server)| server)
+            .expect("vless-reality sample");
+        let backup = server(
+            Credentials::Trojan {
+                password: "secret".into(),
+            },
+            Transport {
+                network: Network::Ws,
+                path: Some("/ws".into()),
+                host: Some("ws.example".into()),
+                ..Transport::default()
+            },
+            tls("ws.example"),
+        );
+        vec![primary, backup]
+    }
+
+    #[test]
+    fn failover_cluster_configs_are_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let nodes = failover_nodes();
+        let ctx = ConnectContext::default();
+        let mut problems = Vec::new();
+        for (label, mode) in [
+            ("failover", FailoverMode::Failover),
+            ("load-balance", FailoverMode::LoadBalance),
+        ] {
+            let mut settings = settings(ConnectionMode::Proxy, Routing::default());
+            settings.failover.enabled = true;
+            settings.failover.mode = mode;
+            let api = api_port(CoreKind::Xray, &settings);
+            let cfg = xray::full_config_cluster_with(&nodes, &settings, api, &ctx);
+            problems.extend(check_core(
+                CoreKind::Xray,
+                &cfg,
+                &format!("multi-node/{label}/xray"),
+            ));
+            let api = api_port(CoreKind::SingBox, &settings);
+            let cfg = singbox::full_config_cluster_with(&nodes, &settings, false, None, api, &ctx);
+            problems.extend(check_core(
+                CoreKind::SingBox,
+                &cfg,
+                &format!("multi-node/{label}/sing-box"),
+            ));
+        }
+        // Failover off: byte-for-byte the single-server config.
+        let settings = settings(ConnectionMode::Proxy, Routing::default());
+        let api = api_port(CoreKind::Xray, &settings);
+        assert_eq!(
+            xray::full_config_cluster_with(&nodes, &settings, api, &ctx),
+            xray::full_config_with(&nodes[0], &settings, api, &ctx),
+        );
+        // Failover on but a single node: still the single-server config.
+        let mut enabled = settings.clone();
+        enabled.failover.enabled = true;
+        assert_eq!(
+            xray::full_config_cluster_with(&nodes[0..1], &enabled, api, &ctx),
+            xray::full_config_with(&nodes[0], &enabled, api, &ctx),
+        );
         report(problems);
     }
 

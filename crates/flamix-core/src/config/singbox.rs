@@ -215,6 +215,34 @@ fn is_domain(value: &str) -> bool {
     value.parse::<std::net::IpAddr>().is_err()
 }
 
+/// A failover node outbound: the real outbound for `node`, tagged `node-<index>`.
+fn node_outbound(node: &Server, settings: &Settings, index: usize) -> Value {
+    let tag = format!("node-{index}");
+    match outbound(node, settings) {
+        Some(mut out) => {
+            if let Value::Object(map) = &mut out {
+                map.insert("tag".into(), json!(tag));
+            }
+            out
+        }
+        // Unreachable for clusterable nodes; a direct hop keeps the tag resolvable.
+        None => json!({"type": "direct", "tag": tag}),
+    }
+}
+
+/// The `urltest` balancer outbound, tagged `proxy` so all existing references keep working.
+fn urltest_outbound(nodes: &[Server], settings: &Settings) -> Value {
+    let outbounds: Vec<String> = (0..nodes.len()).map(|i| format!("node-{i}")).collect();
+    json!({
+        "type": "urltest",
+        "tag": "proxy",
+        "outbounds": outbounds,
+        "url": crate::config::failover_probe_url(settings),
+        "interval": crate::config::duration_ms(settings.failover.probe_interval_ms),
+        "tolerance": settings.failover.tolerance_ms,
+    })
+}
+
 /// Full config. `tun` = add a tun inbound (auto_route, strict_route) instead of mixed.
 /// `upstream_socks` = Some(port): the proxy outbound is SOCKS to 127.0.0.1:port (Xray chain).
 /// `api_port`: `experimental.clash_api` on 127.0.0.1 for traffic stats.
@@ -245,6 +273,60 @@ pub fn full_config_with(
     api_port: u16,
     ctx: &ConnectContext,
 ) -> Value {
+    build_config(
+        server,
+        std::slice::from_ref(server),
+        settings,
+        tun,
+        upstream_socks,
+        api_port,
+        ctx,
+    )
+}
+
+/// Full config for a primary node plus ordered backups (`node-0` is the primary).
+///
+/// With one node (or any node sing-box cannot express, e.g. WireGuard) this is exactly
+/// [`full_config_with`]. With `settings.failover.enabled` and more than one node, every node
+/// becomes an outbound tagged `node-N` and a `urltest` outbound tagged `proxy` is added;
+/// `route.final` and the DNS/rule-set `detour` references keep pointing at `proxy`. Provider
+/// routing/overrides belong to the primary node and apply to the whole config.
+pub(crate) fn full_config_cluster_with(
+    nodes: &[Server],
+    settings: &Settings,
+    tun: bool,
+    upstream_socks: Option<u16>,
+    api_port: u16,
+    ctx: &ConnectContext,
+) -> Value {
+    let Some(primary) = nodes.first() else {
+        return Value::Object(Map::new());
+    };
+    let cluster = settings.failover.enabled
+        && nodes.len() > 1
+        && !tun
+        && upstream_socks.is_none()
+        && nodes
+            .iter()
+            .all(|node| !matches!(node.credentials, Credentials::Wireguard { .. }))
+        && nodes.iter().all(|node| outbound(node, settings).is_some());
+    if !cluster {
+        return full_config_with(primary, settings, tun, upstream_socks, api_port, ctx);
+    }
+    build_config(primary, nodes, settings, tun, upstream_socks, api_port, ctx)
+}
+
+/// Builds one sing-box config for `primary`; `nodes` is the failover path
+/// (`nodes.len() > 1` adds the `urltest` balancer tagged `proxy`).
+fn build_config(
+    primary: &Server,
+    nodes: &[Server],
+    settings: &Settings,
+    tun: bool,
+    upstream_socks: Option<u16>,
+    api_port: u16,
+    ctx: &ConnectContext,
+) -> Value {
     let provider = ctx.provider.filter(|p| p.enabled);
     let provider_dns = provider.and_then(|p| p.dns.as_ref());
     let remote_dns = provider_dns
@@ -256,7 +338,7 @@ pub fn full_config_with(
     let fake_ip = provider.map(|p| p.fake_dns).unwrap_or(settings.dns.fake_ip);
     let geo = GeoUrls::from_provider(provider);
 
-    let wireguard = matches!(server.credentials, Credentials::Wireguard { .. });
+    let wireguard = matches!(primary.credentials, Credentials::Wireguard { .. });
     let proxy_out = match upstream_socks {
         Some(port) => json!({
             "type": "socks",
@@ -266,7 +348,7 @@ pub fn full_config_with(
             "version": "5",
         }),
         None => {
-            outbound(server, settings).unwrap_or_else(|| json!({"type": "direct", "tag": "proxy"}))
+            outbound(primary, settings).unwrap_or_else(|| json!({"type": "direct", "tag": "proxy"}))
         }
     };
     let proxy_in_endpoints = wireguard && upstream_socks.is_none();
@@ -405,9 +487,18 @@ pub fn full_config_with(
     };
     route.insert("final".into(), json!(final_outbound));
 
+    let cluster = nodes.len() > 1;
     let mut outbounds = Vec::new();
     if !proxy_in_endpoints {
-        outbounds.push(proxy_out.clone());
+        if cluster {
+            // `proxy` names the urltest balancer; the real outbounds are `node-N`.
+            outbounds.push(urltest_outbound(nodes, settings));
+            for (i, node) in nodes.iter().enumerate() {
+                outbounds.push(node_outbound(node, settings, i));
+            }
+        } else {
+            outbounds.push(proxy_out.clone());
+        }
     }
     outbounds.push(json!({"type": "direct", "tag": "direct"}));
 

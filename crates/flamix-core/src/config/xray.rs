@@ -7,15 +7,21 @@
 use crate::config::routing::{self, Rule};
 use crate::config::{local_auth, ConnectContext};
 use crate::model::{
-    Credentials, Network, ProviderRouting, RuleAction, Security, Server, Settings, Transport,
+    Credentials, FailoverMode, Network, ProviderRouting, RuleAction, Security, Server, Settings,
+    Transport,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
 /// Outbound object (`"tag": "proxy"`) for `server`.
 pub fn outbound(server: &Server, settings: &Settings) -> Value {
+    outbound_with_tag(server, settings, "proxy")
+}
+
+/// Outbound object for `server` with an explicit `tag` (failover nodes use `node-N`).
+fn outbound_with_tag(server: &Server, settings: &Settings, tag: &str) -> Value {
     let mut obj = Map::new();
-    obj.insert("tag".into(), json!("proxy"));
+    obj.insert("tag".into(), json!(tag));
 
     match &server.credentials {
         Credentials::Vless {
@@ -166,6 +172,28 @@ pub fn full_config_with(
     api_port: u16,
     ctx: &ConnectContext,
 ) -> Value {
+    full_config_cluster_with(std::slice::from_ref(server), settings, api_port, ctx)
+}
+
+/// Full config for a primary node plus ordered backups (`node-0` is the primary).
+///
+/// With one node this is exactly [`full_config_with`]. With `settings.failover.enabled`
+/// and more than one node, every node becomes an outbound tagged `node-N`, `direct`/`block`
+/// stay, and a balancer named `proxy` is added under `routing.balancers` (`leastPing` for
+/// [`FailoverMode::Failover`], `roundRobin` for [`FailoverMode::LoadBalance`]) together with
+/// a top-level `observatory` probing the nodes. The routing generator is unchanged: its
+/// rules keep naming the tag `proxy`. Provider routing/overrides belong to the primary node
+/// and are applied to the whole config.
+pub(crate) fn full_config_cluster_with(
+    nodes: &[Server],
+    settings: &Settings,
+    api_port: u16,
+    ctx: &ConnectContext,
+) -> Value {
+    let Some(primary) = nodes.first() else {
+        return Value::Object(Map::new());
+    };
+    let failover = settings.failover.enabled && nodes.len() > 1;
     let provider = ctx.provider.filter(|p| p.enabled);
     if let Some(provider) = provider {
         if provider.geoip_url.is_some() || provider.geosite_url.is_some() {
@@ -179,7 +207,19 @@ pub fn full_config_with(
     } else {
         "127.0.0.1"
     };
-    json!({
+
+    let mut outbounds = Vec::new();
+    if failover {
+        for (i, node) in nodes.iter().enumerate() {
+            outbounds.push(outbound_with_tag(node, settings, &format!("node-{i}")));
+        }
+    } else {
+        outbounds.push(outbound(primary, settings));
+    }
+    outbounds.push(json!({"protocol": "freedom", "tag": "direct"}));
+    outbounds.push(json!({"protocol": "blackhole", "tag": "block"}));
+
+    let mut config = json!({
         "log": {"loglevel": settings.log_level},
         "api": {"tag": "api", "services": ["StatsService"]},
         "stats": {},
@@ -191,13 +231,28 @@ pub fn full_config_with(
         }},
         "dns": dns_config(settings, provider),
         "inbounds": inbounds(settings, listen, api_port, ctx.overrides),
-        "outbounds": [
-            outbound(server, settings),
-            {"protocol": "freedom", "tag": "direct"},
-            {"protocol": "blackhole", "tag": "block"},
-        ],
+        "outbounds": outbounds,
         "routing": routing_config(settings, provider),
-    })
+    });
+    if failover {
+        let selector: Vec<String> = (0..nodes.len()).map(|i| format!("node-{i}")).collect();
+        let strategy = match settings.failover.mode {
+            FailoverMode::Failover => "leastPing",
+            FailoverMode::LoadBalance => "roundRobin",
+        };
+        config["observatory"] = json!({
+            "subjectSelector": selector.clone(),
+            "probeUrl": crate::config::failover_probe_url(settings),
+            "probeInterval": crate::config::duration_ms(settings.failover.probe_interval_ms),
+            "enableConcurrency": true,
+        });
+        config["routing"]["balancers"] = json!([{
+            "tag": "proxy",
+            "selector": selector,
+            "strategy": {"type": strategy},
+        }]);
+    }
+    config
 }
 
 /// Local inbounds (socks + http on `settings` ports, plus the stats `api` inbound).
