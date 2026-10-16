@@ -8,7 +8,7 @@ use crate::instance;
 use crate::view;
 use crate::{flags, AppWindow, ConnState};
 use flamix_core::config::{self, CoreKind};
-use flamix_core::model::{AppState, ConnectionMode, Subscription};
+use flamix_core::model::{AppState, ConnectionMode, Server, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, link, ping, provider_routing};
 use flamix_sys::sysproxy::ProxySpec;
@@ -41,6 +41,9 @@ pub struct Connection {
     api_port: u16,
     /// Xray binary, needed for `xray api statsquery`.
     xray_bin: Option<PathBuf>,
+    /// Whether the running config is a failover cluster: Xray counters then live on the
+    /// `node-N` outbounds, not the single `proxy` outbound.
+    failover: bool,
     /// Whether we changed the OS system proxy (so we must clear it on exit).
     system_proxy: bool,
     /// Last cumulative totals reported by sing-box (deltas are computed from these).
@@ -149,6 +152,51 @@ fn subscription_of_selected(state: &AppState) -> Option<usize> {
         .subscriptions
         .iter()
         .position(|sub| sub.servers.iter().any(|s| s.id == id))
+}
+
+/// Build the `[primary, backups…]` node slice for core-level failover.
+///
+/// `primary_id` is the selected server; `settings.failover.backups` are resolved through
+/// [`AppState::server`] in order. Unknown ids and the primary's own id are skipped (dedupe),
+/// keeping the user's order for the rest. Returns an empty slice when the primary is unknown.
+/// Pure, so the selection logic is unit-tested without a live core.
+fn failover_nodes(state: &AppState, primary_id: &str) -> Vec<Server> {
+    let Some(primary) = state.server(primary_id).cloned() else {
+        return Vec::new();
+    };
+    let mut nodes = vec![primary];
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert(primary_id.to_string());
+    for id in &state.settings.failover.backups {
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        if let Some(backup) = state.server(id) {
+            nodes.push(backup.clone());
+        }
+    }
+    nodes
+}
+
+/// Whether the planned config actually runs a failover cluster (outbounds tagged `node-N`).
+///
+/// Failover can be enabled in settings while the cluster still collapses to a single node
+/// (no usable backups); the counters then stay on the single `proxy` outbound.
+fn plans_use_failover(plans: &[config::CorePlan]) -> bool {
+    plans.iter().any(|plan| {
+        plan.config
+            .get("outbounds")
+            .and_then(serde_json::Value::as_array)
+            .map(|outbounds| {
+                outbounds.iter().any(|outbound| {
+                    outbound
+                        .get("tag")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|tag| tag.starts_with("node-"))
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// Human status for a share-link import.
@@ -663,7 +711,7 @@ impl Controller {
         // Selecting another server while connected reconnects: tear the old one down first.
         self.disconnect_internal().await;
 
-        let (server, settings, provider, overrides) = {
+        let (server, settings, provider, overrides, failover_on, nodes) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(server) = state.server(&server_id).cloned() else {
                 drop(state);
@@ -683,7 +731,22 @@ impl Controller {
                 ),
                 _ => (None, None),
             };
-            (server, state.settings.clone(), provider, overrides)
+            // Failover is Proxy-only (T21); TUN keeps using `plan_with`.
+            let failover_on =
+                state.settings.failover.enabled && state.settings.mode == ConnectionMode::Proxy;
+            let nodes = if failover_on {
+                failover_nodes(&state, &server_id)
+            } else {
+                Vec::new()
+            };
+            (
+                server,
+                state.settings.clone(),
+                provider,
+                overrides,
+                failover_on,
+                nodes,
+            )
         };
         let ctx = config::ConnectContext {
             provider: provider.as_ref(),
@@ -698,7 +761,13 @@ impl Controller {
         self.set_needs_admin(false);
 
         self.set_conn_state(ConnState::Connecting, "Подключение…");
-        let plans = config::plan_with(&server, &settings, &ctx);
+        let plans = if failover_on && nodes.len() > 1 {
+            config::plan_cluster(&nodes, &settings, &ctx)
+        } else {
+            config::plan_with(&server, &settings, &ctx)
+        };
+        // Only a real cluster moves the counters to the `node-N` outbounds.
+        let failover = plans_use_failover(&plans);
         let run_dir = self.data_dir.join("run");
         let running = match runner::start(&plans, &run_dir).await {
             Ok(running) => running,
@@ -755,6 +824,7 @@ impl Controller {
             core,
             api_port,
             xray_bin,
+            failover,
             system_proxy,
             totals: (0, 0),
         });
@@ -830,15 +900,26 @@ impl Controller {
             if conn.server_id != server_id {
                 return (0, 0);
             }
-            (conn.core, conn.api_port, conn.xray_bin.clone(), conn.totals)
+            (
+                conn.core,
+                conn.api_port,
+                conn.xray_bin.clone(),
+                conn.totals,
+                conn.failover,
+            )
         };
-        let (core, api_port, xray_bin, totals) = sample;
+        let (core, api_port, xray_bin, totals, failover) = sample;
         let delta = match core {
             CoreKind::Xray => {
                 let Some(binary) = xray_bin else {
                     return (0, 0);
                 };
-                stats::xray_traffic(&binary, api_port).await.ok()
+                let pattern = if failover {
+                    stats::XrayPattern::Cluster
+                } else {
+                    stats::XrayPattern::Proxy
+                };
+                stats::xray_traffic(&binary, api_port, pattern).await.ok()
             }
             CoreKind::SingBox => match stats::singbox_traffic(api_port).await {
                 Ok((up_total, down_total)) => {
@@ -1254,6 +1335,11 @@ impl Controller {
     }
 
     /// Apply changed settings/routing: reconnect if connected (no-op otherwise).
+    ///
+    /// Any core-affecting edit must call this — the settings page already does it for its
+    /// fields, and it **must also call it whenever `settings.failover` changes** (enabling or
+    /// disabling failover, or editing the backup list), since the running core config embeds
+    /// the primary + backups. The next [`Self::connect`] re-reads `state.settings` fresh.
     pub fn reconnect_if_connected(self: &Arc<Self>) {
         let selected = self.with_state(|s| s.selected_server.clone());
         if let (true, Some(id)) = (self.is_connected(), selected) {
@@ -1308,7 +1394,9 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flamix_core::model::{Credentials, ProviderRouting, Security, Server, Subscription};
+    use flamix_core::model::{
+        Credentials, ProviderRouting, Security, Server, Settings, Subscription,
+    };
 
     fn server(id: &str) -> Server {
         Server {
@@ -1556,5 +1644,63 @@ mod tests {
             Some("https://e/sub".to_string())
         );
         assert_eq!(extract_import(&["--demo".to_string()]), None);
+    }
+
+    #[test]
+    fn failover_nodes_keeps_primary_first_and_dedupes() {
+        let mut state = AppState {
+            local_servers: vec![server("a"), server("b"), server("c")],
+            selected_server: Some("a".to_string()),
+            ..AppState::default()
+        };
+        state.settings.failover.enabled = true;
+        state.settings.failover.backups = vec![
+            "b".to_string(),
+            "missing".to_string(),
+            "a".to_string(),
+            "c".to_string(),
+            "b".to_string(),
+        ];
+        let ids: Vec<String> = failover_nodes(&state, "a")
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn failover_nodes_empty_without_primary() {
+        let state = AppState {
+            local_servers: vec![server("b")],
+            ..AppState::default()
+        };
+        assert!(failover_nodes(&state, "missing").is_empty());
+    }
+
+    #[test]
+    fn plans_use_failover_only_for_real_clusters() {
+        let mut settings = Settings::default();
+        let primary = server("a");
+        let backup = server("b");
+        let ctx = config::ConnectContext::default();
+
+        // Failover off: the single `proxy` outbound, old stats pattern.
+        assert!(!plans_use_failover(&config::plan_with(
+            &primary, &settings, &ctx
+        )));
+
+        settings.failover.enabled = true;
+        // Enabled but no usable backup: the cluster collapses back to one node.
+        assert!(!plans_use_failover(&config::plan_cluster(
+            std::slice::from_ref(&primary),
+            &settings,
+            &ctx
+        )));
+
+        // Primary + one backup: real `node-N` outbounds.
+        let nodes = vec![primary.clone(), backup];
+        assert!(plans_use_failover(&config::plan_cluster(
+            &nodes, &settings, &ctx
+        )));
     }
 }
