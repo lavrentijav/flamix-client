@@ -16,7 +16,7 @@ use flamix_sys::{autostart, elevation, runner, stats, sysproxy};
 use slint::{ComponentHandle, Weak};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,6 +36,10 @@ const TRAFFIC_PERSIST_EVERY: u32 = 15;
 pub struct Connection {
     running: runner::Running,
     server_id: String,
+    /// Monotonic id of the connect that created this `Connection`. A ticker belongs to exactly
+    /// one connect; a same-id reconnect (now common on settings/failover edits) bumps the
+    /// epoch so the previous ticker stops sampling the new `Connection`.
+    epoch: u64,
     /// Core that owns the outbound to the server (its traffic counters are sampled).
     core: CoreKind,
     api_port: u16,
@@ -199,6 +203,16 @@ fn plans_use_failover(plans: &[config::CorePlan]) -> bool {
     })
 }
 
+/// Whether a traffic ticker still owns the current [`Connection`].
+///
+/// A ticker is bound to the epoch of the connect that spawned it. When a reconnect replaces
+/// the `Connection` — even to the same `server_id` — the epoch no longer matches and the old
+/// ticker must stop, so two samplers never race on `conn.totals` (which would double-count
+/// sing-box deltas). Pure, so the guard is unit-tested without a live core.
+fn ticker_still_owns(conn_epoch: u64, epoch: u64, conn_server_id: &str, server_id: &str) -> bool {
+    conn_epoch == epoch && conn_server_id == server_id
+}
+
 /// Human status for a share-link import.
 fn links_status(added: usize, skipped: usize) -> String {
     let mut text = format!("Добавлено серверов: {added}");
@@ -336,6 +350,9 @@ pub struct Controller {
     pub(crate) updates: Arc<tokio::sync::Semaphore>,
     /// True while a connect/disconnect transition is in flight.
     pub(crate) connecting: Arc<AtomicBool>,
+    /// Bumped on every `connect`, stamped onto the new [`Connection`] and captured by its
+    /// ticker so only the newest ticker for a given `server_id` keeps running.
+    pub(crate) connect_epoch: AtomicU64,
 }
 
 impl Controller {
@@ -359,6 +376,7 @@ impl Controller {
             updating: Arc::new(Mutex::new(HashSet::new())),
             updates: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPDATES)),
             connecting: Arc::new(AtomicBool::new(false)),
+            connect_epoch: AtomicU64::new(0),
         });
         controller.wire(ui);
         controller.apply_now();
@@ -818,9 +836,11 @@ impl Controller {
             }
         }
 
+        let epoch = self.connect_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(Connection {
             running,
             server_id: server_id.clone(),
+            epoch,
             core,
             api_port,
             xray_bin,
@@ -837,7 +857,7 @@ impl Controller {
             self.set_conn_state(ConnState::Connected, "Подключено");
         }
         self.set_speed(0, 0);
-        self.start_ticker(server_id);
+        self.start_ticker(server_id, epoch);
     }
 
     async fn disconnect_internal(self: &Arc<Self>) {
@@ -859,28 +879,33 @@ impl Controller {
         self.persist_and_render();
     }
 
-    fn start_ticker(self: &Arc<Self>, server_id: String) {
+    fn start_ticker(self: &Arc<Self>, server_id: String, epoch: u64) {
         let this = Arc::clone(self);
         self.rt
-            .spawn(async move { this.run_ticker(server_id).await });
+            .spawn(async move { this.run_ticker(server_id, epoch).await });
     }
 
-    async fn run_ticker(self: Arc<Self>, server_id: String) {
+    async fn run_ticker(self: Arc<Self>, server_id: String, epoch: u64) {
         let mut ticks = 0u32;
         loop {
             tokio::time::sleep(TRAFFIC_TICK).await;
             let alive = {
                 let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                 match guard.as_mut() {
-                    Some(conn) if conn.server_id == server_id => conn.running.is_alive(),
+                    Some(conn)
+                        if ticker_still_owns(conn.epoch, epoch, &conn.server_id, &server_id) =>
+                    {
+                        conn.running.is_alive()
+                    }
+                    // A newer connect replaced this one (even to the same id): stop.
                     _ => return,
                 }
             };
             if !alive {
-                self.on_core_dead(&server_id).await;
+                self.on_core_dead(&server_id, epoch).await;
                 return;
             }
-            let (up, down) = self.sample_traffic(&server_id).await;
+            let (up, down) = self.sample_traffic(&server_id, epoch).await;
             self.set_speed(up, down);
             ticks += 1;
             if ticks >= TRAFFIC_PERSIST_EVERY {
@@ -891,13 +916,13 @@ impl Controller {
     }
 
     /// Read the traffic delta of the owning core and accumulate it into the state.
-    async fn sample_traffic(self: &Arc<Self>, server_id: &str) -> (u64, u64) {
+    async fn sample_traffic(self: &Arc<Self>, server_id: &str, epoch: u64) -> (u64, u64) {
         let sample = {
             let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
             let Some(conn) = guard.as_ref() else {
                 return (0, 0);
             };
-            if conn.server_id != server_id {
+            if !ticker_still_owns(conn.epoch, epoch, &conn.server_id, server_id) {
                 return (0, 0);
             }
             (
@@ -926,7 +951,7 @@ impl Controller {
                     {
                         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(conn) = guard.as_mut() {
-                            if conn.server_id == server_id {
+                            if ticker_still_owns(conn.epoch, epoch, &conn.server_id, server_id) {
                                 conn.totals = (up_total, down_total);
                             }
                         }
@@ -955,12 +980,12 @@ impl Controller {
         (up, down)
     }
 
-    async fn on_core_dead(self: &Arc<Self>, server_id: &str) {
+    async fn on_core_dead(self: &Arc<Self>, server_id: &str, epoch: u64) {
         let conn = {
             let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
             if guard
                 .as_ref()
-                .map(|c| c.server_id == server_id)
+                .map(|c| ticker_still_owns(c.epoch, epoch, &c.server_id, server_id))
                 .unwrap_or(false)
             {
                 guard.take()
@@ -1681,7 +1706,17 @@ mod tests {
     fn plans_use_failover_only_for_real_clusters() {
         let mut settings = Settings::default();
         let primary = server("a");
-        let backup = server("b");
+        let compatible = server("b");
+        // hysteria2 is sing-box only: Xray cannot proxy it, so `plan_cluster` drops it.
+        let mut incompatible = server("hy2");
+        incompatible.credentials = Credentials::Hysteria2 {
+            password: "p".to_string(),
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            up_mbps: None,
+            down_mbps: None,
+        };
         let ctx = config::ConnectContext::default();
 
         // Failover off: the single `proxy` outbound, old stats pattern.
@@ -1690,17 +1725,27 @@ mod tests {
         )));
 
         settings.failover.enabled = true;
-        // Enabled but no usable backup: the cluster collapses back to one node.
+        // Enabled but only an incompatible backup: the cluster collapses back to one node
+        // (the single `proxy` outbound), so the proxy stats pattern is kept.
+        let collapsed = vec![primary.clone(), incompatible];
         assert!(!plans_use_failover(&config::plan_cluster(
-            std::slice::from_ref(&primary),
-            &settings,
-            &ctx
+            &collapsed, &settings, &ctx
         )));
 
-        // Primary + one backup: real `node-N` outbounds.
-        let nodes = vec![primary.clone(), backup];
+        // Primary + one compatible backup: real `node-N` outbounds.
+        let nodes = vec![primary.clone(), compatible];
         assert!(plans_use_failover(&config::plan_cluster(
             &nodes, &settings, &ctx
         )));
+    }
+
+    #[test]
+    fn ticker_stays_only_for_its_own_epoch_and_server() {
+        // The ticker from connect epoch 1 owns this connection.
+        assert!(ticker_still_owns(1, 1, "a", "a"));
+        // A same-id reconnect bumps the epoch: the old ticker must stop.
+        assert!(!ticker_still_owns(2, 1, "a", "a"));
+        // Different server id is also not ours.
+        assert!(!ticker_still_owns(1, 1, "b", "a"));
     }
 }

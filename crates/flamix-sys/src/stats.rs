@@ -1,4 +1,4 @@
-//! Traffic counters of the running cores. OWNER: task T05.
+//! Traffic counters of the running cores. OWNER: task T23 (T05 original; controller/failover wiring).
 //!
 //! Communication is deliberately tiny: Xray through its `xray api statsquery` CLI and sing-box
 //! through a raw HTTP/1.1 request to the clash API, so no extra HTTP client is pulled in here.
@@ -19,6 +19,9 @@ pub enum XrayPattern {
     /// Single-server config: the `proxy` outbound.
     Proxy,
     /// Failover cluster: every `node-N` outbound.
+    ///
+    /// Known limitation (accepted): the observatory health probes to `node-N` are counted
+    /// here too, so per-server/daily traffic is slightly inflated even when idle.
     Cluster,
 }
 
