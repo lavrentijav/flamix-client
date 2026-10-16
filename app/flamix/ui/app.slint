@@ -34,6 +34,7 @@ export component AppWindow inherits Window {
     in property <ConnState> state: ConnState.disconnected;
     in property <string> status-text;
     in property <string> speed-text;
+    in property <bool> needs-admin: false;
     in-out property <bool> tun-mode: false;
     in-out property <string> search-text;
     in property <bool> dark: true;
@@ -112,10 +113,12 @@ export component AppWindow inherits Window {
                 state: root.state;
                 status-text: root.status-text;
                 speed-text: root.speed-text;
+                needs-admin: root.needs-admin;
                 tun-mode <=> root.tun-mode;
                 toggle-connect => { root.toggle-connect(); }
                 ping-selected => { root.ping-selected(); }
                 mode-changed(v) => { root.mode-changed(v); }
+                restart-as-admin => { root.restart-as-admin(); }
             }
         }
     }

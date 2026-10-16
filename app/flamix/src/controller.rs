@@ -395,6 +395,13 @@ impl Controller {
             .upgrade_in_event_loop(move |ui| ui.set_status_text(text.into()));
     }
 
+    /// Show or hide the "restart as administrator" button in the connection panel.
+    fn set_needs_admin(&self, value: bool) {
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_needs_admin(value));
+    }
+
     /// Parse and apply a deep link / pasted text on the calling thread, then repaint.
     fn import_text(self: &Arc<Self>, text: &str) {
         let Some(import) = deeplink::parse_import(text) else {
@@ -667,9 +674,11 @@ impl Controller {
         };
 
         if settings.mode == ConnectionMode::Tun && cfg!(windows) && !elevation::is_elevated() {
+            self.set_needs_admin(true);
             self.set_conn_state(ConnState::Error, "Для TUN нужен запуск от администратора");
             return;
         }
+        self.set_needs_admin(false);
 
         self.set_conn_state(ConnState::Connecting, "Подключение…");
         let plans = config::plan(&server, &settings);
@@ -900,7 +909,9 @@ impl Controller {
     }
 
     fn mode_changed(self: &Arc<Self>, tun: bool) {
-        if tun && cfg!(windows) && !elevation::is_elevated() {
+        let needs_admin = tun && cfg!(windows) && !elevation::is_elevated();
+        self.set_needs_admin(needs_admin);
+        if needs_admin {
             self.set_status("Для TUN нужен запуск от администратора");
         }
         let new_mode = if tun {
@@ -1230,6 +1241,39 @@ impl Controller {
     /// Show a line in the status text of the connection panel.
     pub fn status(&self, text: impl Into<String>) {
         self.set_status(text);
+    }
+}
+
+/// Small wrappers used by the system tray (`src/tray.rs`). They must run on the UI thread
+/// or hand work to the runtime themselves, exactly like the UI callbacks do.
+impl Controller {
+    /// Snapshot the tray renders: `(connected, server name, tun mode)`.
+    pub(crate) fn connection_state(&self) -> (bool, String, bool) {
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false)
+            || self.connecting.load(Ordering::Relaxed);
+        let (server, tun) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                view::selected_name(&state),
+                state.settings.mode == ConnectionMode::Tun,
+            )
+        };
+        (connected, server, tun)
+    }
+
+    /// Tray "Подключиться"/"Отключиться".
+    pub(crate) fn toggle_connect_public(self: &Arc<Self>) {
+        self.toggle_connect();
+    }
+
+    /// Tray Proxy/TUN switch.
+    pub(crate) fn set_mode_public(self: &Arc<Self>, tun: bool) {
+        self.mode_changed(tun);
+    }
+
+    /// Tray "Выход": disconnect, save and stop the event loop.
+    pub(crate) fn quit(self: &Arc<Self>) {
+        self.initiate_shutdown();
     }
 }
 
