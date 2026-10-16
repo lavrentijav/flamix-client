@@ -8,6 +8,7 @@ use crate::instance;
 use crate::view;
 use crate::{flags, AppWindow, ConnState};
 use flamix_core::config::{self, CoreKind};
+use flamix_core::model::ExitIp;
 use flamix_core::model::{AppState, ConnectionMode, Server, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, link, ping, provider_routing};
@@ -28,6 +29,39 @@ const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Interval between traffic samples while connected.
 const TRAFFIC_TICK: Duration = Duration::from_secs(1);
+
+/// How often the exit IP of the connected server is re-measured.
+const EXIT_PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// Per-request timeout while probing an exit IP through a core.
+const EXIT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Human status while a batch exit-IP probe runs: `"Проверка IP: 3/12 …"`.
+fn probe_progress_text(done: usize, total: usize) -> String {
+    format!("Проверка IP: {done}/{total} …")
+}
+
+/// Resolve the requested server ids to probe: keep order, drop unknown ids and duplicates.
+fn probe_target_ids(state: &AppState, ids: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        if out.iter().any(|seen| seen == id) {
+            continue;
+        }
+        if state.server(id).is_some() {
+            out.push(id.clone());
+        }
+    }
+    out
+}
+
+/// Free localhost TCP port, obtained by binding to port 0 and releasing it.
+async fn free_local_port() -> Option<u16> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+    let port = listener.local_addr().ok()?.port();
+    drop(listener);
+    Some(port)
+}
 
 /// Persist accumulated traffic every N ticks (avoid a disk write every second).
 const TRAFFIC_PERSIST_EVERY: u32 = 15;
@@ -353,6 +387,8 @@ pub struct Controller {
     /// Bumped on every `connect`, stamped onto the new [`Connection`] and captured by its
     /// ticker so only the newest ticker for a given `server_id` keeps running.
     pub(crate) connect_epoch: AtomicU64,
+    /// True while a batch exit-IP probe is running (only one at a time).
+    pub(crate) probing: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -377,6 +413,7 @@ impl Controller {
             updates: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPDATES)),
             connecting: Arc::new(AtomicBool::new(false)),
             connect_epoch: AtomicU64::new(0),
+            probing: Arc::new(AtomicBool::new(false)),
         });
         controller.wire(ui);
         controller.apply_now();
@@ -857,7 +894,129 @@ impl Controller {
             self.set_conn_state(ConnState::Connected, "Подключено");
         }
         self.set_speed(0, 0);
-        self.start_ticker(server_id, epoch);
+        self.start_ticker(server_id.clone(), epoch);
+        self.start_exit_probe(server_id, epoch, settings.socks_port);
+    }
+
+    /// Spawn the passive exit-IP poller for a freshly connected server.
+    fn start_exit_probe(self: &Arc<Self>, server_id: String, epoch: u64, socks_port: u16) {
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            this.run_exit_probe(server_id, epoch, socks_port).await;
+        });
+    }
+
+    /// Measure the exit IP through the running proxy now, then every [`EXIT_PROBE_INTERVAL`].
+    ///
+    /// Uses the same epoch/server guard as the traffic ticker, so it stops as soon as the
+    /// connection is replaced or torn down ([`Self::disconnect_internal`] drops the
+    /// [`Connection`] and the guard no longer matches).
+    async fn run_exit_probe(self: Arc<Self>, server_id: String, epoch: u64, socks_port: u16) {
+        let proxy = format!("socks5h://127.0.0.1:{socks_port}");
+        loop {
+            if !self.conn_matches(&server_id, epoch) {
+                return;
+            }
+            if let Some(ip) = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await {
+                self.store_exit_ip(&server_id, ip);
+            }
+            tokio::time::sleep(EXIT_PROBE_INTERVAL).await;
+        }
+    }
+
+    /// Whether the current live connection is still the one identified by `epoch`/`server_id`.
+    fn conn_matches(&self, server_id: &str, epoch: u64) -> bool {
+        self.conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|c| ticker_still_owns(c.epoch, epoch, &c.server_id, server_id))
+            .unwrap_or(false)
+    }
+
+    /// Persist a measured exit IP for one server and repaint.
+    fn store_exit_ip(self: &Arc<Self>, id: &str, ip: String) {
+        let checked = chrono::Utc::now().timestamp();
+        self.mutate(|state| {
+            state
+                .exit_ips
+                .insert(id.to_string(), ExitIp { ip, checked });
+        });
+    }
+
+    /// Probe the exit IP of every requested server by really connecting through it.
+    ///
+    /// Refuses while connected (the cores would fight over the inbound). Sequentially, for
+    /// each id: plan a throwaway proxy config, start the core, ask the echo services through
+    /// its SOCKS port, and stop the core in every path (result or failure) so none leaks.
+    pub fn probe_exit_ips(self: &Arc<Self>, ids: Vec<String>) {
+        if self.is_connected() {
+            self.status("Сначала отключитесь");
+            return;
+        }
+        if self.probing.swap(true, Ordering::SeqCst) {
+            self.status("Проверка уже выполняется");
+            return;
+        }
+        let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let targets = probe_target_ids(&snapshot, &ids);
+        let runner = Arc::clone(self);
+        let flag = Arc::clone(&self.probing);
+        self.rt.spawn(async move {
+            runner.run_exit_probe_batch(snapshot, targets).await;
+            flag.store(false, Ordering::SeqCst);
+        });
+    }
+
+    async fn run_exit_probe_batch(self: Arc<Self>, state: AppState, targets: Vec<String>) {
+        let total = targets.len();
+        if total == 0 {
+            self.set_status("Нет серверов для проверки IP");
+            return;
+        }
+        let ports = free_local_port().await;
+        let run_dir = self.data_dir.join("run");
+        let mut measured = 0usize;
+        for (index, id) in targets.iter().enumerate() {
+            self.set_status(probe_progress_text(index, total));
+            let Some(server) = state.server(id).cloned() else {
+                continue;
+            };
+            let mut settings = state.settings.clone();
+            settings.mode = ConnectionMode::Proxy;
+            if let Some(port) = ports {
+                settings.socks_port = port;
+                settings.http_port = port.saturating_add(1);
+            }
+            let plans = config::plan(&server, &settings);
+            let ip = match runner::start(&plans, &run_dir).await {
+                Ok(running) => {
+                    let probe_port = settings.socks_port;
+                    let proxy = format!("socks5h://127.0.0.1:{probe_port}");
+                    let ip = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await;
+                    if let Err(err) = running.stop().await {
+                        tracing::warn!(%err, server = %id, "could not stop the probe core cleanly");
+                    }
+                    ip
+                }
+                Err(err) => {
+                    tracing::warn!(%err, server = %id, "exit-IP probe could not start the core");
+                    None
+                }
+            };
+            if let Some(ip) = ip {
+                measured += 1;
+                self.store_exit_ip(id, ip);
+            }
+        }
+        self.persist_and_render();
+        if measured == 0 {
+            self.set_status("Не удалось определить выходной IP");
+        } else {
+            self.set_status(format!(
+                "Готово: измерено IP у {measured} из {total} серверов"
+            ));
+        }
     }
 
     async fn disconnect_internal(self: &Arc<Self>) {
@@ -1240,6 +1399,14 @@ impl Controller {
         {
             let this = Arc::clone(self);
             ui.on_ping_selected(move || this.ping_selected());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_check_exit_ips(move || {
+                let ids: Vec<String> =
+                    this.with_state(|s| s.servers().map(|server| server.id.clone()).collect());
+                this.probe_exit_ips(ids);
+            });
         }
         {
             let this = Arc::clone(self);
@@ -1737,6 +1904,27 @@ mod tests {
         assert!(plans_use_failover(&config::plan_cluster(
             &nodes, &settings, &ctx
         )));
+    }
+
+    #[test]
+    fn probe_target_ids_dedupes_unknown_and_keeps_order() {
+        let state = AppState {
+            local_servers: vec![server("a"), server("b")],
+            ..AppState::default()
+        };
+        let ids = vec![
+            "b".to_string(),
+            "missing".to_string(),
+            "a".to_string(),
+            "b".to_string(),
+        ];
+        assert_eq!(probe_target_ids(&state, &ids), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn probe_progress_text_formats_counts() {
+        assert_eq!(probe_progress_text(2, 12), "Проверка IP: 2/12 …");
+        assert_eq!(probe_progress_text(0, 1), "Проверка IP: 0/1 …");
     }
 
     #[test]

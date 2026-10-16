@@ -19,6 +19,10 @@ export struct ServerItem {
     quota-fraction: float,
     quota-text: string,
     selected: bool,
+    // Measured public exit IP (empty when never probed).
+    exit-ip: string,
+    // 0 = no measured exit, otherwise the number of servers sharing that exit.
+    exit-group: int,
 }
 
 export struct SubscriptionItem {

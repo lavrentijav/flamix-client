@@ -1,6 +1,14 @@
-//! Latency tests. OWNER: task T04.
+//! Latency tests and exit-IP probing. OWNER: task T04 (latency), T25 (exit IP).
 
+use std::str::FromStr;
 use std::time::Duration;
+
+/// Plain-text services that return the caller's public IP.
+pub const IP_ECHO_URLS: &[&str] = &[
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+];
 
 /// TCP connect time to `host:port` (DNS resolution excluded), `None` on failure/timeout.
 pub async fn tcp_ping(host: &str, port: u16, timeout: Duration) -> Option<u32> {
@@ -33,6 +41,46 @@ pub async fn url_ping(url: &str, proxy: &str, timeout: Duration) -> Option<u32> 
         }
         _ => None,
     }
+}
+
+/// HTTP GET `url` through the local proxy `proxy` (e.g. "socks5h://127.0.0.1:10808"),
+/// returning the response body as text. Never panics; `None` on any failure.
+pub async fn fetch_via_proxy(url: &str, proxy: &str, timeout: Duration) -> Option<String> {
+    let proxy = reqwest::Proxy::all(proxy).ok()?;
+    let client = reqwest::Client::builder()
+        .proxy(proxy)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .timeout(timeout)
+        .build()
+        .ok()?;
+    let response = client.get(url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    response.text().await.ok()
+}
+
+/// Extract a plausible public IP from an echo service response.
+///
+/// Trims the body, takes the first whitespace-separated token and accepts it only if it
+/// parses as a real IPv4/IPv6 address; otherwise `None`.
+pub fn parse_ip(body: &str) -> Option<String> {
+    let token = body.split_whitespace().next()?;
+    std::net::IpAddr::from_str(token.trim())
+        .ok()
+        .map(|ip| ip.to_string())
+}
+
+/// Ask [`IP_ECHO_URLS`] in order (through `proxy`) for the public egress IP.
+pub async fn probe_exit_ip(proxy: &str, timeout: Duration) -> Option<String> {
+    for url in IP_ECHO_URLS {
+        if let Some(body) = fetch_via_proxy(url, proxy, timeout).await {
+            if let Some(ip) = parse_ip(&body) {
+                return Some(ip);
+            }
+        }
+    }
+    None
 }
 
 /// TCP-ping several targets with a bounded number of concurrent connections.
@@ -134,6 +182,36 @@ mod tests {
         assert_eq!(results[1].0, "b");
         assert_eq!(results[0].1, None);
         assert!(results[1].1.is_some());
+    }
+
+    #[test]
+    fn parse_ip_accepts_v4_v6_and_newline() {
+        assert_eq!(parse_ip("203.0.113.7"), Some("203.0.113.7".to_string()));
+        assert_eq!(parse_ip("  203.0.113.7\n"), Some("203.0.113.7".to_string()));
+        assert_eq!(parse_ip("2001:db8::1\n"), Some("2001:db8::1".to_string()));
+        assert_eq!(
+            parse_ip("203.0.113.7\n2001:db8::1"),
+            Some("203.0.113.7".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_ip_rejects_junk_and_empty() {
+        assert_eq!(parse_ip(""), None);
+        assert_eq!(parse_ip("   \n"), None);
+        assert_eq!(parse_ip("not-an-ip"), None);
+        assert_eq!(parse_ip("<html>503</html>"), None);
+        assert_eq!(parse_ip("999.999.999.999"), None);
+    }
+
+    #[tokio::test]
+    async fn probe_exit_ip_dead_proxy_returns_none() {
+        let port = closed_local_port().await;
+        let proxy = format!("socks5h://127.0.0.1:{port}");
+        assert_eq!(
+            probe_exit_ip(&proxy, Duration::from_millis(600)).await,
+            None
+        );
     }
 
     #[tokio::test]

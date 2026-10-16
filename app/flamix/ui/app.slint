@@ -49,6 +49,7 @@ export component AppWindow inherits Window {
     callback open-server(string);
     callback ping-selected();
     callback ping-all();
+    callback check-exit-ips();
     callback update-subscription(string);
     callback update-all();
     callback toggle-pin(string);
@@ -89,6 +90,7 @@ export component AppWindow inherits Window {
                 import-clipboard => { root.import-clipboard(); }
                 update-all => { root.update-all(); }
                 ping-all => { root.ping-all(); }
+                check-exit-ips => { root.check-exit-ips(); }
                 sort-by-ping => { root.sort-by-ping(); }
                 add-subscription => { root.add-subscription(); }
                 toggle-collapse(id) => { root.toggle-collapse(id); }

@@ -16,6 +16,7 @@ export component ServersPanel inherits Rectangle {
     callback import-clipboard();
     callback update-all();
     callback ping-all();
+    callback check-exit-ips();
     callback sort-by-ping();
     callback add-subscription();
     callback toggle-collapse(string);
@@ -45,6 +46,23 @@ export component ServersPanel inherits Rectangle {
                 vertical-alignment: center;
             }
             Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Rectangle {
+                width: 152px;
+                height: 34px;
+                border-radius: 8px;
+                background: exit-ip-ta.has-hover ? Theme.hover : Theme.control-bg;
+                border-width: 1px;
+                border-color: Theme.stroke;
+                Text {
+                    text: "Проверить выходные IP";
+                    color: Theme.text;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                exit-ip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.check-exit-ips(); } }
+            }
 
             Rectangle {
                 width: 34px;
