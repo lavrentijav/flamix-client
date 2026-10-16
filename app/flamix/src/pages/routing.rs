@@ -1,13 +1,18 @@
-//! "Маршрутизация" page (page 2). OWNER: T17C (docs/tasks/T17-pages.md).
+//! "Маршрутизация" page (page 2). OWNER: T17C (docs/tasks/T17-pages.md), T28 value fields.
 //!
 //! Rust talks to the page only through the [`RoutingBridge`] global. Every change is written
 //! through [`Controller::mutate`] and a reconnect (if a core is running) is scheduled with a
 //! 700 ms debounce. All non-trivial logic is pure and unit-tested below.
+//!
+//! Each rule owns three editable lists (domains / IPs / processes). The lists live in
+//! [`ListCache`] as *rows*: the stored entries plus one trailing empty input row, which may also
+//! contain transient empty rows while the user adds an entry in the middle. The stored config
+//! only ever sees the trimmed, non-empty entries.
 
 use crate::controller::Controller;
 use crate::{AppWindow, ProviderRoutingItem, RoutingBridge, RoutingRuleItem};
 use flamix_core::model::{AppState, Routing, RoutingPreset, RoutingRule, RuleAction, Subscription};
-use slint::ComponentHandle;
+use slint::{ComponentHandle, SharedString};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -18,6 +23,9 @@ const RECONNECT_DEBOUNCE: Duration = Duration::from_millis(700);
 
 /// Domain strategy labels, used for the ComboBox mapping.
 const STRATEGIES: [&str; 3] = ["AsIs", "IPIfNonMatch", "IPOnDemand"];
+
+/// Number of editable value lists per rule: domains, IPs, processes.
+const FIELD_COUNT: usize = 3;
 
 pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     match ctrl {
@@ -72,70 +80,81 @@ fn action_from_index(index: i32) -> RuleAction {
     }
 }
 
-/// Which value list a rule currently edits. Domains win over IPs win over processes.
-fn kind_index(rule: &RoutingRule) -> usize {
-    if !rule.ips.is_empty() {
-        1
-    } else if !rule.processes.is_empty() {
-        2
-    } else {
-        0
+/// Field index (0 domains, 1 IPs, 2 processes) as a `usize`, rejecting anything else.
+fn field_index(field: i32) -> Option<usize> {
+    usize::try_from(field).ok().filter(|f| *f < FIELD_COUNT)
+}
+
+/// The stored value list of a rule for a given field.
+fn field_list(rule: &RoutingRule, field: usize) -> &Vec<String> {
+    match field {
+        1 => &rule.ips,
+        2 => &rule.processes,
+        _ => &rule.domains,
     }
 }
 
-fn kind_from_index(index: i32) -> Option<usize> {
-    match index {
-        0 => Some(0),
-        1 => Some(1),
-        2 => Some(2),
-        _ => None,
+/// Mutable access to the stored value list of a rule for a given field.
+fn field_list_mut(rule: &mut RoutingRule, field: usize) -> &mut Vec<String> {
+    match field {
+        1 => &mut rule.ips,
+        2 => &mut rule.processes,
+        _ => &mut rule.domains,
     }
 }
 
-/// Split a UI value into trimmed, non-empty entries.
-///
-/// Entries are separated by commas **or** newlines (`\n`/`\r`, so CRLF works too): the user may
-/// type a comma-separated line and it is re-rendered one entry per line on the next refresh.
-/// Order is preserved and duplicates are kept.
-fn split_values(text: &str) -> Vec<String> {
-    text.split([',', '\n', '\r'])
-        .map(str::trim)
+/// Insert `value` at `row`, clamped to the end of the list.
+fn list_insert(rows: &mut Vec<String>, row: usize, value: &str) {
+    let at = row.min(rows.len());
+    rows.insert(at, value.to_string());
+}
+
+/// Remove the row at `row`; returns whether a row was removed. The last remaining row is kept.
+fn list_remove(rows: &mut Vec<String>, row: usize) -> bool {
+    if rows.len() <= 1 || row >= rows.len() {
+        return false;
+    }
+    rows.remove(row);
+    true
+}
+
+/// The ordered, trimmed, non-empty entries of an editable row list.
+fn list_values(rows: &[String]) -> Vec<String> {
+    rows.iter()
+        .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
         .collect()
 }
 
-/// Render a rule's value list as one entry per line (the multi-line input format).
-fn join_values(rule: &RoutingRule, kind: usize) -> String {
-    let list = match kind {
-        1 => &rule.ips,
-        2 => &rule.processes,
-        _ => &rule.domains,
-    };
-    list.join("\n")
-}
-
-/// Replace the rule's values with `text`, keeping exactly one kind populated.
-fn set_rule_values(rule: &mut RoutingRule, kind: usize, text: &str) {
-    let values = split_values(text);
-    rule.domains.clear();
-    rule.ips.clear();
-    rule.processes.clear();
-    match kind {
-        1 => rule.ips = values,
-        2 => rule.processes = values,
-        _ => rule.domains = values,
-    }
-}
-
-/// Move the current values to another kind, so switching kind never hides data.
-fn change_rule_kind(rule: &mut RoutingRule, kind: usize) {
-    let current = kind_index(rule);
-    if current == kind {
+/// Keep exactly one trailing empty input row. Empty rows in the middle are kept so the user can
+/// still type into a row they just inserted.
+fn normalize_rows(rows: &mut Vec<String>) {
+    if rows.is_empty() {
+        rows.push(String::new());
         return;
     }
-    let text = join_values(rule, current);
-    set_rule_values(rule, kind, &text);
+    while rows.len() >= 2 && rows[rows.len() - 1].is_empty() && rows[rows.len() - 2].is_empty() {
+        rows.pop();
+    }
+    if !rows[rows.len() - 1].is_empty() {
+        rows.push(String::new());
+    }
+}
+
+/// Editable rows for a stored list: the entries plus one trailing empty input row.
+fn list_rows(list: &[String]) -> Vec<String> {
+    let mut rows = list.to_vec();
+    rows.push(String::new());
+    rows
+}
+
+fn string_model(list: &[String]) -> slint::ModelRc<SharedString> {
+    crate::view::model(
+        list.iter()
+            .map(|s| SharedString::from(s.as_str()))
+            .collect(),
+    )
 }
 
 fn is_empty_rule(rule: &RoutingRule) -> bool {
@@ -146,7 +165,7 @@ fn is_empty_rule(rule: &RoutingRule) -> bool {
 fn validation_error(routing: &Routing) -> String {
     for (index, rule) in routing.custom_rules.iter().enumerate() {
         if rule.enabled && is_empty_rule(rule) {
-            return format!("Правило {}: укажите значения", index + 1);
+            return format!("Правило {}: хотя бы одно значение", index + 1);
         }
     }
     String::new()
@@ -190,85 +209,185 @@ fn move_rule(rules: &mut [RoutingRule], index: i32, delta: i32) -> bool {
     true
 }
 
-/// Remembers the chip kind chosen for each rule.
-///
-/// The model cannot tell an empty `domains` list from an empty `ips`/`processes` list, so
-/// [`kind_index`] always reports 0 for a rule with no values. Without this cache an empty rule
-/// would snap back to "Домены" on every repaint (structural edits, enable toggle, ...).
-#[derive(Default)]
-struct KindCache {
-    kinds: Vec<i32>,
+/// Editable state of one rule that the model cannot store: the three row lists and the
+/// UI-local collapsed flag.
+struct RuleUi {
+    rows: [Vec<String>; FIELD_COUNT],
+    collapsed: bool,
 }
 
-impl KindCache {
-    /// Align the cache with the current rules: keep the chosen kind for empty rules, take the
-    /// authoritative derived kind for rules that already contain values.
+impl RuleUi {
+    fn from_rule(rule: &RoutingRule) -> Self {
+        Self {
+            rows: [
+                list_rows(&rule.domains),
+                list_rows(&rule.ips),
+                list_rows(&rule.processes),
+            ],
+            collapsed: false,
+        }
+    }
+}
+
+/// Per-rule editable rows, kept in sync with the model by index. The UI edits here first and the
+/// stored config is derived from these rows, so an in-progress empty row survives repaints.
+#[derive(Default)]
+struct ListCache {
+    rules: Vec<RuleUi>,
+    /// Coordinates of the row that should receive focus on the next repaint.
+    pending_focus: Option<(i32, i32, i32)>,
+    /// Monotonic focus request token; 0 means "no pending request" (consumed by the UI).
+    focus_token: i32,
+}
+
+impl ListCache {
+    /// Align the cache with the model: keep existing rows, add slots for new rules, drop removed
+    /// trailing ones. Middle deletions/moves are applied explicitly by the handlers.
     fn sync(&mut self, routing: &Routing) {
         let count = routing.custom_rules.len();
-        self.kinds.resize(count, 0);
-        for (index, rule) in routing.custom_rules.iter().enumerate() {
-            if !is_empty_rule(rule) {
-                self.kinds[index] = kind_index(rule) as i32;
-            }
+        self.rules.truncate(count);
+        while self.rules.len() < count {
+            let rule = &routing.custom_rules[self.rules.len()];
+            self.rules.push(RuleUi::from_rule(rule));
         }
     }
 
-    fn set(&mut self, index: i32, kind: i32) {
-        if let Some(slot) = usize::try_from(index)
+    fn rule_ui_mut(&mut self, index: i32) -> Option<&mut RuleUi> {
+        usize::try_from(index)
             .ok()
-            .and_then(|index| self.kinds.get_mut(index))
-        {
-            *slot = kind;
+            .and_then(|i| self.rules.get_mut(i))
+    }
+
+    /// Update the text of one row (raw; empty rows are tolerated while editing).
+    fn edit_row(&mut self, index: i32, field: i32, row: i32, text: &str) {
+        let Some(field) = field_index(field) else {
+            return;
+        };
+        let Some(ui) = self.rule_ui_mut(index) else {
+            return;
+        };
+        let rows = &mut ui.rows[field];
+        let Some(row) = usize::try_from(row).ok().filter(|r| *r < rows.len()) else {
+            return;
+        };
+        rows[row] = text.trim().to_string();
+        normalize_rows(rows);
+    }
+
+    /// Insert an empty row after `row`; returns the `(field, row)` to focus.
+    fn insert_row(&mut self, index: i32, field: i32, row: i32) -> Option<(i32, i32)> {
+        let field = field_index(field)?;
+        let row = usize::try_from(row).ok()?;
+        let ui = self.rule_ui_mut(index)?;
+        let rows = &mut ui.rows[field];
+        let at = row.saturating_add(1).min(rows.len());
+        list_insert(rows, at, "");
+        normalize_rows(rows);
+        Some((field as i32, at.min(rows.len().saturating_sub(1)) as i32))
+    }
+
+    /// Remove an empty row; returns the `(field, row)` to focus (the row above).
+    fn remove_row(&mut self, index: i32, field: i32, row: i32) -> Option<(i32, i32)> {
+        let field = field_index(field)?;
+        let row = usize::try_from(row).ok()?;
+        let ui = self.rule_ui_mut(index)?;
+        let rows = &mut ui.rows[field];
+        if row >= rows.len() || !rows[row].is_empty() {
+            return None;
+        }
+        if !list_remove(rows, row) {
+            // Only the first row is left: clearing it is a no-op for the model.
+            rows[row].clear();
+            return None;
+        }
+        normalize_rows(rows);
+        Some((
+            field as i32,
+            row.saturating_sub(1).min(rows.len().saturating_sub(1)) as i32,
+        ))
+    }
+
+    fn set_collapsed(&mut self, index: i32, collapsed: bool) {
+        if let Some(ui) = self.rule_ui_mut(index) {
+            ui.collapsed = collapsed;
         }
     }
 
-    /// Mirror a reorder of the model (uses the same bounds rules as [`move_rule`]).
+    /// Write the trimmed, non-empty rows of one rule back into the stored config.
+    fn write_config(&self, routing: &mut Routing, index: i32) {
+        let Some(ui) = usize::try_from(index).ok().and_then(|i| self.rules.get(i)) else {
+            return;
+        };
+        let Some(rule) = rule_mut(routing, index) else {
+            return;
+        };
+        for (field, rows) in ui.rows.iter().enumerate() {
+            *field_list_mut(rule, field) = list_values(rows);
+        }
+    }
+
+    /// Mirror a reorder of the model (same bounds rules as [`move_rule`]).
     fn swap(&mut self, index: i32, delta: i32) {
         let Ok(from) = usize::try_from(index) else {
             return;
         };
-        if from >= self.kinds.len() {
+        if from >= self.rules.len() {
             return;
         }
         let to = from as i64 + i64::from(delta);
-        if to < 0 || to >= self.kinds.len() as i64 {
+        if to < 0 || to >= self.rules.len() as i64 {
             return;
         }
-        self.kinds.swap(from, to as usize);
+        self.rules.swap(from, to as usize);
     }
 
     fn remove(&mut self, index: i32) {
         if let Some(index) = usize::try_from(index)
             .ok()
-            .filter(|index| *index < self.kinds.len())
+            .filter(|index| *index < self.rules.len())
         {
-            self.kinds.remove(index);
+            self.rules.remove(index);
         }
     }
-}
 
-fn rule_item(index: usize, rule: &RoutingRule, preferred_kind: i32) -> RoutingRuleItem {
-    let kind = if is_empty_rule(rule) {
-        kind_from_index(preferred_kind).unwrap_or(0)
-    } else {
-        kind_index(rule)
-    };
-    RoutingRuleItem {
-        index: index as i32,
-        action: action_index(rule.action),
-        kind: kind as i32,
-        values: join_values(rule, kind).into(),
-        enabled: rule.enabled,
+    fn request_focus(&mut self, rule: i32, field: i32, row: i32) {
+        self.pending_focus = Some((rule, field, row));
     }
-}
 
-fn build_rule_items(routing: &Routing, kinds: &[i32]) -> Vec<RoutingRuleItem> {
-    routing
-        .custom_rules
-        .iter()
-        .enumerate()
-        .map(|(index, rule)| rule_item(index, rule, kinds.get(index).copied().unwrap_or(0)))
-        .collect()
+    /// Take the pending focus request and stamp it with a fresh non-zero token.
+    fn take_focus(&mut self) -> Option<(i32, i32, i32, i32)> {
+        let (rule, field, row) = self.pending_focus.take()?;
+        self.focus_token = self.focus_token.wrapping_add(1);
+        if self.focus_token <= 0 {
+            self.focus_token = 1;
+        }
+        Some((rule, field, row, self.focus_token))
+    }
+
+    /// Build the UI items, falling back to the model when a slot is missing.
+    fn build_items(&self, routing: &Routing) -> Vec<RoutingRuleItem> {
+        routing
+            .custom_rules
+            .iter()
+            .enumerate()
+            .map(|(index, rule)| {
+                let ui = self.rules.get(index);
+                let rows = |field: usize| match ui {
+                    Some(ui) => string_model(&ui.rows[field]),
+                    None => string_model(&list_rows(field_list(rule, field))),
+                };
+                RoutingRuleItem {
+                    index: index as i32,
+                    action: action_index(rule.action),
+                    enabled: rule.enabled,
+                    collapsed: ui.map(|ui| ui.collapsed).unwrap_or(false),
+                    domains: rows(0),
+                    ips: rows(1),
+                    processes: rows(2),
+                }
+            })
+            .collect()
+    }
 }
 
 /// Number of rules that actually take effect: none while the profile is disabled or the user
@@ -313,30 +432,70 @@ fn publish(
     rules: Vec<RoutingRuleItem>,
     providers: Vec<ProviderRoutingItem>,
     error: String,
+    focus: Option<(i32, i32, i32, i32)>,
 ) {
     let bridge = ui.global::<RoutingBridge>();
     bridge.set_preset(preset_index(routing.preset));
     bridge.set_domain_strategy(strategy_index(&routing.domain_strategy));
     bridge.set_block_quic(routing.block_quic);
+    bridge.set_error_text(error.into());
+    // Always publish a definite focus target so a token the UI did not consume can never point
+    // at stale coordinates on a later repaint.
+    match focus {
+        Some((rule, field, row, token)) => {
+            bridge.set_focus_rule(rule);
+            bridge.set_focus_field(field);
+            bridge.set_focus_row(row);
+            bridge.set_focus_token(token);
+        }
+        None => {
+            bridge.set_focus_rule(-1);
+            bridge.set_focus_field(-1);
+            bridge.set_focus_row(-1);
+            bridge.set_focus_token(0);
+        }
+    }
+    // The rules model is published last: the freshly created value rows read the focus target
+    // above during their `init` and focus themselves.
     bridge.set_rules(crate::view::model(rules));
     bridge.set_has_providers(!providers.is_empty());
     bridge.set_providers(crate::view::model(providers));
-    bridge.set_error_text(error.into());
 }
 
-fn refresh(ui: &AppWindow, ctrl: &Controller, cache: &Rc<RefCell<KindCache>>) {
+fn refresh(ui: &AppWindow, ctrl: &Controller, cache: &Rc<RefCell<ListCache>>) {
     let (routing, providers) = ctrl.with_state(|s| (s.settings.routing.clone(), provider_items(s)));
     let error = validation_error(&routing);
-    let mut cache = cache.borrow_mut();
-    cache.sync(&routing);
-    let rules = build_rule_items(&routing, &cache.kinds);
-    publish(ui, &routing, rules, providers, error);
+    let (rules, focus) = {
+        let mut cache = cache.borrow_mut();
+        cache.sync(&routing);
+        (cache.build_items(&routing), cache.take_focus())
+    };
+    publish(ui, &routing, rules, providers, error, focus);
 }
 
-fn repaint(weak: &slint::Weak<AppWindow>, ctrl: &Controller, cache: &Rc<RefCell<KindCache>>) {
+/// Recompute only the validation line, without rebuilding the rules model (so the LineEdit that
+/// is being edited keeps its cursor).
+fn refresh_error(ui: &AppWindow, ctrl: &Controller) {
+    let error = ctrl.with_state(|s| validation_error(&s.settings.routing));
+    ui.global::<RoutingBridge>().set_error_text(error.into());
+}
+
+fn repaint(weak: &slint::Weak<AppWindow>, ctrl: &Controller, cache: &Rc<RefCell<ListCache>>) {
     if let Some(ui) = weak.upgrade() {
         refresh(&ui, ctrl, cache);
     }
+}
+
+/// Repaint on the next event-loop iteration. Structural list edits come from key handlers, so the
+/// model is rebuilt after the key event finished instead of destroying the focused row mid-event.
+fn repaint_later(
+    weak: slint::Weak<AppWindow>,
+    ctrl: Arc<Controller>,
+    cache: Rc<RefCell<ListCache>>,
+) {
+    slint::Timer::single_shot(Duration::ZERO, move || {
+        repaint(&weak, &ctrl, &cache);
+    });
 }
 
 /// Debounced `reconnect_if_connected`: every change bumps a generation, only the last wins.
@@ -370,7 +529,7 @@ impl Defer {
 // --- live wiring ----------------------------------------------------------
 
 fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
-    let cache: Rc<RefCell<KindCache>> = Rc::new(RefCell::new(KindCache::default()));
+    let cache: Rc<RefCell<ListCache>> = Rc::new(RefCell::new(ListCache::default()));
     refresh(ui, &ctrl, &cache);
     let defer = Defer::new(Arc::clone(&ctrl));
 
@@ -403,42 +562,6 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
             });
     }
     {
-        let ctrl = Arc::clone(&ctrl);
-        let cache = Rc::clone(&cache);
-        let defer = defer.clone();
-        ui.global::<RoutingBridge>()
-            .on_rule_kind_changed(move |index, kind| {
-                let Some(kind) = kind_from_index(kind) else {
-                    return;
-                };
-                ctrl.mutate(|s| {
-                    if let Some(rule) = rule_mut(&mut s.settings.routing, index) {
-                        change_rule_kind(rule, kind);
-                    }
-                });
-                cache.borrow_mut().set(index, kind as i32);
-                // No refresh: keep the chips on the chosen kind so the next edit lands in it.
-                defer.schedule();
-            });
-    }
-    {
-        let ctrl = Arc::clone(&ctrl);
-        let cache = Rc::clone(&cache);
-        let defer = defer.clone();
-        ui.global::<RoutingBridge>()
-            .on_rule_values_changed(move |index, kind, text| {
-                let kind = kind_from_index(kind).unwrap_or(0);
-                ctrl.mutate(|s| {
-                    if let Some(rule) = rule_mut(&mut s.settings.routing, index) {
-                        set_rule_values(rule, kind, text.as_str());
-                    }
-                });
-                cache.borrow_mut().set(index, kind as i32);
-                // No refresh: preserve the LineEdit cursor while typing.
-                defer.schedule();
-            });
-    }
-    {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
         let cache = Rc::clone(&cache);
@@ -451,6 +574,77 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                     }
                 });
                 repaint(&weak, &ctrl, &cache);
+                defer.schedule();
+            });
+    }
+    {
+        let weak = ui.as_weak();
+        let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
+        let defer = defer.clone();
+        ui.global::<RoutingBridge>()
+            .on_rule_collapsed_changed(move |index, collapsed| {
+                cache.borrow_mut().set_collapsed(index, collapsed);
+                repaint(&weak, &ctrl, &cache);
+                defer.schedule();
+            });
+    }
+    {
+        let weak = ui.as_weak();
+        let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
+        let defer = defer.clone();
+        ui.global::<RoutingBridge>()
+            .on_rule_item_edited(move |index, field, row, text| {
+                cache
+                    .borrow_mut()
+                    .edit_row(index, field, row, text.as_str());
+                ctrl.mutate(|s| cache.borrow().write_config(&mut s.settings.routing, index));
+                // No full refresh (keep the LineEdit cursor), but the validation line must track
+                // the model so emptying the last value of an enabled rule shows the error at once.
+                if let Some(ui) = weak.upgrade() {
+                    refresh_error(&ui, &ctrl);
+                }
+                defer.schedule();
+            });
+    }
+    {
+        let weak = ui.as_weak();
+        let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
+        let defer = defer.clone();
+        ui.global::<RoutingBridge>()
+            .on_rule_item_insert(move |index, field, row| {
+                let Some((focus_field, focus_row)) =
+                    cache.borrow_mut().insert_row(index, field, row)
+                else {
+                    return;
+                };
+                ctrl.mutate(|s| cache.borrow().write_config(&mut s.settings.routing, index));
+                cache
+                    .borrow_mut()
+                    .request_focus(index, focus_field, focus_row);
+                repaint_later(weak.clone(), Arc::clone(&ctrl), Rc::clone(&cache));
+                defer.schedule();
+            });
+    }
+    {
+        let weak = ui.as_weak();
+        let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
+        let defer = defer.clone();
+        ui.global::<RoutingBridge>()
+            .on_rule_item_remove(move |index, field, row| {
+                let Some((focus_field, focus_row)) =
+                    cache.borrow_mut().remove_row(index, field, row)
+                else {
+                    return;
+                };
+                ctrl.mutate(|s| cache.borrow().write_config(&mut s.settings.routing, index));
+                cache
+                    .borrow_mut()
+                    .request_focus(index, focus_field, focus_row);
+                repaint_later(weak.clone(), Arc::clone(&ctrl), Rc::clone(&cache));
                 defer.schedule();
             });
     }
@@ -600,13 +794,13 @@ fn demo_routing() -> Routing {
         custom_rules: vec![
             demo_rule(
                 RuleAction::Proxy,
-                &["domain:openai.com", "geosite:google"],
-                &[],
+                &["domain:openai.com", "geosite:google", "full:chatgpt.com"],
+                &["geoip:us"],
                 &[],
             ),
             demo_rule(
                 RuleAction::Direct,
-                &[],
+                &["domain:gosuslugi.ru"],
                 &["geoip:ru", "10.0.0.0/8", "192.168.0.0/16"],
                 &[],
             ),
@@ -645,14 +839,17 @@ fn demo_providers() -> Vec<ProviderRoutingItem> {
 /// `--demo` / `--screenshot` mode: realistic static data, callbacks are not wired.
 fn fill_demo(ui: &AppWindow) {
     let routing = demo_routing();
-    let rules = build_rule_items(&routing, &[]);
-    publish(ui, &routing, rules, demo_providers(), String::new());
+    let mut cache = ListCache::default();
+    cache.sync(&routing);
+    let rules = cache.build_items(&routing);
+    publish(ui, &routing, rules, demo_providers(), String::new(), None);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use flamix_core::model::{ProviderRouting, SubscriptionOptions};
+    use slint::Model;
 
     fn subscription(id: &str, name: &str) -> Subscription {
         Subscription {
@@ -676,6 +873,12 @@ mod tests {
             provider: Default::default(),
             options: SubscriptionOptions::default(),
         }
+    }
+
+    fn item_strings(model: &slint::ModelRc<SharedString>) -> Vec<String> {
+        (0..model.row_count())
+            .filter_map(|i| model.row_data(i).map(|s| s.to_string()))
+            .collect()
     }
 
     #[test]
@@ -712,79 +915,249 @@ mod tests {
     }
 
     #[test]
-    fn kind_detection_and_mapping() {
-        let domains = demo_rule(RuleAction::Proxy, &["a.com"], &[], &[]);
-        let ips = demo_rule(RuleAction::Proxy, &[], &["geoip:ru"], &[]);
-        let procs = demo_rule(RuleAction::Proxy, &[], &[], &["x.exe"]);
-        let empty = demo_rule(RuleAction::Proxy, &[], &[], &[]);
-        assert_eq!(kind_index(&domains), 0);
-        assert_eq!(kind_index(&ips), 1);
-        assert_eq!(kind_index(&procs), 2);
-        assert_eq!(kind_index(&empty), 0);
-        assert_eq!(kind_from_index(2), Some(2));
-        assert_eq!(kind_from_index(3), None);
+    fn list_insert_clamps_to_the_end() {
+        let mut rows = vec!["a".to_string(), "b".to_string()];
+        list_insert(&mut rows, 1, "x");
+        assert_eq!(rows, vec!["a", "x", "b"]);
+        list_insert(&mut rows, 99, "end");
+        assert_eq!(rows, vec!["a", "x", "b", "end"]);
     }
 
     #[test]
-    fn split_and_join_values() {
+    fn list_remove_keeps_the_last_row() {
+        let mut rows = vec!["a".to_string(), "b".to_string()];
+        assert!(list_remove(&mut rows, 0));
+        assert_eq!(rows, vec!["b"]);
+        assert!(!list_remove(&mut rows, 0));
+        assert_eq!(rows, vec!["b"]);
+        assert!(!list_remove(&mut rows, 5));
+    }
+
+    #[test]
+    fn list_values_trims_and_drops_empty() {
+        let rows = vec![
+            "  geosite:ru  ".to_string(),
+            String::new(),
+            "10.0.0.0/8".to_string(),
+            "   ".to_string(),
+        ];
+        assert_eq!(list_values(&rows), vec!["geosite:ru", "10.0.0.0/8"]);
+    }
+
+    #[test]
+    fn normalize_keeps_one_trailing_row_and_middle_empties() {
+        let mut rows = vec!["a".to_string()];
+        normalize_rows(&mut rows);
+        assert_eq!(rows, vec!["a", ""]);
+
+        let mut rows = vec!["a".to_string(), "".to_string(), "".to_string()];
+        normalize_rows(&mut rows);
+        assert_eq!(rows, vec!["a", ""]);
+
+        let mut rows = vec!["a".to_string(), "".to_string(), "b".to_string()];
+        normalize_rows(&mut rows);
+        assert_eq!(rows, vec!["a", "", "b", ""]);
+
+        let mut rows: Vec<String> = Vec::new();
+        normalize_rows(&mut rows);
+        assert_eq!(rows, vec![""]);
+    }
+
+    #[test]
+    fn list_rows_appends_an_input_row() {
+        let rows = list_rows(&["a".to_string(), "b".to_string()]);
+        assert_eq!(rows, vec!["a", "b", ""]);
+        assert_eq!(list_rows(&[]), vec![""]);
+    }
+
+    #[test]
+    fn field_mapping_roundtrips() {
+        let mut rule = demo_rule(RuleAction::Proxy, &["d"], &["i"], &["p"]);
+        assert_eq!(field_list(&rule, 0), &vec!["d".to_string()]);
+        assert_eq!(field_list(&rule, 1), &vec!["i".to_string()]);
+        assert_eq!(field_list(&rule, 2), &vec!["p".to_string()]);
+        field_list_mut(&mut rule, 1).push("i2".to_string());
+        assert_eq!(rule.ips, vec!["i", "i2"]);
+        assert_eq!(field_index(2), Some(2));
+        assert_eq!(field_index(3), None);
+        assert_eq!(field_index(-1), None);
+    }
+
+    #[test]
+    fn edit_row_updates_and_normalizes() {
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &[], &[], &[])],
+            ..Routing::default()
+        });
+        // Typing into the only (input) row appends a fresh trailing row.
+        cache.edit_row(0, 0, 0, "  a.com  ");
+        assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
+        // Whitespace-only text is trimmed to an empty input row, not stored raw.
+        cache.edit_row(0, 0, 1, "   ");
+        assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
+        // Out-of-range coordinates are ignored.
+        cache.edit_row(0, 0, 9, "x");
+        cache.edit_row(0, 5, 0, "x");
+        cache.edit_row(9, 0, 0, "x");
+        assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
+    }
+
+    #[test]
+    fn insert_row_inserts_below_and_reports_focus() {
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &["a", "b"], &[], &[])],
+            ..Routing::default()
+        });
+        assert_eq!(cache.rules[0].rows[0], vec!["a", "b", ""]);
+        // Enter on the first row inserts a new row right below it.
+        assert_eq!(cache.insert_row(0, 0, 0), Some((0, 1)));
+        assert_eq!(cache.rules[0].rows[0], vec!["a", "", "b", ""]);
+        // Enter on the trailing input row stays at the end.
+        assert_eq!(cache.insert_row(0, 0, 3), Some((0, 3)));
+        assert_eq!(cache.rules[0].rows[0], vec!["a", "", "b", ""]);
+        // Invalid coordinates do nothing.
+        assert_eq!(cache.insert_row(0, 7, 0), None);
+        assert_eq!(cache.insert_row(4, 0, 0), None);
+    }
+
+    #[test]
+    fn remove_row_drops_empty_and_focuses_above() {
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &["a", "b"], &[], &[])],
+            ..Routing::default()
+        });
+        // rows == ["a", "b", ""]
+        assert_eq!(cache.remove_row(0, 0, 2), Some((0, 1)));
+        assert_eq!(cache.rules[0].rows[0], vec!["a", "b", ""]);
+        // A non-empty row is not removed (the LineEdit edits it instead).
+        assert_eq!(cache.remove_row(0, 0, 0), None);
+        assert_eq!(cache.rules[0].rows[0], vec!["a", "b", ""]);
+        // Removing the only input row of an empty field keeps one row.
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &[], &[], &[])],
+            ..Routing::default()
+        });
+        assert_eq!(cache.remove_row(0, 0, 0), None);
+        assert_eq!(cache.rules[0].rows[0], vec![""]);
+    }
+
+    #[test]
+    fn cache_sync_tracks_rule_count() {
+        let mut cache = ListCache::default();
+        let mut routing = Routing::default();
+        routing
+            .custom_rules
+            .push(demo_rule(RuleAction::Proxy, &["a"], &[], &[]));
+        cache.sync(&routing);
+        assert_eq!(cache.rules.len(), 1);
+        routing
+            .custom_rules
+            .push(demo_rule(RuleAction::Direct, &[], &["i"], &[]));
+        cache.sync(&routing);
+        assert_eq!(cache.rules.len(), 2);
+        assert_eq!(cache.rules[1].rows[0], vec![""]);
+        assert_eq!(cache.rules[1].rows[1], vec!["i", ""]);
+        routing.custom_rules.clear();
+        cache.sync(&routing);
+        assert!(cache.rules.is_empty());
+    }
+
+    #[test]
+    fn cache_swap_and_remove_mirror_reorders() {
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![
+                demo_rule(RuleAction::Proxy, &["a"], &[], &[]),
+                demo_rule(RuleAction::Proxy, &["b"], &[], &[]),
+            ],
+            ..Routing::default()
+        });
+        cache.swap(0, 1);
+        assert_eq!(cache.rules[0].rows[0], vec!["b", ""]);
+        assert_eq!(cache.rules[1].rows[0], vec!["a", ""]);
+        cache.swap(0, -1);
+        assert_eq!(cache.rules[0].rows[0], vec!["b", ""]);
+        cache.remove(0);
+        assert_eq!(cache.rules.len(), 1);
+        assert_eq!(cache.rules[0].rows[0], vec!["a", ""]);
+        cache.remove(5);
+        assert_eq!(cache.rules.len(), 1);
+    }
+
+    #[test]
+    fn write_config_uses_only_non_empty_rows() {
+        let mut cache = ListCache::default();
+        cache.sync(&Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &[], &[], &[])],
+            ..Routing::default()
+        });
+        cache.edit_row(0, 0, 0, " domain:a.com ");
+        cache.edit_row(0, 1, 0, "10.0.0.0/8");
+        cache.edit_row(0, 2, 0, "telegram.exe");
+        let mut routing = Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &["old"], &[], &[])],
+            ..Routing::default()
+        };
+        cache.write_config(&mut routing, 0);
+        assert_eq!(routing.custom_rules[0].domains, vec!["domain:a.com"]);
+        assert_eq!(routing.custom_rules[0].ips, vec!["10.0.0.0/8"]);
+        assert_eq!(routing.custom_rules[0].processes, vec!["telegram.exe"]);
+        // Unknown index is ignored.
+        cache.write_config(&mut routing, 5);
+    }
+
+    #[test]
+    fn take_focus_stamps_a_fresh_token() {
+        let mut cache = ListCache::default();
+        assert_eq!(cache.take_focus(), None);
+        cache.request_focus(1, 2, 3);
+        assert_eq!(cache.take_focus(), Some((1, 2, 3, 1)));
+        assert_eq!(cache.take_focus(), None);
+        cache.request_focus(0, 0, 0);
+        assert_eq!(cache.take_focus(), Some((0, 0, 0, 2)));
+    }
+
+    #[test]
+    fn build_items_maps_rows_and_model() {
+        let mut cache = ListCache::default();
+        let routing = Routing {
+            custom_rules: vec![
+                demo_rule(RuleAction::Block, &["geosite:ads"], &[], &[]),
+                demo_rule(RuleAction::Direct, &[], &["geoip:ru"], &[]),
+            ],
+            ..Routing::default()
+        };
+        cache.sync(&routing);
+        cache.set_collapsed(1, true);
+        cache.edit_row(0, 0, 1, "full:x.y");
+        let items = cache.build_items(&routing);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].index, 0);
+        assert_eq!(items[0].action, 2);
+        assert!(items[0].enabled);
+        assert!(!items[0].collapsed);
         assert_eq!(
-            split_values(" geosite:ru , domain:x.com,, 10.0.0.0/8 "),
-            vec!["geosite:ru", "domain:x.com", "10.0.0.0/8"]
+            item_strings(&items[0].domains),
+            vec!["geosite:ads", "full:x.y", ""]
         );
-        assert!(split_values("  ,  ").is_empty());
-        let rule = demo_rule(RuleAction::Direct, &[], &["geoip:ru", "geoip:cn"], &[]);
-        assert_eq!(join_values(&rule, 1), "geoip:ru\ngeoip:cn");
-        assert_eq!(join_values(&rule, 0), "");
+        assert_eq!(item_strings(&items[0].ips), vec![""]);
+        assert_eq!(item_strings(&items[0].processes), vec![""]);
+        assert!(items[1].collapsed);
+        assert_eq!(item_strings(&items[1].ips), vec!["geoip:ru", ""]);
     }
 
     #[test]
-    fn split_values_normalizes_commas_to_newlines() {
-        // Commas, newlines and blank lines all yield the same ordered list ...
-        assert_eq!(
-            split_values("a.com,b.com\nc.com"),
-            vec!["a.com", "b.com", "c.com"]
-        );
-        // ... and the rule is re-rendered one entry per line.
-        let mut rule = demo_rule(RuleAction::Proxy, &[], &[], &[]);
-        set_rule_values(&mut rule, 0, "a.com, b.com\n\n ,c.com\r\nd.com\r\n");
-        assert_eq!(rule.domains, vec!["a.com", "b.com", "c.com", "d.com"]);
-        assert_eq!(join_values(&rule, 0), "a.com\nb.com\nc.com\nd.com");
-    }
-
-    #[test]
-    fn split_values_handles_crlf_and_blank_lines() {
-        assert_eq!(
-            split_values("geosite:ru\r\n\r\ngeoip:ru\r\n"),
-            vec!["geosite:ru", "geoip:ru"]
-        );
-        assert!(split_values("\n\r\n,\n").is_empty());
-    }
-
-    #[test]
-    fn set_rule_values_keeps_single_kind() {
-        let mut rule = demo_rule(RuleAction::Proxy, &["old.com"], &[], &[]);
-        set_rule_values(&mut rule, 1, "geoip:ru, 10.0.0.0/8");
-        assert!(rule.domains.is_empty());
-        assert!(rule.processes.is_empty());
-        assert_eq!(rule.ips, vec!["geoip:ru", "10.0.0.0/8"]);
-    }
-
-    #[test]
-    fn change_rule_kind_moves_existing_values() {
-        let mut rule = demo_rule(RuleAction::Proxy, &["a.com", "b.com"], &[], &[]);
-        change_rule_kind(&mut rule, 1);
-        assert!(rule.domains.is_empty());
-        assert_eq!(rule.ips, vec!["a.com", "b.com"]);
-        // The moved values survive the multi-line round-trip.
-        assert_eq!(join_values(&rule, 1), "a.com\nb.com");
-        // Switching to the same kind is a no-op.
-        change_rule_kind(&mut rule, 1);
-        assert_eq!(rule.ips, vec!["a.com", "b.com"]);
-        // And a differently-shaped list moves just as well.
-        let mut mixed = demo_rule(RuleAction::Proxy, &[], &[], &["p.exe"]);
-        change_rule_kind(&mut mixed, 0);
-        assert!(mixed.processes.is_empty());
-        assert_eq!(mixed.domains, vec!["p.exe"]);
+    fn build_items_falls_back_to_the_model_without_a_cache_slot() {
+        let routing = Routing {
+            custom_rules: vec![demo_rule(RuleAction::Proxy, &["a.com"], &[], &[])],
+            ..Routing::default()
+        };
+        let items = ListCache::default().build_items(&routing);
+        assert_eq!(item_strings(&items[0].domains), vec!["a.com", ""]);
     }
 
     #[test]
@@ -796,11 +1169,17 @@ mod tests {
         routing.custom_rules[0].enabled = false;
         assert_eq!(validation_error(&routing), "");
         routing.custom_rules[0].enabled = true;
-        assert_eq!(validation_error(&routing), "Правило 1: укажите значения");
+        assert_eq!(
+            validation_error(&routing),
+            "Правило 1: хотя бы одно значение"
+        );
         routing
             .custom_rules
             .push(demo_rule(RuleAction::Direct, &["a.com"], &[], &[]));
-        assert_eq!(validation_error(&routing), "Правило 1: укажите значения");
+        assert_eq!(
+            validation_error(&routing),
+            "Правило 1: хотя бы одно значение"
+        );
     }
 
     #[test]
@@ -842,87 +1221,6 @@ mod tests {
         assert!(!move_rule(&mut rules, -1, 1));
         assert_eq!(rules[0].domains, vec!["a"]);
         assert_eq!(rules[1].domains, vec!["b"]);
-    }
-
-    #[test]
-    fn rule_item_reflects_model() {
-        let rule = demo_rule(RuleAction::Block, &["geosite:ads"], &[], &[]);
-        let item = rule_item(3, &rule, 0);
-        assert_eq!(item.index, 3);
-        assert_eq!(item.action, 2);
-        assert_eq!(item.kind, 0);
-        assert_eq!(item.values.as_str(), "geosite:ads");
-        assert!(item.enabled);
-    }
-
-    #[test]
-    fn rule_item_renders_values_one_per_line() {
-        let rule = demo_rule(
-            RuleAction::Direct,
-            &[],
-            &["geoip:ru", "10.0.0.0/8", "192.168.0.0/16"],
-            &[],
-        );
-        let item = rule_item(0, &rule, 0);
-        assert_eq!(item.kind, 1);
-        assert_eq!(item.values.as_str(), "geoip:ru\n10.0.0.0/8\n192.168.0.0/16");
-    }
-
-    #[test]
-    fn rule_item_keeps_preferred_kind_for_empty_rule() {
-        let empty = demo_rule(RuleAction::Proxy, &[], &[], &[]);
-        let item = rule_item(0, &empty, 2);
-        assert_eq!(item.kind, 2);
-        assert_eq!(item.values.as_str(), "");
-        // A populated rule ignores the preferred kind and uses the real one.
-        let ips = demo_rule(RuleAction::Proxy, &[], &["geoip:ru"], &[]);
-        assert_eq!(rule_item(0, &ips, 2).kind, 1);
-    }
-
-    #[test]
-    fn build_rule_items_maps_every_rule_and_uses_kinds() {
-        let routing = Routing {
-            custom_rules: vec![
-                demo_rule(RuleAction::Proxy, &["a.com"], &[], &[]),
-                demo_rule(RuleAction::Block, &[], &[], &[]),
-            ],
-            ..Routing::default()
-        };
-        let items = build_rule_items(&routing, &[0, 2]);
-        assert_eq!(items.len(), 2);
-        assert_eq!(items[0].index, 0);
-        assert_eq!(items[0].values.as_str(), "a.com");
-        assert_eq!(items[1].index, 1);
-        assert_eq!(items[1].kind, 2);
-        // A missing kind entry falls back to domains.
-        let items = build_rule_items(&routing, &[]);
-        assert_eq!(items[1].kind, 0);
-    }
-
-    #[test]
-    fn kind_cache_sync_set_swap_remove() {
-        let mut routing = Routing {
-            custom_rules: vec![
-                demo_rule(RuleAction::Proxy, &[], &[], &[]),
-                demo_rule(RuleAction::Proxy, &[], &[], &["p.exe"]),
-            ],
-            ..Routing::default()
-        };
-        let mut cache = KindCache::default();
-        cache.sync(&routing);
-        // Domains for the empty rule, processes derived for the populated one.
-        assert_eq!(cache.kinds, vec![0, 2]);
-        cache.set(0, 1);
-        cache.sync(&routing);
-        assert_eq!(cache.kinds, vec![1, 2]);
-        cache.swap(0, 1);
-        assert_eq!(cache.kinds, vec![2, 1]);
-        cache.remove(0);
-        assert_eq!(cache.kinds, vec![1]);
-        // Shrinking to zero and regrowing fills with the default kind.
-        routing.custom_rules.clear();
-        cache.sync(&routing);
-        assert!(cache.kinds.is_empty());
     }
 
     #[test]
