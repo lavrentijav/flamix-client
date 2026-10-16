@@ -346,6 +346,16 @@ component RuleRow inherits Rectangle {
             Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
         }
 
+        // Action controls stay available while the rule is collapsed.
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: center;
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
+            IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
+            IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
+        }
+
         if !root.collapsed : VerticalLayout {
             spacing: 8px;
 
@@ -379,15 +389,6 @@ component RuleRow inherits Rectangle {
                 edited(r, t) => { root.item-edited(2, r, t); }
                 insert(r) => { root.item-insert(2, r); }
                 remove(r) => { root.item-remove(2, r); }
-            }
-
-            HorizontalLayout {
-                spacing: 6px;
-                alignment: center;
-                Rectangle { horizontal-stretch: 1; background: transparent; }
-                IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
-                IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
-                IconButton { icon: @image-url("../../assets/icons/trash.svg"); tint: Theme.danger; clicked => { root.remove(); } }
             }
         }
     }

@@ -270,7 +270,7 @@ impl ListCache {
         let Some(row) = usize::try_from(row).ok().filter(|r| *r < rows.len()) else {
             return;
         };
-        rows[row] = text.to_string();
+        rows[row] = text.trim().to_string();
         normalize_rows(rows);
     }
 
@@ -439,11 +439,21 @@ fn publish(
     bridge.set_domain_strategy(strategy_index(&routing.domain_strategy));
     bridge.set_block_quic(routing.block_quic);
     bridge.set_error_text(error.into());
-    if let Some((rule, field, row, token)) = focus {
-        bridge.set_focus_rule(rule);
-        bridge.set_focus_field(field);
-        bridge.set_focus_row(row);
-        bridge.set_focus_token(token);
+    // Always publish a definite focus target so a token the UI did not consume can never point
+    // at stale coordinates on a later repaint.
+    match focus {
+        Some((rule, field, row, token)) => {
+            bridge.set_focus_rule(rule);
+            bridge.set_focus_field(field);
+            bridge.set_focus_row(row);
+            bridge.set_focus_token(token);
+        }
+        None => {
+            bridge.set_focus_rule(-1);
+            bridge.set_focus_field(-1);
+            bridge.set_focus_row(-1);
+            bridge.set_focus_token(0);
+        }
     }
     // The rules model is published last: the freshly created value rows read the focus target
     // above during their `init` and focus themselves.
@@ -461,6 +471,13 @@ fn refresh(ui: &AppWindow, ctrl: &Controller, cache: &Rc<RefCell<ListCache>>) {
         (cache.build_items(&routing), cache.take_focus())
     };
     publish(ui, &routing, rules, providers, error, focus);
+}
+
+/// Recompute only the validation line, without rebuilding the rules model (so the LineEdit that
+/// is being edited keeps its cursor).
+fn refresh_error(ui: &AppWindow, ctrl: &Controller) {
+    let error = ctrl.with_state(|s| validation_error(&s.settings.routing));
+    ui.global::<RoutingBridge>().set_error_text(error.into());
 }
 
 fn repaint(weak: &slint::Weak<AppWindow>, ctrl: &Controller, cache: &Rc<RefCell<ListCache>>) {
@@ -573,6 +590,7 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
             });
     }
     {
+        let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
         let cache = Rc::clone(&cache);
         let defer = defer.clone();
@@ -582,7 +600,11 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                     .borrow_mut()
                     .edit_row(index, field, row, text.as_str());
                 ctrl.mutate(|s| cache.borrow().write_config(&mut s.settings.routing, index));
-                // No refresh: keep the LineEdit cursor where it is while typing.
+                // No full refresh (keep the LineEdit cursor), but the validation line must track
+                // the model so emptying the last value of an enabled rule shows the error at once.
+                if let Some(ui) = weak.upgrade() {
+                    refresh_error(&ui, &ctrl);
+                }
                 defer.schedule();
             });
     }
@@ -969,16 +991,16 @@ mod tests {
             ..Routing::default()
         });
         // Typing into the only (input) row appends a fresh trailing row.
-        cache.edit_row(0, 0, 0, "a.com");
+        cache.edit_row(0, 0, 0, "  a.com  ");
         assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
-        // A trailing space is stored raw but ignored by the model writer.
+        // Whitespace-only text is trimmed to an empty input row, not stored raw.
         cache.edit_row(0, 0, 1, "   ");
-        assert_eq!(cache.rules[0].rows[0], vec!["a.com", "   ", ""]);
+        assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
         // Out-of-range coordinates are ignored.
         cache.edit_row(0, 0, 9, "x");
         cache.edit_row(0, 5, 0, "x");
         cache.edit_row(9, 0, 0, "x");
-        assert_eq!(cache.rules[0].rows[0], vec!["a.com", "   ", ""]);
+        assert_eq!(cache.rules[0].rows[0], vec!["a.com", ""]);
     }
 
     #[test]
