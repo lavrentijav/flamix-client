@@ -7,8 +7,10 @@
 //! 1.12 moved WireGuard out of `outbounds`); see [`outbound`].
 
 use crate::config::routing::{self, Rule};
+use crate::config::{local_auth, ConnectContext};
 use crate::model::{
-    Credentials, Network, RoutingPreset, RuleAction, Security, Server, Settings, Transport,
+    Credentials, Network, ProviderRouting, RoutingPreset, RuleAction, Security, Server, Settings,
+    Transport,
 };
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -223,6 +225,37 @@ pub fn full_config(
     upstream_socks: Option<u16>,
     api_port: u16,
 ) -> Value {
+    full_config_with(
+        server,
+        settings,
+        tun,
+        upstream_socks,
+        api_port,
+        &ConnectContext::default(),
+    )
+}
+
+/// Like [`full_config`], but with the selected subscription's provider routing and Happ
+/// app-overrides ([`ConnectContext`]). See [`crate::config::plan_with`].
+pub fn full_config_with(
+    server: &Server,
+    settings: &Settings,
+    tun: bool,
+    upstream_socks: Option<u16>,
+    api_port: u16,
+    ctx: &ConnectContext,
+) -> Value {
+    let provider = ctx.provider.filter(|p| p.enabled);
+    let provider_dns = provider.and_then(|p| p.dns.as_ref());
+    let remote_dns = provider_dns
+        .map(|d| d.remote.as_str())
+        .unwrap_or(&settings.dns.remote);
+    let direct_dns = provider_dns
+        .map(|d| d.direct.as_str())
+        .unwrap_or(&settings.dns.direct);
+    let fake_ip = provider.map(|p| p.fake_dns).unwrap_or(settings.dns.fake_ip);
+    let geo = GeoUrls::from_provider(provider);
+
     let wireguard = matches!(server.credentials, Credentials::Wireguard { .. });
     let proxy_out = match upstream_socks {
         Some(port) => json!({
@@ -251,24 +284,32 @@ pub fn full_config(
         }));
     }
     route_rules.push(json!({"ip_is_private": true, "outbound": "direct"}));
-    for rule in routing::custom_rules(&settings.routing) {
-        route_rules.push(route_rule(&rule, &mut rule_sets));
+    // Provider rules replace the user's preset and go before the user's custom rules.
+    if let Some(provider) = provider {
+        for rule in routing::provider_rules(provider) {
+            route_rules.push(route_rule(&rule, &mut rule_sets, &geo));
+        }
     }
-    for rule in routing::preset_rules(settings.routing.preset) {
-        route_rules.push(route_rule(&rule, &mut rule_sets));
+    for rule in routing::custom_rules(&settings.routing) {
+        route_rules.push(route_rule(&rule, &mut rule_sets, &geo));
+    }
+    if provider.is_none() {
+        for rule in routing::preset_rules(settings.routing.preset) {
+            route_rules.push(route_rule(&rule, &mut rule_sets, &geo));
+        }
     }
 
     let mut dns_servers = vec![
-        dns_server(&settings.dns.remote, "remote", Some("proxy"), "1.1.1.1"),
-        dns_server(&settings.dns.direct, "direct", None, "77.88.8.8"),
+        dns_server(remote_dns, "remote", Some("proxy"), "1.1.1.1"),
+        dns_server(direct_dns, "direct", None, "77.88.8.8"),
         json!({"type": "local", "tag": "local"}),
     ];
     let mut dns_rules = Vec::new();
-    if settings.routing.preset == RoutingPreset::BypassRu {
+    if provider.is_none() && settings.routing.preset == RoutingPreset::BypassRu {
         rule_sets.insert("geosite-category-ru".into(), geosite_url("category-ru"));
         dns_rules.push(json!({"rule_set": ["geosite-category-ru"], "server": "direct"}));
     }
-    if settings.dns.fake_ip && tun {
+    if fake_ip && tun {
         dns_servers.push(json!({
             "type": "fakeip",
             "tag": "fakeip",
@@ -276,6 +317,23 @@ pub fn full_config(
             "inet6_range": "fc00::/18",
         }));
         dns_rules.insert(0, json!({"query_type": ["A", "AAAA"], "server": "fakeip"}));
+    }
+    // Provider static hosts: a `hosts` DNS server consulted before anything else.
+    let mut hosts_predefined: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    if let Some(provider) = provider {
+        for (host, address) in &provider.dns_hosts {
+            hosts_predefined.insert(host.clone(), vec![address.clone()]);
+        }
+    }
+    if !hosts_predefined.is_empty() {
+        dns_servers.insert(
+            0,
+            json!({"type": "hosts", "tag": "hosts", "predefined": hosts_predefined}),
+        );
+        let domains: Vec<&String> = provider
+            .map(|p| p.dns_hosts.keys().collect())
+            .unwrap_or_default();
+        dns_rules.insert(0, json!({"domain": domains, "server": "hosts"}));
     }
 
     let mut inbounds = Vec::new();
@@ -296,12 +354,23 @@ pub fn full_config(
         }));
     } else if upstream_socks.is_none() {
         // With an upstream SOCKS chain the Xray process binds the local listener.
-        inbounds.push(json!({
-            "type": "mixed",
-            "tag": "mixed-in",
-            "listen": if settings.allow_lan { "0.0.0.0" } else { "127.0.0.1" },
-            "listen_port": settings.socks_port,
-        }));
+        let mut inbound = Map::new();
+        inbound.insert("type".into(), json!("mixed"));
+        inbound.insert("tag".into(), json!("mixed-in"));
+        inbound.insert(
+            "listen".into(),
+            json!(if settings.allow_lan {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            }),
+        );
+        inbound.insert("listen_port".into(), json!(settings.socks_port));
+        let users = mixed_users(ctx.overrides);
+        if !users.is_empty() {
+            inbound.insert("users".into(), json!(users));
+        }
+        inbounds.push(Value::Object(inbound));
     }
 
     let mut route = Map::new();
@@ -327,7 +396,12 @@ pub fn full_config(
         route.insert("rule_set".into(), json!(sets));
     }
     route.insert("rules".into(), json!(route_rules));
-    route.insert("final".into(), json!("proxy"));
+    // `global_proxy == false`: unmatched traffic goes direct instead of through the proxy.
+    let final_outbound = match provider {
+        Some(provider) if !provider.global_proxy => "direct",
+        _ => "proxy",
+    };
+    route.insert("final".into(), json!(final_outbound));
 
     let mut outbounds = Vec::new();
     if !proxy_in_endpoints {
@@ -355,6 +429,53 @@ pub fn full_config(
         json!({"clash_api": {"external_controller": format!("127.0.0.1:{api_port}")}}),
     );
     Value::Object(cfg)
+}
+
+/// `socks-auth-*` / `http-auth-*` overrides as mixed-inbound `users` (deduplicated).
+fn mixed_users(overrides: Option<&BTreeMap<String, String>>) -> Vec<Value> {
+    let mut users: Vec<Value> = Vec::new();
+    for prefix in ["socks", "http"] {
+        if let Some(auth) = local_auth(prefix, overrides) {
+            let user = json!({"username": auth.user, "password": auth.password});
+            if !users.contains(&user) {
+                users.push(user);
+            }
+        }
+    }
+    users
+}
+
+/// Provider geo-file URLs, used only when they are sing-box `.srs` rule-set URLs.
+#[derive(Default)]
+struct GeoUrls {
+    geosite: Option<String>,
+    geoip: Option<String>,
+}
+
+impl GeoUrls {
+    fn from_provider(provider: Option<&ProviderRouting>) -> Self {
+        let Some(provider) = provider else {
+            return Self::default();
+        };
+        Self {
+            geosite: provider
+                .geosite_url
+                .clone()
+                .filter(|url| url.ends_with(".srs")),
+            geoip: provider
+                .geoip_url
+                .clone()
+                .filter(|url| url.ends_with(".srs")),
+        }
+    }
+
+    fn geosite(&self, name: &str) -> String {
+        self.geosite.clone().unwrap_or_else(|| geosite_url(name))
+    }
+
+    fn geoip(&self, name: &str) -> String {
+        self.geoip.clone().unwrap_or_else(|| geoip_url(name))
+    }
 }
 
 fn non_empty(value: &Option<String>) -> Option<&str> {
@@ -484,7 +605,7 @@ fn transport_json(transport: &Transport) -> Option<Value> {
     }
 }
 
-fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>) -> Value {
+fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>, geo: &GeoUrls) -> Value {
     let mut m = Map::new();
     let mut rule_sets = Vec::new();
     let mut domain = Vec::new();
@@ -493,7 +614,7 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>) -> Value {
     for value in &rule.domains {
         if let Some(name) = value.strip_prefix("geosite:") {
             let tag = format!("geosite-{name}");
-            sets.insert(tag.clone(), geosite_url(name));
+            sets.insert(tag.clone(), geo.geosite(name));
             rule_sets.push(tag);
         } else if let Some(value) = value.strip_prefix("domain:") {
             domain_suffix.push(value.to_string());
@@ -512,7 +633,7 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>) -> Value {
             ip_private = true;
         } else if let Some(name) = value.strip_prefix("geoip:") {
             let tag = format!("geoip-{name}");
-            sets.insert(tag.clone(), geoip_url(name));
+            sets.insert(tag.clone(), geo.geoip(name));
             rule_sets.push(tag);
         } else {
             ip_cidr.push(value.clone());
@@ -955,5 +1076,188 @@ mod tests {
         let rules = cfg["route"]["rules"].as_array().unwrap();
         assert!(rules.iter().any(|r| r["ip_is_private"] == json!(true)));
         assert_eq!(cfg["route"]["final"], json!("proxy"));
+    }
+
+    use crate::model::RoutingRule;
+
+    fn provider_profile(global_proxy: bool, rules: Vec<RoutingRule>) -> ProviderRouting {
+        ProviderRouting {
+            name: "provider".into(),
+            enabled: true,
+            global_proxy,
+            rules,
+            ..ProviderRouting::default()
+        }
+    }
+
+    fn rule(domains: Vec<&str>, ips: Vec<&str>, action: RuleAction) -> RoutingRule {
+        RoutingRule {
+            domains: domains.into_iter().map(str::to_string).collect(),
+            ips: ips.into_iter().map(str::to_string).collect(),
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action,
+            enabled: true,
+        }
+    }
+
+    fn vless() -> Server {
+        server(Credentials::Vless {
+            uuid: "u".into(),
+            flow: None,
+            encryption: None,
+        })
+    }
+
+    #[test]
+    fn provider_rules_replace_preset_and_come_before_custom() {
+        let mut settings = Settings::default();
+        settings.routing.preset = RoutingPreset::BypassRu;
+        settings.routing.custom_rules = vec![rule(
+            vec!["domain:custom.example"],
+            Vec::new(),
+            RuleAction::Direct,
+        )];
+        let provider = provider_profile(
+            true,
+            vec![rule(vec!["geosite:google"], Vec::new(), RuleAction::Proxy)],
+        );
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &settings, false, None, 10819, &ctx);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        let google = rules
+            .iter()
+            .position(|r| r["rule_set"] == json!(["geosite-google"]))
+            .expect("provider rule");
+        let custom = rules
+            .iter()
+            .position(|r| r["domain_suffix"] == json!(["custom.example"]))
+            .expect("custom rule");
+        assert!(google < custom, "provider rules go before custom rules");
+        // BypassRu preset must be gone.
+        assert!(!rules
+            .iter()
+            .any(|r| r["rule_set"] == json!(["geosite-category-ads-all"])));
+        assert_eq!(cfg["route"]["final"], json!("proxy"));
+    }
+
+    #[test]
+    fn provider_global_proxy_false_final_direct() {
+        let provider = provider_profile(false, Vec::new());
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
+        assert_eq!(cfg["route"]["final"], json!("direct"));
+
+        let provider = provider_profile(true, Vec::new());
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
+        assert_eq!(cfg["route"]["final"], json!("proxy"));
+    }
+
+    #[test]
+    fn provider_dns_and_hosts_override() {
+        let mut provider = provider_profile(true, Vec::new());
+        provider.dns = Some(Dns {
+            remote: "https://9.9.9.9/dns-query".into(),
+            direct: "https://8.8.8.8/dns-query".into(),
+            fake_ip: false,
+        });
+        provider
+            .dns_hosts
+            .insert("example.com".into(), "10.0.0.1".into());
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
+
+        let servers = cfg["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers[0]["type"], json!("hosts"));
+        assert_eq!(servers[0]["predefined"]["example.com"], json!(["10.0.0.1"]));
+        let remote = servers
+            .iter()
+            .find(|s| s["tag"] == json!("remote"))
+            .unwrap();
+        assert_eq!(remote["server"], json!("9.9.9.9"));
+        let direct = servers
+            .iter()
+            .find(|s| s["tag"] == json!("direct"))
+            .unwrap();
+        assert_eq!(direct["server"], json!("8.8.8.8"));
+        assert_eq!(cfg["dns"]["rules"][0]["server"], json!("hosts"));
+        assert_eq!(cfg["dns"]["rules"][0]["domain"], json!(["example.com"]));
+    }
+
+    #[test]
+    fn provider_fake_dns_enables_fakeip_in_tun() {
+        let mut provider = provider_profile(true, Vec::new());
+        provider.fake_dns = true;
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), true, None, 10819, &ctx);
+        assert!(cfg["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["type"] == json!("fakeip")));
+    }
+
+    #[test]
+    fn provider_geo_urls_used_only_for_srs() {
+        let mut provider = provider_profile(
+            true,
+            vec![rule(
+                vec!["geosite:google"],
+                vec!["geoip:ru"],
+                RuleAction::Proxy,
+            )],
+        );
+        provider.geosite_url = Some("https://cdn.example/geosite.srs".into());
+        provider.geoip_url = Some("https://cdn.example/geoip.dat".into());
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: None,
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
+        let sets = cfg["route"]["rule_set"].as_array().unwrap();
+        assert!(sets.iter().any(|s| s["tag"] == json!("geosite-google")
+            && s["url"] == json!("https://cdn.example/geosite.srs")));
+        // The .dat geoip URL is not a sing-box rule-set: keep the default .srs base.
+        let geoip = sets.iter().find(|s| s["tag"] == json!("geoip-ru")).unwrap();
+        assert!(geoip["url"].as_str().unwrap().ends_with("geoip-ru.srs"));
+        assert!(geoip["url"]
+            .as_str()
+            .unwrap()
+            .contains("SagerNet/sing-geoip"));
+    }
+
+    #[test]
+    fn override_enables_mixed_auth() {
+        let overrides = BTreeMap::from([
+            ("socks-auth-mode".to_string(), "password".to_string()),
+            ("socks-auth-user".to_string(), "u".to_string()),
+            ("socks-auth-password".to_string(), "p".to_string()),
+        ]);
+        let ctx = ConnectContext {
+            provider: None,
+            overrides: Some(&overrides),
+        };
+        let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
+        let inbound = &cfg["inbounds"][0];
+        assert_eq!(inbound["type"], json!("mixed"));
+        assert_eq!(inbound["users"][0]["username"], json!("u"));
+        assert_eq!(inbound["users"][0]["password"], json!("p"));
     }
 }

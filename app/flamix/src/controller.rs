@@ -656,14 +656,31 @@ impl Controller {
         // Selecting another server while connected reconnects: tear the old one down first.
         self.disconnect_internal().await;
 
-        let (server, settings) = {
+        let (server, settings, provider, overrides) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let Some(server) = state.server(&server_id).cloned() else {
                 drop(state);
                 self.set_conn_state(ConnState::Disconnected, "Выберите сервер");
                 return;
             };
-            (server, state.settings.clone())
+            // Provider routing/overrides come from the subscription that owns the server.
+            // Local servers, and subscriptions with `ignore_provider_routing`, use defaults.
+            let sub = state
+                .subscriptions
+                .iter()
+                .find(|s| s.servers.iter().any(|srv| srv.id == server_id));
+            let (provider, overrides) = match sub {
+                Some(sub) if !sub.options.ignore_provider_routing => (
+                    sub.provider.routing.clone(),
+                    Some(sub.provider.app_overrides.clone()),
+                ),
+                _ => (None, None),
+            };
+            (server, state.settings.clone(), provider, overrides)
+        };
+        let ctx = config::ConnectContext {
+            provider: provider.as_ref(),
+            overrides: overrides.as_ref(),
         };
 
         if settings.mode == ConnectionMode::Tun && cfg!(windows) && !elevation::is_elevated() {
@@ -672,7 +689,7 @@ impl Controller {
         }
 
         self.set_conn_state(ConnState::Connecting, "Подключение…");
-        let plans = config::plan(&server, &settings);
+        let plans = config::plan_with(&server, &settings, &ctx);
         let run_dir = self.data_dir.join("run");
         let running = match runner::start(&plans, &run_dir).await {
             Ok(running) => running,
@@ -698,7 +715,11 @@ impl Controller {
             .then(|| runner::find_core(CoreKind::Xray).ok())
             .flatten();
 
-        let system_proxy = settings.mode == ConnectionMode::Proxy && settings.set_system_proxy;
+        // Local inbound auth breaks the OS system proxy (browsers do not send proxy
+        // credentials): keep working for HTTP clients only when auth is off.
+        let proxy_requested = settings.mode == ConnectionMode::Proxy && settings.set_system_proxy;
+        let auth_on = config::local_auth_enabled(overrides.as_ref());
+        let system_proxy = proxy_requested && !auth_on;
         if system_proxy {
             let spec = ProxySpec {
                 host: "127.0.0.1".to_string(),
@@ -728,7 +749,14 @@ impl Controller {
             system_proxy,
             totals: (0, 0),
         });
-        self.set_conn_state(ConnState::Connected, "Подключено");
+        if proxy_requested && auth_on {
+            self.set_conn_state(
+                ConnState::Connected,
+                "Системный прокси выключен: провайдер включил авторизацию",
+            );
+        } else {
+            self.set_conn_state(ConnState::Connected, "Подключено");
+        }
         self.set_speed(0, 0);
         self.start_ticker(server_id);
     }
