@@ -69,6 +69,7 @@ pub fn restart_elevated(args: &[String]) -> crate::Result<()> {
 #[cfg(target_os = "windows")]
 mod windows {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -95,7 +96,7 @@ mod windows {
                 file.as_ptr(),
                 params.as_ptr(),
                 std::ptr::null(),
-                1,
+                SW_SHOWNORMAL,
             )
         };
         if (result as usize) <= 32 {
