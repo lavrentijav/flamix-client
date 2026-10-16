@@ -2,7 +2,8 @@
 //!
 //! The subscription form is applied in two steps: [`Controller::import`] parses the URL and adds
 //! the subscription (and starts its fetch), then we fill the optional name / backup URLs by
-//! matching it by URL. See the note on [`add_subscription`] about the resulting race.
+//! matching it by id. Because the fetch and the meta write race, a bounded background task
+//! re-applies the meta once the first fetch finishes (see [`add_subscription`]).
 
 use crate::controller::Controller;
 use crate::{AddBridge, AppWindow};
@@ -10,6 +11,11 @@ use flamix_core::model::AppState;
 use flamix_core::{deeplink, link};
 use slint::{ComponentHandle, Weak};
 use std::sync::Arc;
+use std::time::Duration;
+
+/// Poll interval / tick budget while waiting for the first subscription fetch to finish.
+const META_REAPPLY_TICK: Duration = Duration::from_millis(250);
+const META_REAPPLY_TICKS: u32 = 240;
 
 /// Demo contents for `--demo` / screenshot mode.
 const DEMO_URL: &str = "https://sub.flamix.example/api/v1/client/subscribe?token=8f3c1a";
@@ -56,12 +62,11 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
 
 /// "Add" button: import a subscription URL, then apply the optional name / backup URLs.
 ///
-/// Note: [`Controller::import`] starts the subscription fetch immediately, before the name /
-/// backup URLs are filled in. The fetch clones the subscription at its start, and
-/// `subscription::update` keeps a user-visible name (it only overwrites the auto title), so the
-/// meta normally survives; but if the fetch clones before our `mutate`, the typed name is
-/// overwritten. The public controller API exposes no hook to set the meta before the fetch or to
-/// re-apply it after the fetch completes, so the meta is applied as early as possible here.
+/// [`Controller::import`] adds the subscription and immediately spawns its fetch, which clones
+/// the subscription before `subscription::update` rewrites it. If that clone happens before our
+/// `mutate`, the typed name / backup URLs are lost. The meta is therefore applied as early as
+/// possible, and while the first fetch is still pending a bounded background task re-applies it
+/// once the fetch finishes (detected through `last_update` / `last_error`).
 fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
     let Some(window) = ui.upgrade() else {
         return;
@@ -78,15 +83,34 @@ fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
 
     bridge.set_busy(true);
     ctrl.import(&url);
-    let found = ctrl.with_state(|state| state.subscriptions.iter().any(|s| s.url == url));
-    if !found {
+    let id = ctrl.with_state(|state| {
+        state
+            .subscriptions
+            .iter()
+            .rev()
+            .find(|s| s.url == url)
+            .map(|s| s.id.clone())
+    });
+    let Some(id) = id else {
         bridge.set_busy(false);
         set_status(&ui, "Не удалось распознать ссылку на подписку");
         return;
-    }
-    ctrl.mutate(|state| {
-        apply_subscription_meta(state, &url, &name, &backups);
+    };
+
+    // The fetch may still be pending; remember that so we can correct the meta afterwards.
+    let pending = ctrl.with_state(|state| {
+        state
+            .subscriptions
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.last_update.is_none() && s.last_error.is_none())
     });
+    ctrl.mutate(|state| {
+        apply_subscription_meta(state, &id, &name, &backups);
+    });
+    if pending && !(name.is_empty() && backups.is_empty()) {
+        schedule_meta_reapply(Arc::clone(&ctrl), id, name, backups);
+    }
 
     bridge.set_status("Подписка добавлена".into());
     bridge.set_url("".into());
@@ -94,6 +118,26 @@ fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
     bridge.set_backups("".into());
     bridge.set_busy(false);
     window.set_page(0);
+}
+
+/// Re-apply the user meta after the first fetch; the fetch may have overwritten it.
+fn schedule_meta_reapply(ctrl: Arc<Controller>, id: String, name: String, backups: Vec<String>) {
+    ctrl.runtime().spawn(async move {
+        for _ in 0..META_REAPPLY_TICKS {
+            tokio::time::sleep(META_REAPPLY_TICK).await;
+            let finished = ctrl.with_state(|state| {
+                state
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .is_none_or(|sub| sub.last_update.is_some() || sub.last_error.is_some())
+            });
+            if finished {
+                ctrl.mutate(|state| reapply_meta(state, &id, &name, &backups));
+                return;
+            }
+        }
+    });
 }
 
 /// "Импортировать" button: parse the pasted share links.
@@ -213,14 +257,9 @@ fn parse_backup_urls(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Apply the optional name / backup URLs to the subscription with this URL.
-fn apply_subscription_meta(
-    state: &mut AppState,
-    url: &str,
-    name: &str,
-    backups: &[String],
-) -> bool {
-    let Some(sub) = state.subscriptions.iter_mut().rev().find(|s| s.url == url) else {
+/// Apply the optional name / backup URLs to the subscription with this id.
+fn apply_subscription_meta(state: &mut AppState, id: &str, name: &str, backups: &[String]) -> bool {
+    let Some(sub) = state.subscriptions.iter_mut().find(|s| s.id == id) else {
         return false;
     };
     if !name.is_empty() {
@@ -230,6 +269,21 @@ fn apply_subscription_meta(
         sub.backup_urls = backups.to_vec();
     }
     true
+}
+
+/// Restore the user name and merge the user backup URLs, keeping any added by the provider.
+fn reapply_meta(state: &mut AppState, id: &str, name: &str, backups: &[String]) {
+    let Some(sub) = state.subscriptions.iter_mut().find(|s| s.id == id) else {
+        return;
+    };
+    if !name.is_empty() && sub.name != name {
+        sub.name = name.to_string();
+    }
+    for backup in backups {
+        if !sub.backup_urls.contains(backup) {
+            sub.backup_urls.push(backup.clone());
+        }
+    }
 }
 
 /// Result line for a share-link import (matches the controller's wording, skipped kept).
@@ -269,6 +323,10 @@ mod tests {
         state
     }
 
+    fn only_id(state: &AppState) -> String {
+        state.subscriptions[0].id.clone()
+    }
+
     #[test]
     fn validate_subscription_url_accepts_http_and_https() {
         assert!(validate_subscription_url("https://example.com/sub").is_ok());
@@ -300,13 +358,9 @@ mod tests {
     #[test]
     fn apply_subscription_meta_sets_name_and_backups() {
         let mut state = state_with_subscription("https://example.com/sub");
+        let id = only_id(&state);
         let backups = vec!["https://backup.example.com/sub".to_string()];
-        assert!(apply_subscription_meta(
-            &mut state,
-            "https://example.com/sub",
-            "My Sub",
-            &backups
-        ));
+        assert!(apply_subscription_meta(&mut state, &id, "My Sub", &backups));
         assert_eq!(state.subscriptions[0].name, "My Sub");
         assert_eq!(state.subscriptions[0].backup_urls, backups);
     }
@@ -314,26 +368,52 @@ mod tests {
     #[test]
     fn apply_subscription_meta_keeps_name_when_empty() {
         let mut state = state_with_subscription("https://example.com/sub");
+        let id = only_id(&state);
         let original = state.subscriptions[0].name.clone();
-        assert!(apply_subscription_meta(
-            &mut state,
-            "https://example.com/sub",
-            "",
-            &[]
-        ));
+        assert!(apply_subscription_meta(&mut state, &id, "", &[]));
         assert_eq!(state.subscriptions[0].name, original);
         assert!(state.subscriptions[0].backup_urls.is_empty());
     }
 
     #[test]
-    fn apply_subscription_meta_reports_missing_url() {
+    fn apply_subscription_meta_reports_missing_id() {
         let mut state = state_with_subscription("https://example.com/sub");
-        assert!(!apply_subscription_meta(
+        assert!(!apply_subscription_meta(&mut state, "missing", "N", &[]));
+    }
+
+    #[test]
+    fn reapply_meta_restores_name_and_merges_backups() {
+        let mut state = state_with_subscription("https://example.com/sub");
+        let id = only_id(&state);
+        // Simulate the fetch having overwritten the meta and added a provider backup.
+        state.subscriptions[0].name = "Provider title".to_string();
+        state.subscriptions[0].backup_urls = vec!["https://provider.example/sub".to_string()];
+        reapply_meta(
             &mut state,
-            "https://other.example/sub",
-            "N",
-            &[]
-        ));
+            &id,
+            "My Sub",
+            &[
+                "https://provider.example/sub".to_string(),
+                "https://mine.example/sub".to_string(),
+            ],
+        );
+        assert_eq!(state.subscriptions[0].name, "My Sub");
+        assert_eq!(
+            state.subscriptions[0].backup_urls,
+            vec![
+                "https://provider.example/sub".to_string(),
+                "https://mine.example/sub".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn reapply_meta_keeps_provider_name_when_no_user_name() {
+        let mut state = state_with_subscription("https://example.com/sub");
+        let id = only_id(&state);
+        state.subscriptions[0].name = "Provider title".to_string();
+        reapply_meta(&mut state, &id, "", &[]);
+        assert_eq!(state.subscriptions[0].name, "Provider title");
     }
 
     #[test]
