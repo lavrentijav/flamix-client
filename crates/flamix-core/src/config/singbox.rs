@@ -15,9 +15,6 @@ use crate::model::{
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
 
-const GEOSITE_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
-const GEOIP_BASE: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
-
 const PRIVATE_RANGES: [&str; 9] = [
     "10.0.0.0/8",
     "172.16.0.0/12",
@@ -416,7 +413,7 @@ fn build_config(
     {
         tracing::debug!("dns.serve_stale is Xray-only; ignored by sing-box");
     }
-    let geo = GeoUrls::from_provider(provider);
+    let geo = GeoUrls::new(settings, provider);
 
     let wireguard = matches!(primary.credentials, Credentials::Wireguard { .. });
     let proxy_out = match upstream_socks {
@@ -513,7 +510,7 @@ fn build_config(
     }
     let mut dns_rules = Vec::new();
     if provider.is_none() && settings.routing.preset == RoutingPreset::BypassRu {
-        rule_sets.insert("geosite-category-ru".into(), geosite_url("category-ru"));
+        rule_sets.insert("geosite-category-ru".into(), geo.geosite("category-ru"));
         dns_rules.push(json!({"rule_set": ["geosite-category-ru"], "server": "direct"}));
     }
     if fake_ip && tun {
@@ -692,30 +689,41 @@ fn mixed_users(settings: &Settings, overrides: Option<&BTreeMap<String, String>>
     users
 }
 
-/// Provider geo-file URLs, used only when they are sing-box `.srs` rule-set URLs.
-#[derive(Default)]
+/// Geo rule-set URLs for one config: the sing-box `.srs` bases from the settings
+/// [`GeoData`](crate::model::GeoData) source, with a provider `.srs` URL (when present and
+/// valid) overriding the base entirely.
 struct GeoUrls {
     geosite: Option<String>,
     geoip: Option<String>,
+    geosite_base: String,
+    geoip_base: String,
 }
 
 impl GeoUrls {
-    fn from_provider(provider: Option<&ProviderRouting>) -> Self {
-        let Some(provider) = provider else {
-            return Self::default();
-        };
+    fn new(settings: &Settings, provider: Option<&ProviderRouting>) -> Self {
+        let bases = crate::geo::urls(&settings.geo);
         Self {
-            geosite: provider.geosite_url.clone().filter(|url| is_srs_url(url)),
-            geoip: provider.geoip_url.clone().filter(|url| is_srs_url(url)),
+            geosite: provider
+                .and_then(|p| p.geosite_url.clone())
+                .filter(|url| is_srs_url(url)),
+            geoip: provider
+                .and_then(|p| p.geoip_url.clone())
+                .filter(|url| is_srs_url(url)),
+            geosite_base: bases.singbox_geosite_base,
+            geoip_base: bases.singbox_geoip_base,
         }
     }
 
     fn geosite(&self, name: &str) -> String {
-        self.geosite.clone().unwrap_or_else(|| geosite_url(name))
+        self.geosite
+            .clone()
+            .unwrap_or_else(|| geosite_url(&self.geosite_base, name))
     }
 
     fn geoip(&self, name: &str) -> String {
-        self.geoip.clone().unwrap_or_else(|| geoip_url(name))
+        self.geoip
+            .clone()
+            .unwrap_or_else(|| geoip_url(&self.geoip_base, name))
     }
 }
 
@@ -936,12 +944,12 @@ fn is_srs_url(url: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".srs")
 }
 
-fn geosite_url(name: &str) -> String {
-    format!("{GEOSITE_BASE}/geosite-{name}.srs")
+fn geosite_url(base: &str, name: &str) -> String {
+    format!("{base}/geosite-{name}.srs")
 }
 
-fn geoip_url(name: &str) -> String {
-    format!("{GEOIP_BASE}/geoip-{name}.srs")
+fn geoip_url(base: &str, name: &str) -> String {
+    format!("{base}/geoip-{name}.srs")
 }
 
 /// "20000-30000" / "20000-30000,40000" -> ["20000:30000", "40000"].
@@ -1503,13 +1511,14 @@ mod tests {
         let sets = cfg["route"]["rule_set"].as_array().unwrap();
         assert!(sets.iter().any(|s| s["tag"] == json!("geosite-google")
             && s["url"] == json!("https://cdn.example/GEOSITE.SRS?v=2#frag")));
-        // The .dat geoip URL is not a sing-box rule-set: keep the default .srs base.
+        // The .dat geoip URL is not a sing-box rule-set: keep the settings source's .srs base
+        // (the default "Freedom for Russia" lists).
         let geoip = sets.iter().find(|s| s["tag"] == json!("geoip-ru")).unwrap();
         assert!(geoip["url"].as_str().unwrap().ends_with("geoip-ru.srs"));
         assert!(geoip["url"]
             .as_str()
             .unwrap()
-            .contains("SagerNet/sing-geoip"));
+            .contains("runetfreedom/russia-v2ray-rules-dat"));
     }
 
     #[test]

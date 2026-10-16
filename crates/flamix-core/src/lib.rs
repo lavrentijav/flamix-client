@@ -4,6 +4,7 @@
 //! - [`link`]: share links (`vless://`, `vmess://`, ...) <-> [`model::Server`]
 //! - [`subscription`]: fetching/parsing subscriptions, headers, backup URLs
 //! - [`config`]: generating Xray / sing-box configs
+//! - [`geo`]: geo rule-database source -> download URLs
 //! - [`store`]: persisting [`model::AppState`]
 //! - [`ping`]: latency tests
 //! - [`country`]: flag emoji <-> ISO country code
@@ -15,6 +16,7 @@ pub mod config;
 pub mod country;
 pub mod deeplink;
 pub mod error;
+pub mod geo;
 pub mod link;
 pub mod model;
 pub mod ping;
