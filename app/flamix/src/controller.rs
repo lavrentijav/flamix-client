@@ -914,7 +914,7 @@ impl Controller {
         // Local inbound auth breaks the OS system proxy (browsers do not send proxy
         // credentials): keep working for HTTP clients only when auth is off.
         let proxy_requested = settings.mode == ConnectionMode::Proxy && settings.set_system_proxy;
-        let auth_on = config::local_auth_enabled(overrides.as_ref());
+        let auth_on = config::settings_auth_enabled(&settings, overrides.as_ref());
         let system_proxy = proxy_requested && !auth_on;
         if system_proxy {
             let spec = ProxySpec {
