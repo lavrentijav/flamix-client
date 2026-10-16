@@ -4,7 +4,12 @@
 //! URLs: the Xray `geosite.dat`/`geoip.dat` files and the sing-box `.srs` rule-set **bases**.
 //! This is pure — no network, no filesystem; the app performs the actual downloads.
 //!
-//! ## Pinned versions (keep in sync with `scripts/fetch-cores.sh`)
+//! ## Pinned versions
+//!
+//! The `.dat` assets are pinned by release tag; the sing-box `.srs` bases are rolling branches
+//! (upstream publishes `.srs` only on a branch / inside a per-tag zip), so the Xray `.dat` and
+//! the sing-box `.srs` can drift over time — accepted. `scripts/fetch-cores.sh` bundles its own
+//! `.dat` for the shipped packages and is a separate concern (not kept in sync with this file).
 //!
 //! - "Freedom for Russia" (`runetfreedom/russia-v2ray-rules-dat`) — the default source, the
 //!   RU-focused lists: Xray `.dat` assets from release tag **202610161855**.
