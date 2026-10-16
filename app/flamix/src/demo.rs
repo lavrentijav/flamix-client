@@ -133,7 +133,13 @@ fn select(ui: &AppWindow, subs: &Subs, locals: &Locals, id: &str) {
 
 fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
     let mut premium = vec![
-        server("de-1", "DE", "Frankfurt · Reality", "vless / tcp / reality", 42),
+        server(
+            "de-1",
+            "DE",
+            "Frankfurt · Reality",
+            "vless / tcp / reality",
+            42,
+        ),
         server("de-2", "DE", "Берлин · WebSocket", "vless / ws / tls", 88),
         server("nl-1", "NL", "Amsterdam · gRPC", "vless / grpc / tls", 121),
         server("ru-1", "RU", "Москва · WS", "vmess / ws / tls", 15),
@@ -462,7 +468,10 @@ pub fn screenshot(path: &Path, light: bool) -> anyhow::Result<()> {
     write_png(path, &buffer)
 }
 
-fn write_png(path: &Path, buffer: &slint::SharedPixelBuffer<slint::Rgb8Pixel>) -> anyhow::Result<()> {
+fn write_png(
+    path: &Path,
+    buffer: &slint::SharedPixelBuffer<slint::Rgb8Pixel>,
+) -> anyhow::Result<()> {
     let (width, height) = (buffer.width(), buffer.height());
     let mut data = Vec::with_capacity((width * height * 3) as usize);
     for px in buffer.as_slice() {
