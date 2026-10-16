@@ -45,6 +45,14 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let bridge = ui.global::<SettingsBridge>();
+            // A stale timer must not blank the status we are about to show.
+            status_timer.borrow().stop();
+            // The connection panel owns the same setting: mirror the live mode back so the two
+            // controls cannot drift apart.
+            if let Some(ctrl) = ctrl.as_ref() {
+                let tun = ctrl.with_state(|state| state.settings.mode) == ConnectionMode::Tun;
+                bridge.set_tun_mode(tun);
+            }
             let settings = read_bridge(&bridge, &current.borrow());
             publish_errors(&bridge, &validate(&settings));
             apply_theme(&ui, settings.theme);
@@ -79,21 +87,51 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
         }
     });
 
+    // The Proxy/TUN control writes the mode immediately (and reconnects): it is shared with the
+    // connection panel, so it must not go through the debounced snapshot save.
+    bridge.on_mode_changed({
+        let current = current.clone();
+        let ctrl = ctrl.cloned();
+        move |tun| {
+            let mode = if tun {
+                ConnectionMode::Tun
+            } else {
+                ConnectionMode::Proxy
+            };
+            current.borrow_mut().mode = mode;
+            let Some(ctrl) = ctrl.as_ref() else { return };
+            ctrl.mutate(move |state| state.settings.mode = mode);
+            ctrl.reconnect_if_connected();
+        }
+    });
+
     // Reset to defaults (already confirmed on the page).
     bridge.on_reset_confirmed({
         let ui_weak = ui.as_weak();
         let current = current.clone();
+        let status_timer = status_timer.clone();
         let ctrl = ctrl.cloned();
         move || {
             let Some(ui) = ui_weak.upgrade() else { return };
             let bridge = ui.global::<SettingsBridge>();
+            // Cancel any pending "Сохранено" timer that could blank the new status.
+            status_timer.borrow().stop();
             let defaults = Settings::default();
             write_bridge(&bridge, &defaults);
             publish_errors(&bridge, &validate(&defaults));
             *current.borrow_mut() = defaults.clone();
             bridge.set_reset_confirm(false);
+            // Preserve mode/routing (owned elsewhere) while resetting the rest.
             save(&ui, ctrl.as_ref(), &defaults);
             bridge.set_save_status("Сброшено".into());
+            let ui_weak = ui.as_weak();
+            status_timer
+                .borrow()
+                .start(TimerMode::SingleShot, STATUS_TIMEOUT, move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.global::<SettingsBridge>().set_save_status("".into());
+                    }
+                });
         }
     });
 
@@ -107,18 +145,21 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     });
 }
 
-/// Persist `settings` through the controller and reconnect the core when the change needs it.
+/// Persist the fields this page owns through the controller and reconnect when the core must be
+/// restarted. The write starts from the live state so fields owned elsewhere (`mode`, `routing`)
+/// are never reverted to a stale snapshot.
 fn save(ui: &AppWindow, ctrl: Option<&Arc<Controller>>, settings: &Settings) {
     apply_theme(ui, settings.theme);
     let Some(ctrl) = ctrl else { return };
 
-    let previous = ctrl.with_state(|state| state.settings.clone());
-    let reconnect = core_affecting_changed(&previous, settings);
-    let launch_changed = previous.launch_at_login != settings.launch_at_login;
-    let launch_at_login = settings.launch_at_login;
-    let next = settings.clone();
+    let live_before = ctrl.with_state(|state| state.settings.clone());
+    let effective = merge_owned(&live_before, settings);
+    let reconnect = core_affecting_changed(&live_before, &effective);
+    let launch_changed = live_before.launch_at_login != effective.launch_at_login;
+    let launch_at_login = effective.launch_at_login;
 
-    ctrl.mutate(move |state| state.settings = next);
+    let src = settings.clone();
+    ctrl.mutate(move |state| apply_owned_in_place(&mut state.settings, &src));
     if reconnect {
         ctrl.reconnect_if_connected();
     }
@@ -132,11 +173,41 @@ fn save(ui: &AppWindow, ctrl: Option<&Arc<Controller>>, settings: &Settings) {
     }
 }
 
+/// Copy the fields owned by this page from `src` into `live`, leaving `mode` (connection panel)
+/// and `routing` (routing page) untouched.
+fn apply_owned_in_place(live: &mut Settings, src: &Settings) {
+    live.socks_port = src.socks_port;
+    live.http_port = src.http_port;
+    live.allow_lan = src.allow_lan;
+    live.set_system_proxy = src.set_system_proxy;
+    live.proxy_bypass = src.proxy_bypass.clone();
+    live.dns = src.dns.clone();
+    live.tun_mtu = src.tun_mtu;
+    live.tun_stack = src.tun_stack.clone();
+    live.tun_ipv6 = src.tun_ipv6;
+    live.mux = src.mux;
+    live.default_fingerprint = src.default_fingerprint.clone();
+    live.ping_url = src.ping_url.clone();
+    live.ping_method = src.ping_method.clone();
+    live.launch_at_login = src.launch_at_login;
+    live.connect_on_launch = src.connect_on_launch;
+    live.minimize_to_tray = src.minimize_to_tray;
+    live.auto_update_subscriptions = src.auto_update_subscriptions;
+    live.theme = src.theme;
+    live.language = src.language.clone();
+    live.log_level = src.log_level.clone();
+}
+
+/// `live` with this page's fields taken from `src` (used for the change comparison).
+fn merge_owned(live: &Settings, src: &Settings) -> Settings {
+    let mut out = live.clone();
+    apply_owned_in_place(&mut out, src);
+    out
+}
+
 /// Mirror the theme into the UI immediately (System follows the app default = dark).
 fn apply_theme(ui: &AppWindow, theme: SettingsTheme) {
-    let dark = theme_is_dark(theme);
-    ui.set_dark(dark);
-    ui.global::<Theme>().set_dark(dark);
+    ui.global::<Theme>().set_dark(theme_is_dark(theme));
 }
 
 fn theme_is_dark(theme: SettingsTheme) -> bool {
@@ -265,6 +336,8 @@ fn core_affecting_changed(a: &Settings, b: &Settings) -> bool {
         || a.socks_port != b.socks_port
         || a.http_port != b.http_port
         || a.allow_lan != b.allow_lan
+        || a.set_system_proxy != b.set_system_proxy
+        || a.proxy_bypass != b.proxy_bypass
         || a.dns != b.dns
         || a.tun_mtu != b.tun_mtu
         || a.tun_stack != b.tun_stack
@@ -352,6 +425,7 @@ fn language_from_index(index: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flamix_core::model::{RoutingRule, RuleAction};
 
     fn settings() -> Settings {
         Settings::default()
@@ -453,6 +527,16 @@ mod tests {
         };
         assert!(core_affecting_changed(&base, &mux));
 
+        let system_proxy = Settings {
+            set_system_proxy: !base.set_system_proxy,
+            ..base.clone()
+        };
+        assert!(core_affecting_changed(&base, &system_proxy));
+
+        let mut bypass = base.clone();
+        bypass.proxy_bypass.push("example.com".into());
+        assert!(core_affecting_changed(&base, &bypass));
+
         // UI-only fields must not trigger a reconnect.
         let ui_only = Settings {
             minimize_to_tray: !base.minimize_to_tray,
@@ -461,5 +545,45 @@ mod tests {
             ..base.clone()
         };
         assert!(!core_affecting_changed(&base, &ui_only));
+    }
+
+    #[test]
+    fn theme_is_dark_for_all_variants() {
+        assert!(theme_is_dark(SettingsTheme::Dark));
+        assert!(!theme_is_dark(SettingsTheme::Light));
+        // System follows the app default (dark).
+        assert!(theme_is_dark(SettingsTheme::System));
+    }
+
+    #[test]
+    fn merge_owned_preserves_mode_and_routing() {
+        let mut live = settings();
+        live.mode = ConnectionMode::Tun;
+        live.routing.custom_rules.push(RoutingRule {
+            domains: vec!["geosite:category-ru".into()],
+            ips: Vec::new(),
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Direct,
+            enabled: true,
+        });
+
+        let mut edited = live.clone();
+        edited.mode = ConnectionMode::Proxy; // stale snapshot from this page
+        edited.routing.custom_rules.clear(); // another page owns routing
+        edited.mux = !live.mux;
+
+        let merged = merge_owned(&live, &edited);
+        assert_eq!(merged.mode, ConnectionMode::Tun);
+        assert_eq!(merged.routing.custom_rules.len(), 1);
+        assert_eq!(merged.mux, edited.mux);
+
+        // Applying in place from the raw snapshot keeps the live mode/routing too.
+        let mut target = live.clone();
+        apply_owned_in_place(&mut target, &edited);
+        assert_eq!(target.mode, ConnectionMode::Tun);
+        assert_eq!(target.routing.custom_rules.len(), 1);
+        assert_eq!(target.mux, edited.mux);
     }
 }

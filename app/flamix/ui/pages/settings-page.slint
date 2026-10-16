@@ -46,6 +46,7 @@ export global SettingsBridge {
     in-out property <bool> reset-confirm: false;
 
     callback changed();
+    callback mode-changed(bool);
     callback reset-confirmed();
     callback reset-cancelled();
 }
@@ -155,7 +156,7 @@ export component SettingsPage inherits Rectangle {
                                         clicked => {
                                             if (SettingsBridge.tun-mode) {
                                                 SettingsBridge.tun-mode = false;
-                                                SettingsBridge.changed();
+                                                SettingsBridge.mode-changed(false);
                                             }
                                         }
                                     }
@@ -176,7 +177,7 @@ export component SettingsPage inherits Rectangle {
                                         clicked => {
                                             if (!SettingsBridge.tun-mode) {
                                                 SettingsBridge.tun-mode = true;
-                                                SettingsBridge.changed();
+                                                SettingsBridge.mode-changed(true);
                                             }
                                         }
                                     }
