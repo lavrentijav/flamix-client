@@ -23,6 +23,12 @@ anyhow.workspace = true
 chrono.workspace = true
 # Clipboard reading for `import-clipboard`.
 arboard = "3"
+# Native file dialogs for the backup export / import on the About page (T20).
+# `xdg-portal` keeps Linux free of a GTK build dependency. rfd's sync dialog blocks on an
+# ashpd future: with `async-std` zbus runs its own reactor thread, so the call is safe from
+# the Slint UI thread (the app's tokio runtime lives on a different thread, so the `tokio`
+# feature would panic with "no reactor running").
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 # Only used by the hidden `--screenshot` mode (offscreen software renderer -> PNG).
 png = "0.17"
 

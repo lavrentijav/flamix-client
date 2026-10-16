@@ -7,11 +7,17 @@ export global AboutBridge {
     in property <string> version: "";
     in property <string> xray-version: "…";
     in property <string> singbox-version: "…";
+    in property <string> backup-status: "";
+    in-out property <bool> import-confirm: false;
 
     callback open-github();
     callback open-releases();
     callback open-issues();
     callback refresh-cores();
+    callback export();
+    callback import();
+    callback import-confirmed();
+    callback import-cancelled();
 }
 
 component CardTitle inherits Text {
@@ -175,6 +181,70 @@ export component AboutPage inherits Rectangle {
                         LicenceRow { name: "sing-box"; licence: "GPL-3.0"; }
                         LicenceRow { name: "Slint"; licence: "royalty-free / GPL-3.0"; }
                         LicenceRow { name: "Alfa-Bank icons"; licence: "MIT"; }
+                    }
+                }
+
+                // --- Backup -----------------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: Theme.radius;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: backup.preferred-height;
+                    backup := VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        CardTitle { text: "Резервная копия"; }
+                        Muted {
+                            text: "Сохраните все настройки, подписки, локальные серверы и статистику в один JSON-файл и восстановите их на этом или другом компьютере.";
+                        }
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Button {
+                                text: "Экспортировать…";
+                                clicked => { AboutBridge.export(); }
+                            }
+                            Button {
+                                text: "Импортировать…";
+                                clicked => { AboutBridge.import(); }
+                            }
+                        }
+                        if AboutBridge.import-confirm : Rectangle {
+                            background: Theme.control-bg;
+                            border-radius: 8px;
+                            border-width: 1px;
+                            border-color: Theme.stroke;
+                            height: confirm-row.preferred-height;
+                            confirm-row := HorizontalLayout {
+                                padding: 8px;
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                alignment: center;
+                                Text {
+                                    text: "Импортировать копию и заменить текущие настройки и серверы?";
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                    horizontal-stretch: 1;
+                                }
+                                Button {
+                                    text: "Да";
+                                    clicked => { AboutBridge.import-confirmed(); }
+                                }
+                                Button {
+                                    text: "Отмена";
+                                    clicked => { AboutBridge.import-cancelled(); }
+                                }
+                            }
+                        }
+                        if AboutBridge.backup-status != "" : Text {
+                            text: AboutBridge.backup-status;
+                            color: Theme.muted;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
                     }
                 }
 

@@ -10,6 +10,7 @@
 //! - [`deeplink`]: `flamix://`, `happ://`, `v2raytun://` import links
 #![forbid(unsafe_code)]
 
+pub mod backup;
 pub mod config;
 pub mod country;
 pub mod deeplink;
