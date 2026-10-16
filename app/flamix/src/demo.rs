@@ -4,7 +4,9 @@
 //! `[SubscriptionItem]` / `[ServerItem]` models are rebuilt on every change (see `rebuild`).
 
 use crate::flags;
+use crate::view;
 use crate::{AppWindow, ConnState, ServerItem, SubscriptionItem};
+use flamix_core::model::{AppState, ConnectionMode};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::path::Path;
@@ -420,8 +422,28 @@ pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Fill the window from the real persisted state (used by `--screenshot` without `--demo`).
+fn apply_state(ui: &AppWindow, state: &AppState) {
+    ui.set_subscriptions(view::model(view::build_subscriptions(
+        state,
+        "",
+        false,
+        &std::collections::HashSet::new(),
+    )));
+    ui.set_local_servers(view::model(view::build_local_servers(state, "", false)));
+    ui.set_selected_name(view::selected_name(state).into());
+    let iso = view::selected_iso(state);
+    if !iso.is_empty() {
+        ui.set_selected_flag(flags::flag(&iso));
+    }
+    ui.set_tun_mode(state.settings.mode == ConnectionMode::Tun);
+}
+
 /// Render the window offscreen (software renderer) and save it as a PNG.
-pub fn screenshot(path: &Path, light: bool) -> anyhow::Result<()> {
+///
+/// `state` is `Some` for the real data path (loaded from `FLAMIX_HOME`) and `None` for the
+/// `--demo` screenshot.
+pub fn screenshot(path: &Path, light: bool, state: Option<&AppState>) -> anyhow::Result<()> {
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
     struct ShotPlatform {
@@ -442,7 +464,10 @@ pub fn screenshot(path: &Path, light: bool) -> anyhow::Result<()> {
     .map_err(|e| anyhow::anyhow!("set_platform: {e}"))?;
 
     let ui = AppWindow::new()?;
-    setup(&ui)?;
+    match state {
+        Some(state) => apply_state(&ui, state),
+        None => setup(&ui)?,
+    }
 
     // The build host has no system fonts; use the bundled DejaVu family for the shot.
     ui.set_font_family("DejaVu Sans".into());

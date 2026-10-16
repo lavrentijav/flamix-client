@@ -15,12 +15,14 @@ path = "src/main.rs"
 flamix-core.workspace = true
 flamix-sys.workspace = true
 slint = { version = "1", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "accessibility"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["signal"] }
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+# Clipboard reading for `import-clipboard`.
+arboard = "3"
 # Only used by the hidden `--screenshot` mode (offscreen software renderer -> PNG).
 png = "0.17"
 

@@ -1,0 +1,197 @@
+{
+  "version": 1,
+  "device_id": "0123456789abcdef0123456789abcdef",
+  "selected_server": "5f0d2a1c9b8e7f60",
+  "subscriptions": [
+    {
+      "id": "sub-premium",
+      "name": "Flamix Premium",
+      "url": "https://example.com/sub/premium",
+      "update_interval_hours": 24,
+      "last_update": 1798675200,
+      "pinned": true,
+      "collapsed": false,
+      "traffic": {
+        "upload": 2147483648,
+        "download": 13958643712,
+        "total": 107374182400,
+        "expire": 1798761600
+      },
+      "announce": "Скорость удвоена до 1 Гбит/с",
+      "provider": {
+        "info_banner": {
+          "text": "Технические работы 20.10 в 03:00 UTC",
+          "color": "#3d7dff"
+        },
+        "update_always": false
+      },
+      "servers": [
+        {
+          "id": "5f0d2a1c9b8e7f60",
+          "name": "Frankfurt · Reality",
+          "country": "DE",
+          "address": "de1.example.com",
+          "port": 443,
+          "credentials": {
+            "protocol": "vless",
+            "uuid": "11111111-1111-1111-1111-111111111111",
+            "flow": "xtls-rprx-vision",
+            "encryption": "none"
+          },
+          "security": {
+            "type": "reality",
+            "sni": "www.microsoft.com",
+            "public_key": "rLj6M416xXQjTr7KlO_xpBxxpUaM5u_e_SOeNhHhtVQ",
+            "short_id": "abcd",
+            "spider_x": "/",
+            "fingerprint": "chrome"
+          },
+          "last_ping_ms": 42
+        },
+        {
+          "id": "1a2b3c4d5e6f7081",
+          "name": "Берлин · WebSocket",
+          "country": "DE",
+          "address": "de2.example.com",
+          "port": 443,
+          "credentials": {
+            "protocol": "vless",
+            "uuid": "22222222-2222-2222-2222-222222222222",
+            "flow": null,
+            "encryption": "none"
+          },
+          "transport": {
+            "network": "ws",
+            "path": "/ws",
+            "host": "de2.example.com"
+          },
+          "security": {
+            "type": "tls",
+            "sni": "de2.example.com",
+            "alpn": ["h2", "http/1.1"],
+            "fingerprint": "chrome",
+            "allow_insecure": false
+          },
+          "last_ping_ms": 88
+        },
+        {
+          "id": "9988776655443322",
+          "name": "Amsterdam · gRPC",
+          "country": "NL",
+          "address": "nl1.example.com",
+          "port": 443,
+          "credentials": {
+            "protocol": "trojan",
+            "password": "secret-nl"
+          },
+          "transport": {
+            "network": "grpc",
+            "service_name": "gsvc"
+          },
+          "security": {
+            "type": "tls",
+            "sni": "nl1.example.com",
+            "alpn": ["h2"],
+            "fingerprint": "chrome",
+            "allow_insecure": false
+          },
+          "traffic": {
+            "upload": 104857600,
+            "download": 3154116608,
+            "total": 5368709120,
+            "expire": 0
+          },
+          "last_ping_ms": 121
+        }
+      ]
+    },
+    {
+      "id": "sub-basic",
+      "name": "Базовый тариф",
+      "url": "https://example.com/sub/basic",
+      "update_interval_hours": 12,
+      "pinned": false,
+      "collapsed": false,
+      "traffic": {
+        "upload": 0,
+        "download": 0,
+        "total": 0,
+        "expire": 0
+      },
+      "servers": [
+        {
+          "id": "778899aabbccdde1",
+          "name": "Москва · WS",
+          "country": "RU",
+          "address": "ru1.example.com",
+          "port": 8443,
+          "credentials": {
+            "protocol": "vmess",
+            "uuid": "33333333-3333-3333-3333-333333333333",
+            "alter_id": 0,
+            "cipher": "auto"
+          },
+          "transport": {
+            "network": "ws",
+            "path": "/vm",
+            "host": "ru1.example.com"
+          },
+          "security": {
+            "type": "tls",
+            "sni": "ru1.example.com",
+            "alpn": [],
+            "fingerprint": "chrome",
+            "allow_insecure": false
+          },
+          "last_ping_ms": 15
+        },
+        {
+          "id": "aabbccddeeff0011",
+          "name": "Singapore · Hysteria2",
+          "country": "SG",
+          "address": "sg1.example.com",
+          "port": 443,
+          "credentials": {
+            "protocol": "hysteria2",
+            "password": "hy2-secret",
+            "obfs": "salamander",
+            "obfs_password": "obfs-pass"
+          },
+          "security": {
+            "type": "tls",
+            "sni": "sg1.example.com",
+            "alpn": ["h3"],
+            "fingerprint": "chrome",
+            "allow_insecure": false
+          },
+          "last_ping_ms": null
+        }
+      ]
+    }
+  ],
+  "local_servers": [
+    {
+      "id": "local-001",
+      "name": "Локальный сервер",
+      "country": "RU",
+      "address": "127.0.0.1",
+      "port": 1080,
+      "credentials": {
+        "protocol": "socks",
+        "username": null,
+        "password": null
+      },
+      "last_ping_ms": 7
+    }
+  ],
+  "settings": {
+    "mode": "proxy",
+    "socks_port": 10808,
+    "http_port": 10809,
+    "set_system_proxy": true,
+    "auto_update_subscriptions": true,
+    "minimize_to_tray": true,
+    "theme": "dark",
+    "language": "ru"
+  }
+}
