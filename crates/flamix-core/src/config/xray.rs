@@ -934,10 +934,11 @@ mod tests {
         assert_eq!(inbounds[0]["settings"]["udp"], json!(true));
         assert_eq!(
             inbounds[0]["sniffing"]["destOverride"],
-            json!(["http", "tls"])
+            json!(["http", "tls", "quic"])
         );
-        assert_eq!(inbounds[0]["sniffing"]["routeOnly"], json!(false));
-        assert_eq!(cfg["dns"]["enableParallelQuery"], json!(true));
+        assert_eq!(inbounds[0]["sniffing"]["routeOnly"], json!(true));
+        // `parallel` defaults off, so no Xray parallel-query flag (matches the old behaviour).
+        assert!(cfg["dns"].get("enableParallelQuery").is_none());
         assert!(cfg["dns"].get("serveStale").is_none());
         assert_eq!(inbounds[1]["tag"], json!("http"));
         assert_eq!(inbounds[1]["port"], json!(10809));

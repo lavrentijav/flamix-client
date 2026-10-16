@@ -62,6 +62,36 @@ pub fn local_auth_enabled(overrides: Option<&BTreeMap<String, String>>) -> bool 
     local_auth("socks", overrides).is_some() || local_auth("http", overrides).is_some()
 }
 
+/// True when the local inbounds will require authentication under the given settings and
+/// provider/Happ overrides.
+///
+/// This is the union of the two auth sources ([`effective_local_auth`]): a provider
+/// `socks-auth-*`/`http-auth-*` override, or the user `local_auth_user` + `local_auth_pass`
+/// when both are non-empty. Callers that only want to know "is auth on?" (e.g. the system-proxy
+/// decision in the app) should use this rather than re-deriving the precedence.
+pub fn settings_auth_enabled(
+    settings: &Settings,
+    overrides: Option<&BTreeMap<String, String>>,
+) -> bool {
+    local_auth_enabled(overrides)
+        || (!settings.local_auth_user.is_empty() && !settings.local_auth_pass.is_empty())
+}
+
+/// A copy of `settings` with the user local-inbound credentials stripped.
+///
+/// Used for the **internal** Xray hop of TUN mode: sing-box (which captured the TUN) dials
+/// this hop's SOCKS inbound without credentials, so a user `local_auth_user`/`local_auth_pass`
+/// must not turn the internal listener into an authenticated one (it would make TUN + an
+/// Xray-only transport + user auth unable to connect). Provider overrides are already absent
+/// there because the hop is built with [`ConnectContext::default`].
+fn internal_hop_settings(settings: &Settings) -> Settings {
+    Settings {
+        local_auth_user: String::new(),
+        local_auth_pass: String::new(),
+        ..settings.clone()
+    }
+}
+
 /// Local inbound credentials for `prefix`, with the provider/Happ override taking precedence
 /// over the user setting.
 ///
@@ -321,23 +351,51 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
             }
         }
         ConnectionMode::Tun => {
-            // sing-box captures the TUN and forwards to the protocol outbound, or to a
-            // local SOCKS inbound run by Xray when the transport is Xray-only (xhttp/kcp).
-            let upstream_socks = singbox::outbound(primary, settings)
-                .is_none()
-                .then_some(settings.socks_port);
+            // sing-box always captures the TUN (it is the only core with a `tun` inbound) and
+            // forwards to the protocol outbound, or to a local SOCKS inbound run by Xray when
+            // the transport is Xray-only (xhttp/kcp/quic) — or when `core_override` forces it.
+            //
+            // `core_override` selection in TUN:
+            // - "xray": run the internal Xray SOCKS hop for Xray-capable servers (falls back to
+            //   the native sing-box outbound with a warning for hysteria2/tuic);
+            // - "sing-box"/"auto": native sing-box outbound when it can express the server,
+            //   else the Xray hop (xhttp/kcp/quic have no sing-box outbound).
+            let native = singbox::outbound(primary, settings).is_some();
+            let xray_capable = supported_by(primary).contains(&CoreKind::Xray);
+            let force_xray = settings.core_override == "xray";
+            let upstream_socks = if native {
+                if force_xray && xray_capable {
+                    Some(settings.socks_port)
+                } else {
+                    if force_xray {
+                        tracing::warn!(
+                            "core_override=xray: server '{}' is not Xray-capable in TUN; using sing-box",
+                            primary.name
+                        );
+                    }
+                    None
+                }
+            } else {
+                if settings.core_override == "sing-box" {
+                    tracing::warn!(
+                        "core_override=sing-box: server '{}' needs the Xray hop in TUN; ignoring",
+                        primary.name
+                    );
+                }
+                Some(settings.socks_port)
+            };
             let mut plans = Vec::new();
             if upstream_socks.is_some() {
                 let api_port = api_port(CoreKind::Xray, settings);
                 // This Xray process is an internal hop: sing-box (which captured the TUN)
                 // owns routing and dials its local SOCKS inbound without credentials, so
-                // provider routing/auth must NOT be applied here — only to the user-facing
-                // inbounds of the TUN sing-box process below.
+                // provider routing/auth and the user `local_auth_*` must NOT reach it —
+                // only the user-facing inbounds of the TUN sing-box process below.
                 plans.push(CorePlan {
                     core: CoreKind::Xray,
                     config: xray::full_config_with(
                         primary,
-                        settings,
+                        &internal_hop_settings(settings),
                         api_port,
                         &ConnectContext::default(),
                     ),
@@ -585,6 +643,36 @@ mod tests {
     }
 
     #[test]
+    fn settings_auth_enabled_unions_provider_and_user() {
+        let manual = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "prov"),
+            ("socks-auth-password", "secret"),
+        ]);
+        let user = Settings {
+            local_auth_user: "user".into(),
+            local_auth_pass: "pass".into(),
+            ..Settings::default()
+        };
+
+        // Neither source: off.
+        assert!(!settings_auth_enabled(&Settings::default(), None));
+        // Provider override only.
+        assert!(settings_auth_enabled(&Settings::default(), Some(&manual)));
+        // User setting only.
+        assert!(settings_auth_enabled(&user, None));
+        // Both.
+        assert!(settings_auth_enabled(&user, Some(&manual)));
+
+        // A half-set user credential does not count.
+        let half = Settings {
+            local_auth_user: "user".into(),
+            ..Settings::default()
+        };
+        assert!(!settings_auth_enabled(&half, None));
+    }
+
+    #[test]
     fn core_override_forces_and_falls_back() {
         // One Xray-capable, one sing-box-capable server.
         let ws = server(
@@ -639,6 +727,94 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(plan(&hy2, &bogus)[0].core, CoreKind::SingBox);
+    }
+
+    #[test]
+    fn core_override_in_tun_mode() {
+        let ws = server(
+            Credentials::Vless {
+                uuid: "u".into(),
+                flow: None,
+                encryption: None,
+            },
+            Transport {
+                network: Network::Ws,
+                path: Some("/ws".into()),
+                ..Transport::default()
+            },
+        );
+        let tun = |core_override: &str| Settings {
+            mode: ConnectionMode::Tun,
+            core_override: core_override.into(),
+            ..Settings::default()
+        };
+
+        // sing-box always captures the TUN; auto runs the native sing-box outbound.
+        let plans = plan(&ws, &tun("auto"));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::SingBox);
+        assert_eq!(plans[0].config["outbounds"][0]["type"], "vless");
+
+        // "sing-box" stays native.
+        let plans = plan(&ws, &tun("sing-box"));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].config["outbounds"][0]["type"], "vless");
+
+        // "xray" forces the internal Xray hop for an Xray-capable server.
+        let plans = plan(&ws, &tun("xray"));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        assert_eq!(plans[1].core, CoreKind::SingBox);
+        assert_eq!(plans[1].config["outbounds"][0]["type"], "socks");
+
+        // "xray" is impossible for hysteria2: warn and keep the native sing-box outbound.
+        let hy2 = server(
+            Credentials::Hysteria2 {
+                password: "p".into(),
+                obfs: None,
+                obfs_password: None,
+                ports: None,
+                up_mbps: None,
+                down_mbps: None,
+            },
+            Transport::default(),
+        );
+        let plans = plan(&hy2, &tun("xray"));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].config["outbounds"][0]["type"], "hysteria2");
+
+        // "sing-box" is impossible for the xhttp chain: warn and keep the Xray hop.
+        let plans = plan(&vless_xhttp(), &tun("sing-box"));
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        assert_eq!(plans[1].config["outbounds"][0]["type"], "socks");
+    }
+
+    #[test]
+    fn tun_internal_xray_hop_has_no_user_auth() {
+        // A TUN + xhttp (Xray-only transport) + user local auth: the internal Xray hop must
+        // NOT require credentials, because sing-box dials it without any.
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            local_auth_user: "user".into(),
+            local_auth_pass: "pass".into(),
+            ..Settings::default()
+        };
+        let plans = plan(&vless_xhttp(), &settings);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        let socks_in = &plans[0].config["inbounds"][0];
+        assert_eq!(socks_in["tag"], "socks");
+        assert_eq!(socks_in["settings"]["auth"], "noauth");
+        assert!(socks_in["settings"].get("accounts").is_none());
+
+        // TUN mode has no user-facing mixed inbound (the TUN is the boundary), so the user
+        // credentials never leak into the sing-box config either.
+        assert!(plans[1].config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|inbound| inbound["type"] != json!("mixed")));
     }
 
     #[test]
@@ -1824,6 +2000,39 @@ mod validation {
                 CoreKind::SingBox,
                 &cfg,
                 &format!("overhaul/tun/{icmp}/sing-box"),
+            ));
+        }
+        report(problems);
+    }
+
+    /// TUN + an Xray-only transport + user local auth: both cores must accept the chain, and
+    /// the internal Xray hop must not require credentials.
+    #[test]
+    fn tun_user_auth_internal_hop_is_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let Some((_, srv)) = samples().into_iter().find(|(n, _)| *n == "vless-xhttp") else {
+            return;
+        };
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            local_auth_user: "user".into(),
+            local_auth_pass: "pass".into(),
+            ..Settings::default()
+        };
+        let plans = super::plan(&srv, &settings);
+        assert_eq!(plans.len(), 2, "xhttp chain must be xray + sing-box");
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        // The internal hop carries no auth (sing-box dials it without credentials).
+        assert_eq!(plans[0].config["inbounds"][0]["settings"]["auth"], "noauth");
+        let mut problems = Vec::new();
+        for plan in &plans {
+            problems.extend(check_core(
+                plan.core,
+                &plan.config,
+                &format!("tun-user-auth/{}", plan.core.binary_name()),
             ));
         }
         report(problems);

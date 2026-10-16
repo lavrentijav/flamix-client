@@ -443,8 +443,10 @@ fn build_config(
             sniff.insert("sniffer".into(), json!(sniffer));
         }
         route_rules.push(Value::Object(sniff));
-        // `route_only` (sniff for routing without overriding the destination) has no sing-box
-        // equivalent: the `sniff` action always feeds the sniffed domain into routing.
+        // LIMITATION: `route_only` (Xray: sniff for routing but do not override the destination
+        // the outbound dials) has no sing-box equivalent. The `sniff` action always makes the
+        // sniffed domain the destination, and sing-box has no "sniff without override" switch,
+        // so the flag is ignored (noted for the user, never a config failure).
         if settings.route_only {
             tracing::debug!("settings.route_only is Xray-only; ignored by sing-box");
         }
@@ -583,7 +585,9 @@ fn build_config(
         }));
     } else if upstream_socks.is_none() {
         // With an upstream SOCKS chain the Xray process binds the local listener.
-        // sing-box's `mixed` inbound always serves UDP, so `udp_enabled=false` is noted only.
+        // LIMITATION: sing-box's `mixed` inbound always serves UDP (TCP + UDP on one port);
+        // there is no per-inbound UDP toggle, so `udp_enabled=false` only applies to the Xray
+        // inbound. Noted for the user, never a config failure.
         if !settings.udp_enabled {
             tracing::debug!("settings.udp_enabled=false has no sing-box mixed equivalent; ignored");
         }
@@ -1209,7 +1213,7 @@ mod tests {
         let rules = cfg["route"]["rules"].as_array().unwrap();
         assert_eq!(
             rules[0],
-            json!({"action": "sniff", "sniffer": ["http", "tls"]})
+            json!({"action": "sniff", "sniffer": ["http", "tls", "quic"]})
         );
         assert_eq!(rules[1], json!({"protocol": "dns", "action": "hijack-dns"}));
         assert!(rules
@@ -1276,7 +1280,7 @@ mod tests {
             json!(["172.19.0.1/30", "fdfe:dcba:9876::1/126"])
         );
         assert_eq!(cfg["inbounds"][0]["auto_route"], json!(true));
-        assert_eq!(cfg["inbounds"][0]["strict_route"], json!(false));
+        assert_eq!(cfg["inbounds"][0]["strict_route"], json!(true));
         assert!(cfg["inbounds"][0]["route_exclude_address"]
             .as_array()
             .unwrap()
@@ -1533,7 +1537,7 @@ mod tests {
         let rules = cfg["route"]["rules"].as_array().unwrap();
         assert_eq!(
             rules[0],
-            json!({"action": "sniff", "sniffer": ["http", "tls"]})
+            json!({"action": "sniff", "sniffer": ["http", "tls", "quic"]})
         );
 
         // Sniffing off: no `sniff` action at all.
