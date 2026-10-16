@@ -93,5 +93,25 @@ Flamix — обычный Cargo-workspace. Нужен стабильный Rust 
 ## 5. CI
 
 `.github/workflows/ci.yml` на push/PR в `main` гоняет `fmt`, `clippy` и тесты на Linux,
-плюс `cargo check -p flamix` на Windows и macOS. `.github/workflows/release.yml` по тегу `v*`
-(или вручную) собирает все пакеты и прикрепляет их вместе с `SHA256SUMS.txt` к GitHub Release.
+плюс `cargo clippy --workspace --all-targets -- -D warnings` и `cargo test -p flamix-core -p flamix-sys`
+на Windows и macOS. `.github/workflows/release.yml` по тегу `v*` (или вручную) собирает все пакеты и
+прикрепляет их вместе с `SHA256SUMS.txt` к GitHub Release.
+
+## 6. Cross-checking Windows from Linux
+
+Windows-сборку можно проверять без Windows-машины — на билд-сервере через `scripts/ru1`:
+
+    scripts/ru1 scripts/check-windows.sh
+
+`scripts/check-windows.sh` кросс-компилирует весь workspace под `x86_64-pc-windows-gnu`
+(`cargo zigbuild`, запасной вариант — `cargo check`) и прогоняет
+`cargo clippy --target x86_64-pc-windows-gnu --workspace --all-targets -- -D warnings`.
+Нужны zig (только как C-тулчейн/линкер для крейтов вроде `ring`; Zig-кода в репозитории нет)
+и `cargo-zigbuild`:
+
+    rustup target add x86_64-pc-windows-gnu
+    cargo install --locked cargo-zigbuild
+
+Крейт `flamix-sys` так же можно проверить под `aarch64-apple-darwin`
+(`cargo check --target aarch64-apple-darwin -p flamix-sys` с zig-компилятором C); полное
+приложение требует macOS SDK и покрывается CI на macOS.

@@ -24,10 +24,12 @@ const LOG_CAP: usize = 500;
 const STOP_FILE: &str = "stop";
 
 /// How long `stop` waits for the root watchdog to tear its core down.
+#[cfg(unix)]
 const ELEVATED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long the app waits for a freshly launched elevated core to report its pid.
 /// Generous because the polkit password prompt is interactive.
+#[cfg(unix)]
 const ELEVATED_PID_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[cfg(windows)]
