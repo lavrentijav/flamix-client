@@ -4,6 +4,7 @@
 //! persists it, or hands work to the multi-thread tokio runtime; background results are pushed
 //! back with `Weak::upgrade_in_event_loop`.
 
+use crate::instance;
 use crate::view;
 use crate::{flags, AppWindow, ConnState};
 use flamix_core::config::{self, CoreKind};
@@ -11,7 +12,7 @@ use flamix_core::model::{AppState, ConnectionMode, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, link, ping, provider_routing};
 use flamix_sys::sysproxy::ProxySpec;
-use flamix_sys::{elevation, runner, stats, sysproxy};
+use flamix_sys::{autostart, elevation, runner, stats, sysproxy};
 use slint::{ComponentHandle, Weak};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -151,6 +152,23 @@ fn links_status(added: usize, skipped: usize) -> String {
     text
 }
 
+/// Extract the import string (positional deep link or `--import <value>`) from raw args.
+pub(crate) fn extract_import(args: &[String]) -> Option<String> {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--screenshot" => {
+                let _ = it.next();
+            }
+            "--import" => return it.next().cloned(),
+            "--light" | "--demo" | "--minimized" | "--" => {}
+            other if other.starts_with('-') => {}
+            other => return Some(other.to_string()),
+        }
+    }
+    None
+}
+
 /// Should this subscription be refreshed now? (`update_always` or its interval elapsed.)
 fn should_update(sub: &Subscription, now: i64) -> bool {
     if sub.provider.update_always {
@@ -219,7 +237,7 @@ async fn clear_system_proxy() -> Result<(), String> {
 }
 
 /// Random hex string of `bytes` bytes (16 chars for 8 bytes).
-fn random_hex(bytes: usize) -> String {
+pub(crate) fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,6 +321,10 @@ impl Controller {
                 signal.initiate_shutdown();
             }
         });
+        let autostart = Arc::clone(&controller);
+        controller
+            .rt
+            .spawn(async move { autostart.sync_autostart().await });
         controller
     }
 
@@ -405,6 +427,16 @@ impl Controller {
                 Err(_) => this.set_status("Буфер обмена пуст"),
             }
         });
+    }
+
+    /// Handle arguments forwarded by a second launch: import and bring the window to front.
+    pub fn handle_remote_args(self: &Arc<Self>, args: Vec<String>) {
+        let _ = self.ui.upgrade_in_event_loop(|ui| {
+            let _ = ui.show();
+        });
+        if let Some(text) = extract_import(&args) {
+            self.import_text(&text);
+        }
     }
 
     /// Queue a fetch for one subscription (bounded by the global semaphore).
@@ -838,6 +870,26 @@ impl Controller {
         clear_proxy_marker(&self.data_dir);
     }
 
+    /// Make the OS autostart entry match `settings.launch_at_login`.
+    async fn sync_autostart(self: Arc<Self>) {
+        let desired = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.settings.launch_at_login
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            if autostart::is_enabled() == desired {
+                return Ok(());
+            }
+            autostart::set_enabled(desired)
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => tracing::warn!(%err, "could not update autostart"),
+            Err(err) => tracing::warn!(%err, "autostart task failed"),
+        }
+    }
+
     fn mode_changed(self: &Arc<Self>, tun: bool) {
         if tun && cfg!(windows) && !elevation::is_elevated() {
             self.set_status("Для TUN нужен запуск от администратора");
@@ -874,6 +926,7 @@ impl Controller {
         let args: Vec<String> = std::env::args().skip(1).collect();
         match elevation::restart_elevated(&args) {
             Ok(()) => {
+                let _ = std::fs::remove_file(instance::instance_path(&self.data_dir));
                 let _ = slint::quit_event_loop();
             }
             Err(err) => self.set_status(format!("Не удалось перезапустить: {err}")),
@@ -976,6 +1029,7 @@ impl Controller {
             if let Err(err) = this.persist.save_now(&snapshot) {
                 tracing::warn!(%err, "could not save state on exit");
             }
+            let _ = std::fs::remove_file(instance::instance_path(&this.data_dir));
             let _ = slint::quit_event_loop();
         });
     }
@@ -1353,5 +1407,26 @@ mod tests {
         assert_eq!(first_line("\n\n  hello \nworld"), "hello");
         assert_eq!(first_line("   "), "");
         assert_eq!(first_line("core exited: boom\nmore"), "core exited: boom");
+    }
+
+    #[test]
+    fn extract_import_handles_positional_and_flag() {
+        assert_eq!(
+            extract_import(&["--demo".to_string(), "flamix://x".to_string()]),
+            Some("flamix://x".to_string())
+        );
+        assert_eq!(
+            extract_import(&["--import".to_string(), "https://e/sub".to_string()]),
+            Some("https://e/sub".to_string())
+        );
+        assert_eq!(
+            extract_import(&[
+                "--screenshot".to_string(),
+                "out.png".to_string(),
+                "https://e/sub".to_string()
+            ]),
+            Some("https://e/sub".to_string())
+        );
+        assert_eq!(extract_import(&["--demo".to_string()]), None);
     }
 }
