@@ -89,7 +89,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         let rt = build_runtime()?;
         let state = persist::load(&data_dir)?;
-        Some(Controller::new(&ui, data_dir, rt, state))
+        Some(Controller::new(&ui, data_dir, rt, state, args.import.clone()))
     };
 
     if args.minimized {
