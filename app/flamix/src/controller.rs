@@ -11,7 +11,7 @@ use flamix_core::config::{self, CoreKind};
 use flamix_core::model::ExitIp;
 use flamix_core::model::{AppState, ConnectionMode, Server, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
-use flamix_core::{deeplink, link, ping, provider_routing};
+use flamix_core::{deeplink, geo, link, ping, provider_routing};
 use flamix_sys::sysproxy::ProxySpec;
 use flamix_sys::{autostart, elevation, runner, stats, sysproxy};
 use slint::{ComponentHandle, Weak};
@@ -35,6 +35,11 @@ const EXIT_PROBE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// Per-request timeout while probing an exit IP through a core.
 const EXIT_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How old the downloaded geo databases (`geosite.dat`/`geoip.dat`) may get before a connect
+/// refreshes them. Seven days: the rule lists change rarely, so this keeps connect fast while
+/// still picking up updates within a week. The refresh is best-effort (see [`Controller::connect`]).
+const GEO_MAX_AGE: i64 = 7 * 24 * 3600;
 
 /// Human status while a batch exit-IP probe runs: `"Проверка IP: 3/12 …"`.
 fn probe_progress_text(done: usize, total: usize) -> String {
@@ -442,6 +447,8 @@ pub struct Controller {
     pub(crate) connect_epoch: AtomicU64,
     /// True while a batch exit-IP probe is running (only one at a time).
     pub(crate) probing: Arc<AtomicBool>,
+    /// True while a manual geo database refresh is running (only one at a time).
+    pub(crate) geo_updating: Arc<AtomicBool>,
     /// Generation counter bumped on every disconnect; the passive exit-IP poller subscribes
     /// to it so a disconnect cancels its wait immediately instead of after the full interval.
     pub(crate) exit_probe_cancel: tokio::sync::watch::Sender<u64>,
@@ -470,6 +477,7 @@ impl Controller {
             connecting: Arc::new(AtomicBool::new(false)),
             connect_epoch: AtomicU64::new(0),
             probing: Arc::new(AtomicBool::new(false)),
+            geo_updating: Arc::new(AtomicBool::new(false)),
             exit_probe_cancel: tokio::sync::watch::channel(0).0,
         });
         controller.wire(ui);
@@ -886,8 +894,30 @@ impl Controller {
         };
         // Only a real cluster moves the counters to the `node-N` outbounds.
         let failover = plans_use_failover(&plans);
+        let geo_dir = self.data_dir.join("geo");
+        // Best-effort geo refresh before the core starts: only Xray reads the local databases.
+        // A failed download must never break the connection — the previously downloaded files
+        // stay usable, and if there are none Xray itself reports the missing geo. Only a
+        // successful download touches `geo_updated`.
+        //
+        // Single-writer: `geo::ensure` writes `<dest>.part` and renames over the same
+        // `geosite.dat`/`geoip.dat`, so it must never run concurrently with the manual
+        // `update_geo` refresh (which already refuses while connecting). If a manual refresh is
+        // in flight, skip this one; the running/next connect uses whatever is already on disk.
+        if self.geo_updating.load(Ordering::SeqCst) {
+            tracing::debug!("skipping the geo refresh: a manual update is in flight");
+        } else {
+            match geo::ensure(&geo_dir, &settings.geo, GEO_MAX_AGE).await {
+                Ok(status) if status.downloaded => {
+                    let now = chrono::Utc::now().timestamp();
+                    self.mutate(|state| state.geo_updated = now);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "geo database refresh failed; continuing"),
+            }
+        }
         let run_dir = self.data_dir.join("run");
-        let running = match runner::start(&plans, &run_dir).await {
+        let running = match runner::start(&plans, &run_dir, Some(&geo_dir)).await {
             Ok(running) => running,
             Err(err) => {
                 self.set_conn_state(
@@ -1119,6 +1149,9 @@ impl Controller {
     /// between reservation and `runner::start` (a small TOCTOU window).
     async fn probe_one_exit(self: &Arc<Self>, state: &AppState, id: &str) -> Option<String> {
         let run_dir = self.data_dir.join("run").join("exit-probe");
+        // The throwaway core uses the same routing presets (BypassRu resolves geosite/geoip), so
+        // it must see the downloaded geo dir too; no refresh is needed here.
+        let geo_dir = self.data_dir.join("geo");
         for _attempt in 0..2 {
             let base = reserve_port_block(PROBE_PORT_SPAN).await?;
             let server = state.server(id).cloned()?;
@@ -1127,7 +1160,7 @@ impl Controller {
             settings.socks_port = base;
             settings.http_port = base.saturating_add(1);
             let plans = config::plan(&server, &settings);
-            match runner::start(&plans, &run_dir).await {
+            match runner::start(&plans, &run_dir, Some(&geo_dir)).await {
                 Ok(running) => {
                     let proxy = format!("socks5h://127.0.0.1:{base}");
                     let ip = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await;
@@ -1678,6 +1711,42 @@ impl Controller {
     /// Show a line in the status text of the connection panel.
     pub fn status(&self, text: impl Into<String>) {
         self.set_status(text);
+    }
+
+    /// Manually refresh the geo databases (settings button). Refuses while a core is running
+    /// (a connect, a live connection, or a batch exit-IP probe — those own the cores and ports);
+    /// otherwise forces a download (`max_age = 0`) on the runtime. Guarded against concurrent
+    /// runs by [`Controller::geo_updating`], which is released on every path.
+    pub fn update_geo(self: &Arc<Self>) {
+        if self.is_connected()
+            || self.connecting.load(Ordering::SeqCst)
+            || self.probing.load(Ordering::SeqCst)
+        {
+            self.status("Сначала отключитесь");
+            return;
+        }
+        if self.geo_updating.swap(true, Ordering::SeqCst) {
+            self.status("Обновление геоданных уже выполняется");
+            return;
+        }
+        let guard = ProbeGuard(Arc::clone(&self.geo_updating));
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            // Keep the guard alive for the whole task; it clears the flag on drop, even on panic.
+            let _guard = guard;
+            let geo_dir = this.data_dir.join("geo");
+            let geo = this.with_state(|state| state.settings.geo.clone());
+            match geo::ensure(&geo_dir, &geo, 0).await {
+                Ok(status) if status.downloaded => {
+                    let now = chrono::Utc::now().timestamp();
+                    this.mutate(|state| state.geo_updated = now);
+                    this.set_status("Геоданные обновлены");
+                }
+                // Nothing to fetch (e.g. a Custom source with empty URLs): don't claim an update.
+                Ok(_) => this.set_status("Геоданные не настроены"),
+                Err(err) => this.set_status(format!("Ошибка обновления геоданных: {err}")),
+            }
+        });
     }
 }
 

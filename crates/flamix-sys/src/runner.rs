@@ -162,7 +162,17 @@ impl Running {
 /// Write each plan's config to `<work_dir>/<core>.json` and start the processes in order
 /// (Xray before sing-box). Elevated plans go through [`crate::elevation`]. Fails if a
 /// process exits within 1.5 s (error carries its last log lines).
-pub async fn start(plans: &[CorePlan], work_dir: &Path) -> crate::Result<Running> {
+///
+/// `geo_dir` is the directory containing the Xray `geosite.dat`/`geoip.dat` databases. When
+/// `Some`, Xray cores (normal and elevated) get `XRAY_LOCATION_ASSET` pointing there, so
+/// `geoip:`/`geosite:` rules resolve from the downloaded files. When `None` the variable is
+/// left unset and the core falls back to the directory next to its binary. sing-box is
+/// unaffected: its config uses remote `.srs` rule-sets, not local geo files.
+pub async fn start(
+    plans: &[CorePlan],
+    work_dir: &Path,
+    geo_dir: Option<&Path>,
+) -> crate::Result<Running> {
     tokio::fs::create_dir_all(work_dir).await?;
     // A stop file left over from a previous run must not kill the new core immediately.
     let _ = tokio::fs::remove_file(work_dir.join(STOP_FILE)).await;
@@ -177,7 +187,7 @@ pub async fn start(plans: &[CorePlan], work_dir: &Path) -> crate::Result<Running
     let mut procs: Vec<Proc> = Vec::new();
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     for plan in ordered {
-        match spawn_one(plan, work_dir, &log, &mut tasks).await {
+        match spawn_one(plan, work_dir, geo_dir, &log, &mut tasks).await {
             Ok(proc) => procs.push(proc),
             Err(e) => {
                 for task in tasks {
@@ -217,6 +227,7 @@ pub async fn start(plans: &[CorePlan], work_dir: &Path) -> crate::Result<Running
 async fn spawn_one(
     plan: &CorePlan,
     work_dir: &Path,
+    geo_dir: Option<&Path>,
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
@@ -228,10 +239,27 @@ async fn spawn_one(
 
     let binary = find_core(plan.core)?;
     if plan.elevated {
-        spawn_elevated(plan, &binary, &config_path, work_dir, log, tasks).await
+        spawn_elevated(plan, &binary, &config_path, work_dir, geo_dir, log, tasks).await
     } else {
         let args = core_args(plan.core, &config_path, work_dir);
-        spawn_command(binary.as_os_str(), &args, log, tasks).await
+        spawn_command(
+            binary.as_os_str(),
+            &args,
+            xray_geo(plan.core, geo_dir),
+            log,
+            tasks,
+        )
+        .await
+    }
+}
+
+/// The `XRAY_LOCATION_ASSET` value a plan should inherit: only Xray reads the local geo
+/// databases, so sing-box always gets `None` even when a geo dir was supplied.
+fn xray_geo(core: CoreKind, geo_dir: Option<&Path>) -> Option<&Path> {
+    if core == CoreKind::Xray {
+        geo_dir
+    } else {
+        None
     }
 }
 
@@ -251,6 +279,7 @@ fn core_args(core: CoreKind, config_path: &Path, work_dir: &Path) -> Vec<OsStrin
 async fn spawn_command(
     program: &OsStr,
     args: &[OsString],
+    geo_dir: Option<&Path>,
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
@@ -259,6 +288,11 @@ async fn spawn_command(
         .kill_on_drop(true)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // Point Xray at the downloaded geo databases. Unset when no geo dir was supplied, so the
+    // core keeps its default (the directory next to its binary).
+    if let Some(dir) = geo_dir {
+        cmd.env("XRAY_LOCATION_ASSET", dir);
+    }
     #[cfg(windows)]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -289,12 +323,19 @@ fn shell_quote(s: &str) -> String {
 }
 
 /// The body of the root watchdog script. `core_cmd`, `log`, `pid` and `stop` must already be
-/// shell-quoted. The app pid is passed as `$1`.
+/// shell-quoted. `env_prefix` is an already-quoted `export …; ` prelude (empty when the core
+/// needs no extra environment). The app pid is passed as `$1`.
 #[cfg(unix)]
-fn watchdog_script_body(core_cmd: &str, log: &str, pid: &str, stop: &str) -> String {
+fn watchdog_script_body(
+    core_cmd: &str,
+    env_prefix: &str,
+    log: &str,
+    pid: &str,
+    stop: &str,
+) -> String {
     format!(
         "app_pid=$1\n\
-         {core_cmd} > {log} 2>&1 &\n\
+         {env_prefix}{core_cmd} > {log} 2>&1 &\n\
          core_pid=$!\n\
          printf '%s\\n' \"$core_pid\" > {pid}\n\
          while kill -0 \"$app_pid\" 2>/dev/null && [ ! -e {stop} ] && kill -0 \"$core_pid\" 2>/dev/null; do\n\
@@ -316,6 +357,10 @@ fn watchdog_script_body(core_cmd: &str, log: &str, pid: &str, stop: &str) -> Str
 /// `<work_dir>/<core>.log`, then loops until the app pid (`$1`) is gone, `<work_dir>/stop`
 /// appears, or the core exits, and finally kills the core (TERM then KILL after 3 s).
 ///
+/// When `geo_dir` is `Some` and `core` is Xray, the script exports
+/// `XRAY_LOCATION_ASSET=<geo_dir>` before starting the (root-owned) core, so it resolves
+/// `geosite:`/`geoip:` from the downloaded databases like the non-elevated path.
+///
 /// Exposed so tests can run it directly without `pkexec`/`osascript`.
 #[cfg(unix)]
 pub fn elevated_watchdog_script(
@@ -323,6 +368,7 @@ pub fn elevated_watchdog_script(
     binary: &Path,
     config_path: &Path,
     work_dir: &Path,
+    geo_dir: Option<&Path>,
 ) -> String {
     let name = core.binary_name();
     let mut parts = vec![shell_quote(&binary.to_string_lossy())];
@@ -330,10 +376,17 @@ pub fn elevated_watchdog_script(
         parts.push(shell_quote(&arg.to_string_lossy()));
     }
     let core_cmd = parts.join(" ");
+    let env_prefix = match xray_geo(core, geo_dir) {
+        Some(dir) => format!(
+            "export XRAY_LOCATION_ASSET={}; ",
+            shell_quote(&dir.to_string_lossy())
+        ),
+        None => String::new(),
+    };
     let log = shell_quote(&work_dir.join(format!("{name}.log")).to_string_lossy());
     let pid = shell_quote(&work_dir.join(format!("{name}.pid")).to_string_lossy());
     let stop = shell_quote(&work_dir.join(STOP_FILE).to_string_lossy());
-    watchdog_script_body(&core_cmd, &log, &pid, &stop)
+    watchdog_script_body(&core_cmd, &env_prefix, &log, &pid, &stop)
 }
 
 /// Wait until the watchdog has written `<path>`, returning the core pid.
@@ -408,13 +461,21 @@ async fn spawn_elevated(
     binary: &Path,
     config_path: &Path,
     work_dir: &Path,
+    geo_dir: Option<&Path>,
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
     // Already root or the binary carries the capability: run it directly.
     if crate::elevation::is_elevated() || has_cap_net_admin(binary) {
         let args = core_args(plan.core, config_path, work_dir);
-        return spawn_command(binary.as_os_str(), &args, log, tasks).await;
+        return spawn_command(
+            binary.as_os_str(),
+            &args,
+            xray_geo(plan.core, geo_dir),
+            log,
+            tasks,
+        )
+        .await;
     }
     if !command_exists("pkexec") {
         return Err(crate::Error::Command(format!(
@@ -429,7 +490,7 @@ async fn spawn_elevated(
     let log_path = work_dir.join(format!("{name}.log"));
     let _ = tokio::fs::remove_file(&pid_path).await;
 
-    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir);
+    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir, geo_dir);
     let app_pid = std::process::id().to_string();
     let mut cmd = tokio::process::Command::new("pkexec");
     cmd.arg("/bin/sh")
@@ -479,6 +540,7 @@ async fn spawn_elevated(
     binary: &Path,
     config_path: &Path,
     work_dir: &Path,
+    geo_dir: Option<&Path>,
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
@@ -487,7 +549,7 @@ async fn spawn_elevated(
     let log_path = work_dir.join(format!("{name}.log"));
     let _ = tokio::fs::remove_file(&pid_path).await;
 
-    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir);
+    let script = elevated_watchdog_script(plan.core, binary, config_path, work_dir, geo_dir);
     let app_pid = std::process::id().to_string();
     let shell = format!(
         "/bin/sh -c {} flamix {} &> /dev/null &",
@@ -525,12 +587,20 @@ async fn spawn_elevated(
     binary: &Path,
     config_path: &Path,
     work_dir: &Path,
+    geo_dir: Option<&Path>,
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
     if crate::elevation::is_elevated() {
         let args = core_args(plan.core, config_path, work_dir);
-        spawn_command(binary.as_os_str(), &args, log, tasks).await
+        spawn_command(
+            binary.as_os_str(),
+            &args,
+            xray_geo(plan.core, geo_dir),
+            log,
+            tasks,
+        )
+        .await
     } else {
         Err(crate::Error::Command(
             "TUN mode needs Flamix to run as administrator".to_string(),
@@ -544,6 +614,7 @@ async fn spawn_elevated(
     _binary: &Path,
     _config_path: &Path,
     _work_dir: &Path,
+    _geo_dir: Option<&Path>,
     _log: &LogBuffer,
     _tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
@@ -707,7 +778,7 @@ mod tests {
         let work = PathBuf::from("/tmp/fla mix/work'x");
         let bin = PathBuf::from("/opt/x ray/sing-box");
         let cfg = work.join("sing-box.json");
-        let script = elevated_watchdog_script(CoreKind::SingBox, &bin, &cfg, &work);
+        let script = elevated_watchdog_script(CoreKind::SingBox, &bin, &cfg, &work, None);
 
         assert!(script.contains("app_pid=$1"));
         assert!(script.contains("'/opt/x ray/sing-box'"));
@@ -717,5 +788,26 @@ mod tests {
             "rm -f {}",
             shell_quote("/tmp/fla mix/work'x/stop")
         )));
+        // No geo dir: the asset variable must not be exported.
+        assert!(!script.contains("XRAY_LOCATION_ASSET"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_script_exports_geo_only_for_xray() {
+        let work = PathBuf::from("/tmp/work");
+        let bin = PathBuf::from("/opt/xray");
+        let cfg = work.join("xray.json");
+        let geo = PathBuf::from("/home/u/.flamix/geo data");
+
+        let xray = elevated_watchdog_script(CoreKind::Xray, &bin, &cfg, &work, Some(&geo));
+        assert!(xray.contains(&format!(
+            "export XRAY_LOCATION_ASSET={};",
+            shell_quote("/home/u/.flamix/geo data")
+        )));
+
+        // sing-box ignores the geo dir (remote `.srs` rule-sets).
+        let sing = elevated_watchdog_script(CoreKind::SingBox, &bin, &cfg, &work, Some(&geo));
+        assert!(!sing.contains("XRAY_LOCATION_ASSET"));
     }
 }
