@@ -161,6 +161,7 @@ mod tests {
             settings,
             daily_traffic,
             device_id: None,
+            exit_ips: BTreeMap::new(),
         }
     }
 

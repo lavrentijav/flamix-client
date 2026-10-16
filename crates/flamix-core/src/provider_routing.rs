@@ -101,6 +101,7 @@ pub fn from_happ_profile(json: &Value) -> Result<ProviderRouting> {
             remote: remote.unwrap_or_else(|| Dns::default().remote),
             direct: direct.unwrap_or_else(|| Dns::default().direct),
             fake_ip: routing.fake_dns,
+            ..Dns::default()
         });
     }
 

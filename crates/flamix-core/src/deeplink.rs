@@ -10,6 +10,10 @@ use crate::subscription::util::decode_b64_str;
 use percent_encoding::percent_decode_str;
 
 /// What an import string refers to.
+///
+/// The `Routing` variant is large (it carries a whole provider profile), but `Import` is a
+/// short-lived value produced once per paste — boxing it would add churn for no real gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Import {
     /// Subscription URL plus optional name.

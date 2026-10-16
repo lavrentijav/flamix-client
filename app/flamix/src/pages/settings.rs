@@ -181,11 +181,23 @@ fn apply_owned_in_place(live: &mut Settings, src: &Settings) {
     live.allow_lan = src.allow_lan;
     live.set_system_proxy = src.set_system_proxy;
     live.proxy_bypass = src.proxy_bypass.clone();
+    live.udp_enabled = src.udp_enabled;
+    live.sniffing = src.sniffing;
+    live.dest_override = src.dest_override.clone();
+    live.route_only = src.route_only;
+    live.local_auth_user = src.local_auth_user.clone();
+    live.local_auth_pass = src.local_auth_pass.clone();
     live.dns = src.dns.clone();
     live.tun_mtu = src.tun_mtu;
     live.tun_stack = src.tun_stack.clone();
     live.tun_ipv6 = src.tun_ipv6;
+    live.tun_auto_route = src.tun_auto_route;
+    live.tun_strict_route = src.tun_strict_route;
+    live.tun_icmp = src.tun_icmp.clone();
+    live.tun_route_exclude = src.tun_route_exclude.clone();
     live.mux = src.mux;
+    live.mux_concurrency = src.mux_concurrency;
+    live.core_override = src.core_override.clone();
     live.default_fingerprint = src.default_fingerprint.clone();
     live.ping_url = src.ping_url.clone();
     live.ping_method = src.ping_method.clone();
@@ -270,6 +282,7 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
             remote: bridge.get_dns_remote().to_string(),
             direct: bridge.get_dns_direct().to_string(),
             fake_ip: bridge.get_dns_fake_ip(),
+            ..base.dns.clone()
         },
         tun_mtu: bridge.get_tun_mtu().max(0) as u32,
         tun_stack: bridge.get_tun_stack().to_string(),
@@ -285,6 +298,7 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         theme: theme_from_index(bridge.get_theme_index()),
         language: language_from_index(bridge.get_language_index()).to_string(),
         log_level: bridge.get_log_level().to_string(),
+        ..base.clone()
     }
 }
 
@@ -461,6 +475,7 @@ mod tests {
                 remote: "nope".into(),
                 direct: "https://77.88.8.8/dns-query".into(),
                 fake_ip: false,
+                ..Dns::default()
             },
             ..settings()
         };

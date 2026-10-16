@@ -1461,6 +1461,7 @@ mod validation {
                 remote: "https://1.1.1.1/dns-query".into(),
                 direct: "https://77.88.8.8/dns-query".into(),
                 fake_ip: false,
+                ..Dns::default()
             }),
             dns_hosts: BTreeMap::from([("host.example".into(), "10.0.0.7".into())]),
             geoip_url: Some("https://cdn.example/geoip.dat".into()),
@@ -1484,6 +1485,7 @@ mod validation {
                 remote: "https://9.9.9.9/dns-query".into(),
                 direct: "https://77.88.8.8/dns-query".into(),
                 fake_ip: true,
+                ..Dns::default()
             }),
             fake_dns: true,
             ..ProviderRouting::default()

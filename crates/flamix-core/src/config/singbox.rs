@@ -1288,6 +1288,7 @@ mod tests {
             remote: "https://9.9.9.9/dns-query".into(),
             direct: "https://8.8.8.8/dns-query".into(),
             fake_ip: false,
+            ..Dns::default()
         });
         provider
             .dns_hosts

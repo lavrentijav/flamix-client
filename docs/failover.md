@@ -43,9 +43,13 @@ TUN mode: sing-box tun ──► flamix-gate ──► (same)
 - **Health prober** (in gate): every `probe_interval` per server: HTTP `GET` of `settings.ping_url` through that server's
   inbound (real end-to-end check, ~1 RTT on a warm connection); 2 consecutive failures = dead (primary also marked dead
   immediately on N dial errors in a row from real traffic — passive detection is faster than probing).
-- **Exit IP probe**: through each server fetch `https://api.ipify.org` (fallbacks: `https://ifconfig.me/ip`,
-  `https://icanhazip.com`) on connect and every 10 min; servers with equal exit IPs form a group; UI shows the group badge
-  and prefers same-group backups first.
+- **Exit IP probe**: **connect through each server** and fetch an IP-echo URL (`https://api.ipify.org`,
+  fallbacks `https://ifconfig.me/ip`, `https://icanhazip.com`) — the *egress* IP the outside world sees — on connect
+  and every 10 min. Servers with equal **measured** exit IPs form a group; the UI shows the group badge and prefers
+  same-group backups first.
+  **Grouping is by the measured exit IP only — never by the input address/domain**: one domain can front many exits
+  (a CDN/front or a pool), and different inputs (host, IP, port, path) can share a single exit. Only a real
+  connection tells you the exit.
 - **Without the gate** (fallback / simple mode): Xray `observatory` + `routing.balancers` (strategy `leastPing`,
   `fallbackTag`) and sing-box `urltest` outbound give core-level failover for new connections, no freeze, no UDP re-pin.
   Used if the gate is disabled in settings.
@@ -65,6 +69,8 @@ pub struct Failover {
 // Server: + exit_ip: Option<String>, exit_ip_checked: Option<Timestamp>
 // RoutingRule: + server: Option<String>  (per-rule server for multi-traffic)
 ```
+Implemented so far: `Failover` (T21, minus the gate-only fields) and
+`AppState.exit_ips: BTreeMap<String, ExitIp>` (`ExitIp { ip, checked }`, T24) — the measured egress per server.
 
 ## Tasks
 - **T12** core: model additions; Xray multi-inbound/multi-outbound config + balancer/observatory fallback; sing-box
