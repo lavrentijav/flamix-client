@@ -6,12 +6,15 @@
 
 use crate::view;
 use crate::{flags, AppWindow, ConnState};
+use flamix_core::config::{self, CoreKind};
 use flamix_core::model::{AppState, ConnectionMode, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, link, provider_routing};
+use flamix_sys::sysproxy::ProxySpec;
+use flamix_sys::{elevation, runner, stats, sysproxy};
 use slint::{ComponentHandle, Weak};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -22,8 +25,26 @@ const MAX_PARALLEL_UPDATES: usize = 3;
 /// Interval between the periodic auto-update checks.
 const AUTO_UPDATE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
-/// Everything needed to talk to the running cores (filled in when connected).
-pub struct Connection {}
+/// Interval between traffic samples while connected.
+const TRAFFIC_TICK: Duration = Duration::from_secs(1);
+
+/// Persist accumulated traffic every N ticks (avoid a disk write every second).
+const TRAFFIC_PERSIST_EVERY: u32 = 15;
+
+/// Everything needed to talk to the running cores while connected.
+pub struct Connection {
+    running: runner::Running,
+    server_id: String,
+    /// Core that owns the outbound to the server (its traffic counters are sampled).
+    core: CoreKind,
+    api_port: u16,
+    /// Xray binary, needed for `xray api statsquery`.
+    xray_bin: Option<PathBuf>,
+    /// Whether we changed the OS system proxy (so we must clear it on exit).
+    system_proxy: bool,
+    /// Last cumulative totals reported by sing-box (deltas are computed from these).
+    totals: (u64, u64),
+}
 
 /// Result of a pure [`apply_import`] call, used for the status text and follow-up work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +165,59 @@ fn should_update(sub: &Subscription, now: i64) -> bool {
     }
 }
 
+/// First non-empty line of a possibly multi-line error / log tail.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Marker written while the OS system proxy points at us (crash detection).
+fn proxy_marker(dir: &Path) -> PathBuf {
+    dir.join("run").join("proxy-set")
+}
+
+/// Create the proxy marker file (called after a successful `sysproxy::set`).
+fn mark_proxy_set(dir: &Path) {
+    let path = proxy_marker(dir);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(err) = std::fs::write(&path, b"") {
+        tracing::warn!(%err, "could not write the proxy marker");
+    }
+}
+
+/// Remove the proxy marker file (called after `sysproxy::clear`).
+fn clear_proxy_marker(dir: &Path) {
+    let _ = std::fs::remove_file(proxy_marker(dir));
+}
+
+/// "YYYY-MM-DD" in the machine's local timezone.
+fn today_key() -> String {
+    chrono::Local::now().format("%Y-%m-%d").to_string()
+}
+
+/// Publish the system proxy (blocking work moved off the async threads).
+async fn set_system_proxy(spec: ProxySpec) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || sysproxy::set(&spec)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+/// Clear the system proxy (blocking work moved off the async threads).
+async fn clear_system_proxy() -> Result<(), String> {
+    match tokio::task::spawn_blocking(sysproxy::clear).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 /// Random hex string of `bytes` bytes (16 chars for 8 bytes).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -186,6 +260,8 @@ pub struct Controller {
     pub(crate) updating: Arc<Mutex<HashSet<String>>>,
     /// Bounds the number of concurrent subscription fetches.
     pub(crate) updates: Arc<tokio::sync::Semaphore>,
+    /// True while a connect/disconnect transition is in flight.
+    pub(crate) connecting: Arc<AtomicBool>,
 }
 
 impl Controller {
@@ -208,6 +284,7 @@ impl Controller {
             sort_by_ping: AtomicBool::new(false),
             updating: Arc::new(Mutex::new(HashSet::new())),
             updates: Arc::new(tokio::sync::Semaphore::new(MAX_PARALLEL_UPDATES)),
+            connecting: Arc::new(AtomicBool::new(false)),
         });
         controller.wire(ui);
         controller.apply_now();
@@ -216,6 +293,16 @@ impl Controller {
         }
         let auto = Arc::clone(&controller);
         controller.rt.spawn(async move { auto.run_auto_update().await });
+        let cleanup = Arc::clone(&controller);
+        controller
+            .rt
+            .spawn(async move { cleanup.cleanup_stale_proxy().await });
+        let signal = Arc::clone(&controller);
+        controller.rt.spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                signal.initiate_shutdown();
+            }
+        });
         controller
     }
 
@@ -463,6 +550,353 @@ impl Controller {
         }
     }
 
+    // --- connect / disconnect ------------------------------------------------
+
+    /// Connected state of the whole app, mirrored into the UI.
+    fn set_conn_state(&self, state: ConnState, status: impl Into<String>) {
+        let status = status.into();
+        let _ = self.ui.upgrade_in_event_loop(move |ui| {
+            ui.set_state(state);
+            ui.set_status_text(status.into());
+        });
+    }
+
+    fn set_speed(&self, up: u64, down: u64) {
+        let text = format!("↑ {}/s   ↓ {}/s", view::human_bytes(up), view::human_bytes(down));
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_speed_text(text.into()));
+    }
+
+    fn toggle_connect(self: &Arc<Self>) {
+        if self.connecting.load(Ordering::SeqCst) {
+            return;
+        }
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false);
+        if connected {
+            self.start_disconnect();
+            return;
+        }
+        let server_id = self
+            .state
+            .lock()
+            .map(|s| s.selected_server.clone())
+            .unwrap_or(None);
+        match server_id {
+            Some(id) => self.start_connect(id),
+            None => self.set_conn_state(ConnState::Disconnected, "Выберите сервер"),
+        }
+    }
+
+    fn start_connect(self: &Arc<Self>, server_id: String) {
+        if self.connecting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            Arc::clone(&this).connect(server_id).await;
+            this.connecting.store(false, Ordering::SeqCst);
+        });
+    }
+
+    fn start_disconnect(self: &Arc<Self>) {
+        if self.connecting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            this.disconnect_internal().await;
+            this.connecting.store(false, Ordering::SeqCst);
+        });
+    }
+
+    async fn connect(self: Arc<Self>, server_id: String) {
+        // Selecting another server while connected reconnects: tear the old one down first.
+        self.disconnect_internal().await;
+
+        let (server, settings) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(server) = state.server(&server_id).cloned() else {
+                drop(state);
+                self.set_conn_state(ConnState::Disconnected, "Выберите сервер");
+                return;
+            };
+            (server, state.settings.clone())
+        };
+
+        if settings.mode == ConnectionMode::Tun && cfg!(windows) && !elevation::is_elevated() {
+            self.set_conn_state(ConnState::Error, "Для TUN нужен запуск от администратора");
+            return;
+        }
+
+        self.set_conn_state(ConnState::Connecting, "Подключение…");
+        let plans = config::plan(&server, &settings);
+        let run_dir = self.data_dir.join("run");
+        let running = match runner::start(&plans, &run_dir).await {
+            Ok(running) => running,
+            Err(err) => {
+                self.set_conn_state(
+                    ConnState::Error,
+                    format!("Ошибка: {}", first_line(&err.to_string())),
+                );
+                return;
+            }
+        };
+
+        // The core with the outbound to the server owns the traffic counters.
+        let owner = plans
+            .iter()
+            .find(|p| p.core == CoreKind::Xray)
+            .or_else(|| plans.first());
+        let (core, api_port) = match owner {
+            Some(plan) => (plan.core, plan.api_port),
+            None => (CoreKind::Xray, 0),
+        };
+        let xray_bin = (core == CoreKind::Xray)
+            .then(|| runner::find_core(CoreKind::Xray).ok())
+            .flatten();
+
+        let system_proxy = settings.mode == ConnectionMode::Proxy && settings.set_system_proxy;
+        if system_proxy {
+            let spec = ProxySpec {
+                host: "127.0.0.1".to_string(),
+                http_port: settings.http_port,
+                socks_port: settings.socks_port,
+                bypass: settings.proxy_bypass.clone(),
+            };
+            if let Err(err) = set_system_proxy(spec).await {
+                let _ = running.stop().await;
+                self.set_conn_state(
+                    ConnState::Error,
+                    format!("Ошибка системного прокси: {}", first_line(&err)),
+                );
+                return;
+            }
+            mark_proxy_set(&self.data_dir);
+        }
+
+        *self.conn.lock().unwrap_or_else(|e| e.into_inner()) = Some(Connection {
+            running,
+            server_id: server_id.clone(),
+            core,
+            api_port,
+            xray_bin,
+            system_proxy,
+            totals: (0, 0),
+        });
+        self.set_conn_state(ConnState::Connected, "Подключено");
+        self.set_speed(0, 0);
+        self.start_ticker(server_id);
+    }
+
+    async fn disconnect_internal(self: &Arc<Self>) {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(conn) = conn else {
+            return;
+        };
+        if conn.system_proxy {
+            if let Err(err) = clear_system_proxy().await {
+                tracing::warn!(%err, "could not clear the system proxy");
+            }
+        }
+        clear_proxy_marker(&self.data_dir);
+        if let Err(err) = conn.running.stop().await {
+            tracing::warn!(%err, "could not stop the core cleanly");
+        }
+        self.set_conn_state(ConnState::Disconnected, "Не подключено");
+        self.set_speed(0, 0);
+        self.persist_and_render();
+    }
+
+    fn start_ticker(self: &Arc<Self>, server_id: String) {
+        let this = Arc::clone(self);
+        self.rt.spawn(async move { this.run_ticker(server_id).await });
+    }
+
+    async fn run_ticker(self: Arc<Self>, server_id: String) {
+        let mut ticks = 0u32;
+        loop {
+            tokio::time::sleep(TRAFFIC_TICK).await;
+            let alive = {
+                let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                match guard.as_mut() {
+                    Some(conn) if conn.server_id == server_id => conn.running.is_alive(),
+                    _ => return,
+                }
+            };
+            if !alive {
+                self.on_core_dead(&server_id).await;
+                return;
+            }
+            let (up, down) = self.sample_traffic(&server_id).await;
+            self.set_speed(up, down);
+            ticks += 1;
+            if ticks >= TRAFFIC_PERSIST_EVERY {
+                ticks = 0;
+                self.persist_and_render();
+            }
+        }
+    }
+
+    /// Read the traffic delta of the owning core and accumulate it into the state.
+    async fn sample_traffic(self: &Arc<Self>, server_id: &str) -> (u64, u64) {
+        let sample = {
+            let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(conn) = guard.as_ref() else {
+                return (0, 0);
+            };
+            if conn.server_id != server_id {
+                return (0, 0);
+            }
+            (conn.core, conn.api_port, conn.xray_bin.clone(), conn.totals)
+        };
+        let (core, api_port, xray_bin, totals) = sample;
+        let delta = match core {
+            CoreKind::Xray => {
+                let Some(binary) = xray_bin else {
+                    return (0, 0);
+                };
+                stats::xray_traffic(&binary, api_port).await.ok()
+            }
+            CoreKind::SingBox => match stats::singbox_traffic(api_port).await {
+                Ok((up_total, down_total)) => {
+                    {
+                        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(conn) = guard.as_mut() {
+                            if conn.server_id == server_id {
+                                conn.totals = (up_total, down_total);
+                            }
+                        }
+                    }
+                    Some((
+                        up_total.saturating_sub(totals.0),
+                        down_total.saturating_sub(totals.1),
+                    ))
+                }
+                Err(_) => None,
+            },
+        };
+        let Some((up, down)) = delta else {
+            return (0, 0);
+        };
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(server) = state.server_mut(server_id) {
+                server.local_traffic.upload = server.local_traffic.upload.saturating_add(up);
+                server.local_traffic.download = server.local_traffic.download.saturating_add(down);
+            }
+            let daily = state.daily_traffic.entry(today_key()).or_default();
+            daily.upload = daily.upload.saturating_add(up);
+            daily.download = daily.download.saturating_add(down);
+        }
+        (up, down)
+    }
+
+    async fn on_core_dead(self: &Arc<Self>, server_id: &str) {
+        let conn = {
+            let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            if guard
+                .as_ref()
+                .map(|c| c.server_id == server_id)
+                .unwrap_or(false)
+            {
+                guard.take()
+            } else {
+                None
+            }
+        };
+        let Some(conn) = conn else {
+            return;
+        };
+        let tail = conn.running.log_tail(5).join(" ");
+        if conn.system_proxy {
+            let _ = clear_system_proxy().await;
+        }
+        clear_proxy_marker(&self.data_dir);
+        let _ = conn.running.stop().await;
+        self.set_conn_state(
+            ConnState::Error,
+            format!("ядро остановилось: {}", first_line(&tail)),
+        );
+        self.set_speed(0, 0);
+        self.persist_and_render();
+    }
+
+    /// Clear a system proxy left behind by a previous crash (marker file present).
+    async fn cleanup_stale_proxy(self: Arc<Self>) {
+        if !proxy_marker(&self.data_dir).exists() {
+            return;
+        }
+        tracing::info!("proxy marker from a previous run found; clearing the system proxy");
+        if let Err(err) = clear_system_proxy().await {
+            tracing::warn!(%err, "could not clear the stale system proxy");
+        }
+        clear_proxy_marker(&self.data_dir);
+    }
+
+    fn mode_changed(self: &Arc<Self>, tun: bool) {
+        if tun && cfg!(windows) && !elevation::is_elevated() {
+            self.set_status("Для TUN нужен запуск от администратора");
+        }
+        let new_mode = if tun {
+            ConnectionMode::Tun
+        } else {
+            ConnectionMode::Proxy
+        };
+        let changed = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.settings.mode == new_mode {
+                false
+            } else {
+                state.settings.mode = new_mode;
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        self.persist_and_render();
+        let connected_id = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|conn| conn.server_id.clone()));
+        if let Some(id) = connected_id {
+            self.start_connect(id);
+        }
+    }
+
+    fn restart_as_admin(self: &Arc<Self>) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        match elevation::restart_elevated(&args) {
+            Ok(()) => {
+                let _ = slint::quit_event_loop();
+            }
+            Err(err) => self.set_status(format!("Не удалось перезапустить: {err}")),
+        }
+    }
+
+    /// Disconnect, save synchronously and quit (window close / Ctrl+C).
+    fn initiate_shutdown(self: &Arc<Self>) {
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            this.disconnect_internal().await;
+            let snapshot = this
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if let Err(err) = this.persist.save_now(&snapshot) {
+                tracing::warn!(%err, "could not save state on exit");
+            }
+            let _ = slint::quit_event_loop();
+        });
+    }
+
     fn wire(self: &Arc<Self>, ui: &AppWindow) {
         {
             let this = Arc::clone(self);
@@ -502,6 +936,25 @@ impl Controller {
         }
         {
             let this = Arc::clone(self);
+            ui.on_toggle_connect(move || this.toggle_connect());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_mode_changed(move |tun| this.mode_changed(tun));
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_restart_as_admin(move || this.restart_as_admin());
+        }
+        {
+            let this = Arc::clone(self);
+            ui.window().on_close_requested(move || {
+                this.initiate_shutdown();
+                slint::CloseRequestResponse::KeepWindowShown
+            });
+        }
+        {
+            let this = Arc::clone(self);
             ui.on_sort_by_ping(move || {
                 let next = !this.sort_by_ping.load(Ordering::Relaxed);
                 this.sort_by_ping.store(next, Ordering::Relaxed);
@@ -533,13 +986,24 @@ impl Controller {
         let mut changed = false;
         {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if state.server(id).is_some() {
+            if state.server(id).is_some() && state.selected_server.as_deref() != Some(id) {
                 state.selected_server = Some(id.to_string());
                 changed = true;
             }
         }
-        if changed {
-            self.persist_and_render();
+        if !changed {
+            return;
+        }
+        self.persist_and_render();
+        // Selecting another server while connected reconnects to it.
+        let connected_other = self
+            .conn
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(|conn| conn.server_id != id))
+            .unwrap_or(false);
+        if connected_other {
+            self.start_connect(id.to_string());
         }
     }
 
@@ -778,5 +1242,24 @@ mod tests {
         sub.update_interval_hours = 0;
         sub.provider.update_always = true;
         assert!(should_update(&sub, now));
+    }
+
+    #[test]
+    fn proxy_marker_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("flamix-marker-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!proxy_marker(&dir).exists());
+        mark_proxy_set(&dir);
+        assert!(proxy_marker(&dir).exists());
+        clear_proxy_marker(&dir);
+        assert!(!proxy_marker(&dir).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_line_skips_blank_lines() {
+        assert_eq!(first_line("\n\n  hello \nworld"), "hello");
+        assert_eq!(first_line("   "), "");
+        assert_eq!(first_line("core exited: boom\nmore"), "core exited: boom");
     }
 }

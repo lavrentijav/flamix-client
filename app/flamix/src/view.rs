@@ -237,11 +237,6 @@ pub fn selected_iso(state: &AppState) -> String {
     state.selected().map(server_iso).unwrap_or_default()
 }
 
-/// Find a server by id in the whole state.
-pub fn find_server<'a>(state: &'a AppState, id: &str) -> Option<&'a Server> {
-    state.server(id)
-}
-
 /// Wrap a vector in the Slint model type used by the UI properties.
 pub fn model<T: Clone + 'static>(items: Vec<T>) -> ModelRc<T> {
     ModelRc::new(VecModel::from(items))
