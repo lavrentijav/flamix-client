@@ -55,12 +55,63 @@ fn probe_target_ids(state: &AppState, ids: &[String]) -> Vec<String> {
     out
 }
 
-/// Free localhost TCP port, obtained by binding to port 0 and releasing it.
-async fn free_local_port() -> Option<u16> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
-    let port = listener.local_addr().ok()?.port();
-    drop(listener);
-    Some(port)
+/// True if the live connection is the one an in-flight exit probe belongs to.
+///
+/// The epoch alone already distinguishes connect attempts, but the socks port is checked too:
+/// a reconnect that reused the same inbound port must not let a late probe of the old core
+/// write its measurement under the new server.
+fn probe_store_is_current(
+    conn_epoch: u64,
+    epoch: u64,
+    conn_server_id: &str,
+    server_id: &str,
+    conn_socks_port: u16,
+    socks_port: u16,
+) -> bool {
+    ticker_still_owns(conn_epoch, epoch, conn_server_id, server_id) && conn_socks_port == socks_port
+}
+
+/// Number of contiguous localhost ports a probe core needs: the mixed inbound (`socks`), the
+/// HTTP inbound (`socks + 1`) and the core stats API (`socks + 11`, the larger offset).
+const PROBE_PORT_SPAN: u16 = 12;
+
+/// Try to reserve a contiguous block of `span` localhost ports and return its base.
+///
+/// All ports are bound at once (and released right after) so the block is known to be free;
+/// binding port 0 lets the OS pick a base. `None` if no such block could be found.
+async fn reserve_port_block(span: u16) -> Option<u16> {
+    for _ in 0..50 {
+        let first = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
+        let base = first.local_addr().ok()?.port();
+        if base.checked_add(span - 1).is_none() {
+            continue;
+        }
+        let mut listeners = vec![first];
+        let mut complete = true;
+        for offset in 1..span {
+            match tokio::net::TcpListener::bind(("127.0.0.1", base + offset)).await {
+                Ok(listener) => listeners.push(listener),
+                Err(_) => {
+                    complete = false;
+                    break;
+                }
+            }
+        }
+        drop(listeners);
+        if complete {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// Clears the `probing` flag when dropped, so a panic/abort cannot leave it stuck `true`.
+struct ProbeGuard(Arc<AtomicBool>);
+
+impl Drop for ProbeGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
 }
 
 /// Persist accumulated traffic every N ticks (avoid a disk write every second).
@@ -77,6 +128,8 @@ pub struct Connection {
     /// Core that owns the outbound to the server (its traffic counters are sampled).
     core: CoreKind,
     api_port: u16,
+    /// Local SOCKS inbound port of this connection (used to attribute exit-IP probes).
+    socks_port: u16,
     /// Xray binary, needed for `xray api statsquery`.
     xray_bin: Option<PathBuf>,
     /// Whether the running config is a failover cluster: Xray counters then live on the
@@ -389,6 +442,9 @@ pub struct Controller {
     pub(crate) connect_epoch: AtomicU64,
     /// True while a batch exit-IP probe is running (only one at a time).
     pub(crate) probing: Arc<AtomicBool>,
+    /// Generation counter bumped on every disconnect; the passive exit-IP poller subscribes
+    /// to it so a disconnect cancels its wait immediately instead of after the full interval.
+    pub(crate) exit_probe_cancel: tokio::sync::watch::Sender<u64>,
 }
 
 impl Controller {
@@ -414,6 +470,7 @@ impl Controller {
             connecting: Arc::new(AtomicBool::new(false)),
             connect_epoch: AtomicU64::new(0),
             probing: Arc::new(AtomicBool::new(false)),
+            exit_probe_cancel: tokio::sync::watch::channel(0).0,
         });
         controller.wire(ui);
         controller.apply_now();
@@ -763,6 +820,12 @@ impl Controller {
     }
 
     async fn connect(self: Arc<Self>, server_id: String) {
+        // A batch exit-IP probe owns `settings.socks_port` and the cores: starting a
+        // connection now would race it. Refuse and let the user retry.
+        if self.probing.load(Ordering::SeqCst) {
+            self.set_conn_state(ConnState::Error, "Идёт проверка выходных IP, подождите");
+            return;
+        }
         // Selecting another server while connected reconnects: tear the old one down first.
         self.disconnect_internal().await;
 
@@ -880,6 +943,7 @@ impl Controller {
             epoch,
             core,
             api_port,
+            socks_port: settings.socks_port,
             xray_bin,
             failover,
             system_proxy,
@@ -908,30 +972,84 @@ impl Controller {
 
     /// Measure the exit IP through the running proxy now, then every [`EXIT_PROBE_INTERVAL`].
     ///
-    /// Uses the same epoch/server guard as the traffic ticker, so it stops as soon as the
-    /// connection is replaced or torn down ([`Self::disconnect_internal`] drops the
-    /// [`Connection`] and the guard no longer matches).
+    /// Uses the same epoch/server/port guard as the traffic ticker, and subscribes to
+    /// [`Controller::exit_probe_cancel`] so a disconnect (or reconnect) aborts the wait at
+    /// once instead of after a full interval. The guard is re-checked after the (awaited)
+    /// probe and again under the conn lock right before storing, so a late response cannot be
+    /// attributed to a newer connection that happens to reuse the same port.
     async fn run_exit_probe(self: Arc<Self>, server_id: String, epoch: u64, socks_port: u16) {
         let proxy = format!("socks5h://127.0.0.1:{socks_port}");
+        let mut cancel = self.exit_probe_cancel.subscribe();
         loop {
-            if !self.conn_matches(&server_id, epoch) {
+            if !self.conn_matches(&server_id, epoch, socks_port) {
                 return;
             }
             if let Some(ip) = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await {
-                self.store_exit_ip(&server_id, ip);
+                if !self.store_exit_ip_if_current(&server_id, epoch, socks_port, ip) {
+                    return;
+                }
+            } else if !self.conn_matches(&server_id, epoch, socks_port) {
+                return;
             }
-            tokio::time::sleep(EXIT_PROBE_INTERVAL).await;
+            tokio::select! {
+                _ = tokio::time::sleep(EXIT_PROBE_INTERVAL) => {}
+                changed = cancel.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // A newer generation means disconnect/reconnect: stop quietly.
+                    return;
+                }
+            }
         }
     }
 
-    /// Whether the current live connection is still the one identified by `epoch`/`server_id`.
-    fn conn_matches(&self, server_id: &str, epoch: u64) -> bool {
+    /// Whether the current live connection is still the one identified by `epoch`/`server_id`
+    /// and uses `socks_port`.
+    fn conn_matches(&self, server_id: &str, epoch: u64, socks_port: u16) -> bool {
         self.conn
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
-            .map(|c| ticker_still_owns(c.epoch, epoch, &c.server_id, server_id))
+            .map(|c| {
+                probe_store_is_current(
+                    c.epoch,
+                    epoch,
+                    &c.server_id,
+                    server_id,
+                    c.socks_port,
+                    socks_port,
+                )
+            })
             .unwrap_or(false)
+    }
+
+    /// Store `ip` for `server_id` only if the live connection is still the probe's own
+    /// connection (epoch, server id and socks port checked under the conn lock).
+    fn store_exit_ip_if_current(
+        self: &Arc<Self>,
+        server_id: &str,
+        epoch: u64,
+        socks_port: u16,
+        ip: String,
+    ) -> bool {
+        {
+            let guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.as_ref() {
+                Some(conn)
+                    if probe_store_is_current(
+                        conn.epoch,
+                        epoch,
+                        &conn.server_id,
+                        server_id,
+                        conn.socks_port,
+                        socks_port,
+                    ) => {}
+                _ => return false,
+            }
+        }
+        self.store_exit_ip(server_id, ip);
+        true
     }
 
     /// Persist a measured exit IP for one server and repaint.
@@ -946,11 +1064,13 @@ impl Controller {
 
     /// Probe the exit IP of every requested server by really connecting through it.
     ///
-    /// Refuses while connected (the cores would fight over the inbound). Sequentially, for
-    /// each id: plan a throwaway proxy config, start the core, ask the echo services through
-    /// its SOCKS port, and stop the core in every path (result or failure) so none leaks.
+    /// Refuses while a core is busy (connecting, connected, or another batch probing — they
+    /// would share `run/` config/pid/stop files and the inbound). Sequentially, for each id:
+    /// reserve a fresh contiguous port block, plan a throwaway proxy config, start the core in
+    /// a dedicated work dir, ask the echo services through its SOCKS port, and stop the core
+    /// in every path (result or failure) so none leaks.
     pub fn probe_exit_ips(self: &Arc<Self>, ids: Vec<String>) {
-        if self.is_connected() {
+        if self.connecting.load(Ordering::SeqCst) || self.is_connected() {
             self.status("Сначала отключитесь");
             return;
         }
@@ -958,13 +1078,15 @@ impl Controller {
             self.status("Проверка уже выполняется");
             return;
         }
+        let guard = ProbeGuard(Arc::clone(&self.probing));
         let snapshot = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let targets = probe_target_ids(&snapshot, &ids);
         let runner = Arc::clone(self);
-        let flag = Arc::clone(&self.probing);
         self.rt.spawn(async move {
+            // Keep the guard alive for the whole task; it clears `probing` on drop, even if
+            // the task panics or is aborted.
+            let _guard = guard;
             runner.run_exit_probe_batch(snapshot, targets).await;
-            flag.store(false, Ordering::SeqCst);
         });
     }
 
@@ -974,37 +1096,10 @@ impl Controller {
             self.set_status("Нет серверов для проверки IP");
             return;
         }
-        let ports = free_local_port().await;
-        let run_dir = self.data_dir.join("run");
         let mut measured = 0usize;
         for (index, id) in targets.iter().enumerate() {
             self.set_status(probe_progress_text(index, total));
-            let Some(server) = state.server(id).cloned() else {
-                continue;
-            };
-            let mut settings = state.settings.clone();
-            settings.mode = ConnectionMode::Proxy;
-            if let Some(port) = ports {
-                settings.socks_port = port;
-                settings.http_port = port.saturating_add(1);
-            }
-            let plans = config::plan(&server, &settings);
-            let ip = match runner::start(&plans, &run_dir).await {
-                Ok(running) => {
-                    let probe_port = settings.socks_port;
-                    let proxy = format!("socks5h://127.0.0.1:{probe_port}");
-                    let ip = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await;
-                    if let Err(err) = running.stop().await {
-                        tracing::warn!(%err, server = %id, "could not stop the probe core cleanly");
-                    }
-                    ip
-                }
-                Err(err) => {
-                    tracing::warn!(%err, server = %id, "exit-IP probe could not start the core");
-                    None
-                }
-            };
-            if let Some(ip) = ip {
+            if let Some(ip) = self.probe_one_exit(&state, id).await {
                 measured += 1;
                 self.store_exit_ip(id, ip);
             }
@@ -1019,7 +1114,40 @@ impl Controller {
         }
     }
 
+    /// Start one throwaway core for `id` in the probe's private work dir and read its egress
+    /// IP. Retries once with a fresh port block in case the reserved ports were grabbed
+    /// between reservation and `runner::start` (a small TOCTOU window).
+    async fn probe_one_exit(self: &Arc<Self>, state: &AppState, id: &str) -> Option<String> {
+        let run_dir = self.data_dir.join("run").join("exit-probe");
+        for _attempt in 0..2 {
+            let base = reserve_port_block(PROBE_PORT_SPAN).await?;
+            let server = state.server(id).cloned()?;
+            let mut settings = state.settings.clone();
+            settings.mode = ConnectionMode::Proxy;
+            settings.socks_port = base;
+            settings.http_port = base.saturating_add(1);
+            let plans = config::plan(&server, &settings);
+            match runner::start(&plans, &run_dir).await {
+                Ok(running) => {
+                    let proxy = format!("socks5h://127.0.0.1:{base}");
+                    let ip = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await;
+                    if let Err(err) = running.stop().await {
+                        tracing::warn!(%err, server = %id, "could not stop the probe core cleanly");
+                    }
+                    return ip;
+                }
+                Err(err) => {
+                    tracing::warn!(%err, server = %id, "exit-IP probe could not start the core; retrying");
+                }
+            }
+        }
+        None
+    }
+
     async fn disconnect_internal(self: &Arc<Self>) {
+        // Cancel any passive exit probe immediately (even if there is no connection yet).
+        self.exit_probe_cancel
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner()).take();
         let Some(conn) = conn else {
             return;
@@ -1155,6 +1283,9 @@ impl Controller {
         let Some(conn) = conn else {
             return;
         };
+        // The connection is gone: stop the passive exit probe from waiting out its interval.
+        self.exit_probe_cancel
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         let tail = conn.running.log_tail(5).join(" ");
         if conn.system_proxy {
             let _ = clear_system_proxy().await;
@@ -1919,6 +2050,27 @@ mod tests {
             "b".to_string(),
         ];
         assert_eq!(probe_target_ids(&state, &ids), vec!["b", "a"]);
+    }
+
+    #[test]
+    fn probe_target_ids_empty_input_is_empty() {
+        let state = AppState {
+            local_servers: vec![server("a")],
+            ..AppState::default()
+        };
+        assert!(probe_target_ids(&state, &[]).is_empty());
+    }
+
+    #[test]
+    fn stale_probe_store_guard_rejects_wrong_epoch_or_port() {
+        // The current connection: epoch 2, server "a", socks 10808.
+        assert!(probe_store_is_current(2, 2, "a", "a", 10808, 10808));
+        // A reconnect bumped the epoch: the old probe must not store.
+        assert!(!probe_store_is_current(3, 2, "a", "a", 10808, 10808));
+        // Same epoch but a different server id never matches.
+        assert!(!probe_store_is_current(2, 2, "b", "a", 10808, 10808));
+        // A reconnect that reused but changed the port must also be rejected.
+        assert!(!probe_store_is_current(2, 2, "a", "a", 10809, 10808));
     }
 
     #[test]

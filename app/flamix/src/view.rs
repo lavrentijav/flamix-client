@@ -103,7 +103,7 @@ pub fn server_iso(server: &Server) -> String {
 pub struct ExitInfo {
     /// Measured public exit IP, empty when never probed.
     pub ip: String,
-    /// 0 = no measured exit, otherwise the number of servers sharing that exit.
+    /// 0 = no measured exit or a unique exit, otherwise the number of servers (>1) sharing it.
     pub group: i32,
 }
 
@@ -138,8 +138,12 @@ pub fn exit_info(state: &AppState, groups: &BTreeMap<String, Vec<String>>, id: &
     if exit.ip.is_empty() {
         return ExitInfo::default();
     }
-    // A server with no group entry (should not happen) still shows its IP, group 0.
-    let group = groups.get(&exit.ip).map_or(0, |ids| ids.len() as i32);
+    // A group of one is not a shared exit: report 0 so only real sharing shows a badge.
+    let group = groups
+        .get(&exit.ip)
+        .map(|ids| ids.len() as i32)
+        .filter(|count| *count > 1)
+        .unwrap_or(0);
     ExitInfo {
         ip: exit.ip.clone(),
         group,
@@ -619,6 +623,32 @@ mod tests {
             assert_eq!(item.exit_ip.as_str(), "203.0.113.7");
             assert_eq!(item.exit_group, 2);
         }
+    }
+
+    #[test]
+    fn singleton_exit_group_is_zero() {
+        use flamix_core::model::ExitIp;
+        let mut state = AppState {
+            local_servers: vec![server("a", "A", None), server("b", "B", None)],
+            ..AppState::default()
+        };
+        // Only "a" is measured and unique: no shared exit, so no badge.
+        state.exit_ips.insert(
+            "a".to_string(),
+            ExitIp {
+                ip: "203.0.113.9".to_string(),
+                checked: 1,
+            },
+        );
+
+        let items = build_local_servers(&state, "", false);
+        let a = items.iter().find(|i| i.id.as_str() == "a").unwrap();
+        assert_eq!(a.exit_ip.as_str(), "203.0.113.9");
+        assert_eq!(a.exit_group, 0);
+
+        let b = items.iter().find(|i| i.id.as_str() == "b").unwrap();
+        assert_eq!(b.exit_ip.as_str(), "");
+        assert_eq!(b.exit_group, 0);
     }
 
     #[test]

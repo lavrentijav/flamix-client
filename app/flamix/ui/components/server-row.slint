@@ -73,9 +73,12 @@ export component ServerRow inherits Rectangle {
     }
 
     // Measured egress IP (muted, small), with a badge when several servers share it.
+    // The row reserves a dedicated 18px slot at its bottom (see `height`), below the
+    // summary and the quota bar, so nothing overlaps.
     if item.exit-ip != "" : Text {
         x: 48px;
-        y: item.has-quota ? 46px : 31px;
+        y: parent.height - 18px;
+        height: 16px;
         text: item.exit-group > 1 ? "\{item.exit-ip}   IP ×\{item.exit-group}" : item.exit-ip;
         color: item.exit-group > 1 ? Theme.accent : Theme.muted;
         font-size: 11px;

@@ -196,6 +196,19 @@ mod tests {
     }
 
     #[test]
+    fn ip_echo_urls_keep_fallback_order() {
+        // `probe_exit_ip` tries these in order, so the first working one wins.
+        assert_eq!(
+            IP_ECHO_URLS,
+            &[
+                "https://api.ipify.org",
+                "https://ifconfig.me/ip",
+                "https://icanhazip.com",
+            ]
+        );
+    }
+
+    #[test]
     fn parse_ip_rejects_junk_and_empty() {
         assert_eq!(parse_ip(""), None);
         assert_eq!(parse_ip("   \n"), None);

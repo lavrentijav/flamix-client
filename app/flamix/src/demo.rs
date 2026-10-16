@@ -70,7 +70,12 @@ fn assign_exit_groups(subs: &mut [SubData], locals: &mut [ServerItem]) {
         .flat_map(|s| s.servers.iter_mut())
         .chain(locals.iter_mut())
     {
-        item.exit_group = counts.get(item.exit_ip.as_str()).copied().unwrap_or(0);
+        // A group of one is not a shared exit: only sizes > 1 get a badge.
+        item.exit_group = counts
+            .get(item.exit_ip.as_str())
+            .copied()
+            .filter(|count| *count > 1)
+            .unwrap_or(0);
     }
 }
 
