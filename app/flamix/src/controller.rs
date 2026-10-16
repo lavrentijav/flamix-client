@@ -899,13 +899,22 @@ impl Controller {
         // A failed download must never break the connection — the previously downloaded files
         // stay usable, and if there are none Xray itself reports the missing geo. Only a
         // successful download touches `geo_updated`.
-        match geo::ensure(&geo_dir, &settings.geo, GEO_MAX_AGE).await {
-            Ok(status) if status.downloaded => {
-                let now = chrono::Utc::now().timestamp();
-                self.mutate(|state| state.geo_updated = now);
+        //
+        // Single-writer: `geo::ensure` writes `<dest>.part` and renames over the same
+        // `geosite.dat`/`geoip.dat`, so it must never run concurrently with the manual
+        // `update_geo` refresh (which already refuses while connecting). If a manual refresh is
+        // in flight, skip this one; the running/next connect uses whatever is already on disk.
+        if self.geo_updating.load(Ordering::SeqCst) {
+            tracing::debug!("skipping the geo refresh: a manual update is in flight");
+        } else {
+            match geo::ensure(&geo_dir, &settings.geo, GEO_MAX_AGE).await {
+                Ok(status) if status.downloaded => {
+                    let now = chrono::Utc::now().timestamp();
+                    self.mutate(|state| state.geo_updated = now);
+                }
+                Ok(_) => {}
+                Err(err) => tracing::warn!(%err, "geo database refresh failed; continuing"),
             }
-            Ok(_) => {}
-            Err(err) => tracing::warn!(%err, "geo database refresh failed; continuing"),
         }
         let run_dir = self.data_dir.join("run");
         let running = match runner::start(&plans, &run_dir, Some(&geo_dir)).await {
@@ -1140,6 +1149,9 @@ impl Controller {
     /// between reservation and `runner::start` (a small TOCTOU window).
     async fn probe_one_exit(self: &Arc<Self>, state: &AppState, id: &str) -> Option<String> {
         let run_dir = self.data_dir.join("run").join("exit-probe");
+        // The throwaway core uses the same routing presets (BypassRu resolves geosite/geoip), so
+        // it must see the downloaded geo dir too; no refresh is needed here.
+        let geo_dir = self.data_dir.join("geo");
         for _attempt in 0..2 {
             let base = reserve_port_block(PROBE_PORT_SPAN).await?;
             let server = state.server(id).cloned()?;
@@ -1148,7 +1160,7 @@ impl Controller {
             settings.socks_port = base;
             settings.http_port = base.saturating_add(1);
             let plans = config::plan(&server, &settings);
-            match runner::start(&plans, &run_dir, None).await {
+            match runner::start(&plans, &run_dir, Some(&geo_dir)).await {
                 Ok(running) => {
                     let proxy = format!("socks5h://127.0.0.1:{base}");
                     let ip = ping::probe_exit_ip(&proxy, EXIT_PROBE_TIMEOUT).await;
@@ -1701,11 +1713,15 @@ impl Controller {
         self.set_status(text);
     }
 
-    /// Manually refresh the geo databases (settings button). Refuses while a core is running;
+    /// Manually refresh the geo databases (settings button). Refuses while a core is running
+    /// (a connect, a live connection, or a batch exit-IP probe — those own the cores and ports);
     /// otherwise forces a download (`max_age = 0`) on the runtime. Guarded against concurrent
     /// runs by [`Controller::geo_updating`], which is released on every path.
     pub fn update_geo(self: &Arc<Self>) {
-        if self.is_connected() || self.connecting.load(Ordering::SeqCst) {
+        if self.is_connected()
+            || self.connecting.load(Ordering::SeqCst)
+            || self.probing.load(Ordering::SeqCst)
+        {
             self.status("Сначала отключитесь");
             return;
         }
@@ -1721,11 +1737,13 @@ impl Controller {
             let geo_dir = this.data_dir.join("geo");
             let geo = this.with_state(|state| state.settings.geo.clone());
             match geo::ensure(&geo_dir, &geo, 0).await {
-                Ok(_) => {
+                Ok(status) if status.downloaded => {
                     let now = chrono::Utc::now().timestamp();
                     this.mutate(|state| state.geo_updated = now);
                     this.set_status("Геоданные обновлены");
                 }
+                // Nothing to fetch (e.g. a Custom source with empty URLs): don't claim an update.
+                Ok(_) => this.set_status("Геоданные не настроены"),
                 Err(err) => this.set_status(format!("Ошибка обновления геоданных: {err}")),
             }
         });
