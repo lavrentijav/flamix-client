@@ -998,10 +998,10 @@ mod tests {
     #[test]
     fn override_enables_local_auth() {
         let overrides = BTreeMap::from([
-            ("socks-auth-mode".to_string(), "password".to_string()),
+            ("socks-auth-mode".to_string(), "manual".to_string()),
             ("socks-auth-user".to_string(), "u".to_string()),
             ("socks-auth-password".to_string(), "p".to_string()),
-            ("http-auth-mode".to_string(), "password".to_string()),
+            ("http-auth-mode".to_string(), "manual".to_string()),
             ("http-auth-user".to_string(), "hu".to_string()),
             ("http-auth-password".to_string(), "hp".to_string()),
         ]);
@@ -1018,8 +1018,8 @@ mod tests {
         assert_eq!(http["settings"]["accounts"][0]["user"], json!("hu"));
         assert_eq!(http["settings"]["accounts"][0]["pass"], json!("hp"));
 
-        // mode != password (or absent) leaves the socks inbound unauthenticated.
-        let plain = BTreeMap::from([("socks-auth-mode".to_string(), "noauth".to_string())]);
+        // mode != manual (or absent/blank creds) leaves the socks inbound unauthenticated.
+        let plain = BTreeMap::from([("socks-auth-mode".to_string(), "disable".to_string())]);
         let ctx = ConnectContext {
             provider: None,
             overrides: Some(&plain),

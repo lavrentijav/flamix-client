@@ -330,10 +330,12 @@ pub fn full_config_with(
             0,
             json!({"type": "hosts", "tag": "hosts", "predefined": hosts_predefined}),
         );
+        // Xray `dns.hosts` covers the domain *and its subdomains*; match that with
+        // `domain_suffix` (sing-box `domain` would only match the exact name).
         let domains: Vec<&String> = provider
             .map(|p| p.dns_hosts.keys().collect())
             .unwrap_or_default();
-        dns_rules.insert(0, json!({"domain": domains, "server": "hosts"}));
+        dns_rules.insert(0, json!({"domain_suffix": domains, "server": "hosts"}));
     }
 
     let mut inbounds = Vec::new();
@@ -458,14 +460,8 @@ impl GeoUrls {
             return Self::default();
         };
         Self {
-            geosite: provider
-                .geosite_url
-                .clone()
-                .filter(|url| url.ends_with(".srs")),
-            geoip: provider
-                .geoip_url
-                .clone()
-                .filter(|url| url.ends_with(".srs")),
+            geosite: provider.geosite_url.clone().filter(|url| is_srs_url(url)),
+            geoip: provider.geoip_url.clone().filter(|url| is_srs_url(url)),
         }
     }
 
@@ -682,6 +678,17 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>, geo: &GeoUrls) -
         }
     }
     Value::Object(m)
+}
+
+/// True when `url` points at a sing-box rule-set (`.srs`, case-insensitive, ignoring any
+/// query string or fragment). A `.dat` geo file (Xray format) is not a valid rule-set.
+fn is_srs_url(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .trim_end_matches('/');
+    path.to_ascii_lowercase().ends_with(".srs")
 }
 
 fn geosite_url(name: &str) -> String {
@@ -1195,7 +1202,10 @@ mod tests {
             .unwrap();
         assert_eq!(direct["server"], json!("8.8.8.8"));
         assert_eq!(cfg["dns"]["rules"][0]["server"], json!("hosts"));
-        assert_eq!(cfg["dns"]["rules"][0]["domain"], json!(["example.com"]));
+        assert_eq!(
+            cfg["dns"]["rules"][0]["domain_suffix"],
+            json!(["example.com"])
+        );
     }
 
     #[test]
@@ -1224,7 +1234,8 @@ mod tests {
                 RuleAction::Proxy,
             )],
         );
-        provider.geosite_url = Some("https://cdn.example/geosite.srs".into());
+        // Upper-case suffix plus query/fragment still counts as a rule-set URL.
+        provider.geosite_url = Some("https://cdn.example/GEOSITE.SRS?v=2#frag".into());
         provider.geoip_url = Some("https://cdn.example/geoip.dat".into());
         let ctx = ConnectContext {
             provider: Some(&provider),
@@ -1233,7 +1244,7 @@ mod tests {
         let cfg = full_config_with(&vless(), &Settings::default(), false, None, 10819, &ctx);
         let sets = cfg["route"]["rule_set"].as_array().unwrap();
         assert!(sets.iter().any(|s| s["tag"] == json!("geosite-google")
-            && s["url"] == json!("https://cdn.example/geosite.srs")));
+            && s["url"] == json!("https://cdn.example/GEOSITE.SRS?v=2#frag")));
         // The .dat geoip URL is not a sing-box rule-set: keep the default .srs base.
         let geoip = sets.iter().find(|s| s["tag"] == json!("geoip-ru")).unwrap();
         assert!(geoip["url"].as_str().unwrap().ends_with("geoip-ru.srs"));
@@ -1246,7 +1257,7 @@ mod tests {
     #[test]
     fn override_enables_mixed_auth() {
         let overrides = BTreeMap::from([
-            ("socks-auth-mode".to_string(), "password".to_string()),
+            ("socks-auth-mode".to_string(), "manual".to_string()),
             ("socks-auth-user".to_string(), "u".to_string()),
             ("socks-auth-password".to_string(), "p".to_string()),
         ]);

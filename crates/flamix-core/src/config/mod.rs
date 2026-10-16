@@ -34,25 +34,26 @@ pub(crate) struct LocalAuth {
 
 /// Parse `<prefix>-auth-mode`/`-user`/`-password`. `prefix` is `socks` or `http`.
 ///
-/// Only `mode=password` enables auth; other/absent values yield `None` (keys are lower-case).
+/// Happ's `<prefix>-auth-mode` is `auto` \| `manual` \| `from-json` \| `disable`; only
+/// `manual` carries explicit credentials, and both user and password must be non-empty
+/// (otherwise auth is treated as off, e.g. `auto`/`from-json`/`disable` or blank keys).
 pub(crate) fn local_auth(
     prefix: &str,
     overrides: Option<&BTreeMap<String, String>>,
 ) -> Option<LocalAuth> {
     let map = overrides?;
     let mode = map.get(&format!("{prefix}-auth-mode"))?;
-    if !mode.eq_ignore_ascii_case("password") {
+    if !mode.eq_ignore_ascii_case("manual") {
+        return None;
+    }
+    let user = map.get(&format!("{prefix}-auth-user"))?;
+    let password = map.get(&format!("{prefix}-auth-password"))?;
+    if user.is_empty() || password.is_empty() {
         return None;
     }
     Some(LocalAuth {
-        user: map
-            .get(&format!("{prefix}-auth-user"))
-            .cloned()
-            .unwrap_or_default(),
-        password: map
-            .get(&format!("{prefix}-auth-password"))
-            .cloned()
-            .unwrap_or_default(),
+        user: user.clone(),
+        password: password.clone(),
     })
 }
 
@@ -154,9 +155,18 @@ pub fn plan_with(server: &Server, settings: &Settings, ctx: &ConnectContext) -> 
             let mut plans = Vec::new();
             if upstream_socks.is_some() {
                 let api_port = api_port(CoreKind::Xray, settings);
+                // This Xray process is an internal hop: sing-box (which captured the TUN)
+                // owns routing and dials its local SOCKS inbound without credentials, so
+                // provider routing/auth must NOT be applied here — only to the user-facing
+                // inbounds of the TUN sing-box process below.
                 plans.push(CorePlan {
                     core: CoreKind::Xray,
-                    config: xray::full_config_with(server, settings, api_port, ctx),
+                    config: xray::full_config_with(
+                        server,
+                        settings,
+                        api_port,
+                        &ConnectContext::default(),
+                    ),
                     elevated: false,
                     api_port,
                 });
@@ -296,6 +306,106 @@ mod tests {
         assert_eq!(plan[0].core, CoreKind::SingBox);
         assert!(plan[0].elevated);
         assert_eq!(plan[0].config["inbounds"][0]["type"], "tun");
+    }
+
+    fn overrides(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn local_auth_only_for_manual_with_credentials() {
+        let manual = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        let auth = local_auth("socks", Some(&manual)).unwrap();
+        assert_eq!(auth.user, "u");
+        assert_eq!(auth.password, "p");
+        assert!(local_auth_enabled(Some(&manual)));
+
+        // Case-insensitive mode.
+        let upper = overrides(&[
+            ("socks-auth-mode", "MANUAL"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        assert!(local_auth("socks", Some(&upper)).is_some());
+
+        // auto / from-json / disable do not enable auth.
+        for mode in ["auto", "from-json", "disable"] {
+            let m = overrides(&[
+                ("socks-auth-mode", mode),
+                ("socks-auth-user", "u"),
+                ("socks-auth-password", "p"),
+            ]);
+            assert!(local_auth("socks", Some(&m)).is_none(), "mode={mode}");
+            assert!(!local_auth_enabled(Some(&m)), "mode={mode}");
+        }
+    }
+
+    #[test]
+    fn local_auth_requires_non_empty_credentials() {
+        let missing = overrides(&[("socks-auth-mode", "manual")]);
+        assert!(local_auth("socks", Some(&missing)).is_none());
+
+        let blank_user = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", ""),
+            ("socks-auth-password", "p"),
+        ]);
+        assert!(local_auth("socks", Some(&blank_user)).is_none());
+
+        let blank_password = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", ""),
+        ]);
+        assert!(local_auth("socks", Some(&blank_password)).is_none());
+        assert!(!local_auth_enabled(Some(&blank_password)));
+
+        assert!(local_auth("http", None).is_none());
+        assert!(!local_auth_enabled(None));
+    }
+
+    #[test]
+    fn tun_chain_xray_ignores_provider_routing_and_auth() {
+        // The provider asks for global-direct routing and local auth.
+        let provider = ProviderRouting {
+            name: "p".into(),
+            enabled: true,
+            global_proxy: false,
+            domain_strategy: Some("AsIs".into()),
+            ..ProviderRouting::default()
+        };
+        let ov = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "u"),
+            ("socks-auth-password", "p"),
+        ]);
+        let ctx = ConnectContext {
+            provider: Some(&provider),
+            overrides: Some(&ov),
+        };
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            ..Settings::default()
+        };
+        let plans = plan_with(&vless_xhttp(), &settings, &ctx);
+        assert_eq!(plans.len(), 2);
+        // Chained Xray must be built with the default context: no provider routing, no auth.
+        let expected = xray::full_config(&vless_xhttp(), &settings, plans[0].api_port);
+        assert_eq!(plans[0].config, expected);
+        assert_eq!(plans[0].config["inbounds"][0]["settings"]["auth"], "noauth");
+        // No conditionless provider catch-all rule, and no provider domain strategy.
+        let rules = plans[0].config["routing"]["rules"].as_array().unwrap();
+        assert!(!rules.iter().any(|r| r.get("domain").is_none()
+            && r.get("ip").is_none()
+            && r.get("inboundTag").is_none()));
+        assert_eq!(plans[0].config["routing"]["domainStrategy"], "IPIfNonMatch");
     }
 }
 
@@ -907,10 +1017,10 @@ mod validation {
             (
                 "auth",
                 Some(BTreeMap::from([
-                    ("socks-auth-mode".to_string(), "password".to_string()),
+                    ("socks-auth-mode".to_string(), "manual".to_string()),
                     ("socks-auth-user".to_string(), "user".to_string()),
                     ("socks-auth-password".to_string(), "pass".to_string()),
-                    ("http-auth-mode".to_string(), "password".to_string()),
+                    ("http-auth-mode".to_string(), "manual".to_string()),
                     ("http-auth-user".to_string(), "user".to_string()),
                     ("http-auth-password".to_string(), "pass".to_string()),
                 ])),
@@ -972,6 +1082,44 @@ mod validation {
             }
         }
         assert!(validated > 0, "no provider configs validated");
+        report(problems);
+    }
+
+    #[test]
+    fn provider_tun_chain_configs_are_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let Some((_, srv)) = samples().into_iter().find(|(n, _)| *n == "vless-xhttp") else {
+            return;
+        };
+        let mut problems = Vec::new();
+        for (pname, provider) in provider_routings() {
+            for (oname, overrides) in override_sets() {
+                let ctx = ConnectContext {
+                    provider: Some(&provider),
+                    overrides: overrides.as_ref(),
+                };
+                let settings = settings(ConnectionMode::Tun, Routing::default());
+                let plans = super::plan_with(&srv, &settings, &ctx);
+                assert_eq!(
+                    plans.len(),
+                    2,
+                    "{pname}/{oname}: xhttp chain must be xray + sing-box"
+                );
+                for plan in &plans {
+                    problems.extend(check_core(
+                        plan.core,
+                        &plan.config,
+                        &format!(
+                            "vless-xhttp/{pname}/{oname}/tun-chain/{}",
+                            plan.core.binary_name()
+                        ),
+                    ));
+                }
+            }
+        }
         report(problems);
     }
 }
