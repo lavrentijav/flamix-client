@@ -181,8 +181,9 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
         }
     });
 
-    // Re-read "Обновлено" from the controller while the page is visible: `update_geo` and a
-    // connect both finish on the runtime thread, so the label would otherwise stay stale.
+    // Re-read "Обновлено" from the controller: `update_geo` and a connect both finish on the
+    // runtime thread, so the label would otherwise stay stale. The timer runs process-wide and
+    // early-returns unless this page (index 3) is visible (same pattern as the stats page).
     let ui_weak = ui.as_weak();
     let ctrl = ctrl.cloned();
     let timer = Timer::default();
@@ -381,10 +382,14 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         local_auth_pass: bridge.get_local_auth_pass().to_string(),
         routing: base.routing.clone(),
         failover: base.failover.clone(),
-        geo: GeoData {
-            source: source_from_index(bridge.get_geo_source_index()),
-            geosite_url: bridge.get_geo_geosite_url().to_string(),
-            geoip_url: bridge.get_geo_geoip_url().to_string(),
+        geo: {
+            let mut geo = GeoData {
+                source: source_from_index(bridge.get_geo_source_index()),
+                geosite_url: bridge.get_geo_geosite_url().to_string(),
+                geoip_url: bridge.get_geo_geoip_url().to_string(),
+            };
+            trim_geo_urls(&mut geo);
+            geo
         },
         dns: Dns {
             remote: bridge.get_dns_remote().to_string(),
@@ -675,6 +680,13 @@ fn source_from_index(index: i32) -> GeoSource {
         2 => GeoSource::Custom,
         _ => GeoSource::FreedomForRussia,
     }
+}
+
+/// Trim the custom geo URLs so a whitespace-only value is stored as empty (a spaces-only URL
+/// would otherwise look non-empty to `flamix_core::geo::urls` and make the download fail).
+fn trim_geo_urls(geo: &mut GeoData) {
+    geo.geosite_url = geo.geosite_url.trim().to_string();
+    geo.geoip_url = geo.geoip_url.trim().to_string();
 }
 
 /// Human label for `AppState.geo_updated` (unix seconds): "никогда" at 0, else local date/time.
@@ -1053,6 +1065,27 @@ mod tests {
     }
 
     #[test]
+    fn whitespace_only_geo_urls_validate_and_normalize_to_empty() {
+        let mut s = settings();
+        s.geo.source = GeoSource::Custom;
+        s.geo.geosite_url = "   ".into();
+        s.geo.geoip_url = "\t \n".into();
+        // A spaces-only URL is treated as empty: no validation error...
+        assert!(validate(&s).geo.is_empty());
+
+        // ...and normalization (read_bridge) trims it to a real empty string, so `geo::urls`
+        // will not treat it as a URL to download.
+        trim_geo_urls(&mut s.geo);
+        assert_eq!(s.geo.geosite_url, "");
+        assert_eq!(s.geo.geoip_url, "");
+
+        // Surrounding whitespace on a valid URL is also removed.
+        s.geo.geosite_url = "  https://example.com/geosite.dat  ".into();
+        trim_geo_urls(&mut s.geo);
+        assert_eq!(s.geo.geosite_url, "https://example.com/geosite.dat");
+    }
+
+    #[test]
     fn geo_change_is_core_affecting_and_merged() {
         let base = settings();
         let custom = Settings {
@@ -1074,5 +1107,35 @@ mod tests {
         let mut target = base.clone();
         apply_owned_in_place(&mut target, &custom);
         assert_eq!(target.geo, custom.geo);
+    }
+
+    #[test]
+    fn custom_geosite_only_change_is_core_affecting_and_merged() {
+        // Source stays Custom: changing only `geosite_url` must still be a core-affecting edit
+        // and must survive merge_owned/apply_owned_in_place.
+        let base = Settings {
+            geo: GeoData {
+                source: GeoSource::Custom,
+                geosite_url: "https://a.example/geosite.dat".into(),
+                geoip_url: "https://a.example/geoip.dat".into(),
+            },
+            ..settings()
+        };
+        let edited = Settings {
+            geo: GeoData {
+                source: GeoSource::Custom,
+                geosite_url: "https://b.example/geosite.dat".into(),
+                geoip_url: "https://a.example/geoip.dat".into(),
+            },
+            ..base.clone()
+        };
+        assert!(core_affecting_changed(&base, &edited));
+
+        let merged = merge_owned(&base, &edited);
+        assert_eq!(merged.geo, edited.geo);
+
+        let mut target = base.clone();
+        apply_owned_in_place(&mut target, &edited);
+        assert_eq!(target.geo, edited.geo);
     }
 }
