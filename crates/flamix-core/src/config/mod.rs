@@ -62,6 +62,34 @@ pub fn local_auth_enabled(overrides: Option<&BTreeMap<String, String>>) -> bool 
     local_auth("socks", overrides).is_some() || local_auth("http", overrides).is_some()
 }
 
+/// Local inbound credentials for `prefix`, with the provider/Happ override taking precedence
+/// over the user setting.
+///
+/// Precedence (documented, tested):
+/// 1. A valid Happ `socks-auth-*`/`http-auth-*` `manual` override for this prefix wins.
+/// 2. Otherwise, `settings.local_auth_user` + `settings.local_auth_pass` when both are
+///    non-empty.
+/// 3. Otherwise no auth.
+///
+/// The override is per prefix: a provider that authenticates only its SOCKS inbound still
+/// lets the user credentials apply to the HTTP inbound, and vice versa.
+pub(crate) fn effective_local_auth(
+    prefix: &str,
+    settings: &Settings,
+    overrides: Option<&BTreeMap<String, String>>,
+) -> Option<LocalAuth> {
+    if let Some(auth) = local_auth(prefix, overrides) {
+        return Some(auth);
+    }
+    if !settings.local_auth_user.is_empty() && !settings.local_auth_pass.is_empty() {
+        return Some(LocalAuth {
+            user: settings.local_auth_user.clone(),
+            password: settings.local_auth_pass.clone(),
+        });
+    }
+    None
+}
+
 /// Fallback probe URL for the core balancer when neither configured URL is set.
 pub(crate) const DEFAULT_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
 
@@ -206,10 +234,33 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
         ConnectionMode::Proxy => {
             // The core is picked from the primary; backups it cannot proxy are dropped so a
             // cluster never includes a `direct`/`freedom` node that `leastPing` would prefer.
-            let kind = if supported_by(primary).contains(&CoreKind::Xray) {
+            let auto = if supported_by(primary).contains(&CoreKind::Xray) {
                 CoreKind::Xray
             } else {
                 CoreKind::SingBox
+            };
+            // `settings.core_override`: "auto" keeps the automatic choice; a forced core that
+            // cannot express the primary falls back to `auto` with a warning (never a leak).
+            let kind = match settings.core_override.as_str() {
+                "xray" if supported_by(primary).contains(&CoreKind::Xray) => CoreKind::Xray,
+                "xray" => {
+                    tracing::warn!(
+                        "core_override=xray: server '{}' is not Xray-capable; using {}",
+                        primary.name,
+                        auto.binary_name()
+                    );
+                    auto
+                }
+                "sing-box" if singbox::outbound(primary, settings).is_some() => CoreKind::SingBox,
+                "sing-box" => {
+                    tracing::warn!(
+                        "core_override=sing-box: server '{}' is not sing-box-capable; using {}",
+                        primary.name,
+                        auto.binary_name()
+                    );
+                    auto
+                }
+                _ => auto,
             };
             let compatible: Vec<Server> = nodes
                 .iter()
@@ -493,6 +544,101 @@ mod tests {
 
         assert!(local_auth("http", None).is_none());
         assert!(!local_auth_enabled(None));
+    }
+
+    #[test]
+    fn effective_local_auth_provider_wins_then_user_then_none() {
+        let manual = overrides(&[
+            ("socks-auth-mode", "manual"),
+            ("socks-auth-user", "prov"),
+            ("socks-auth-password", "secret"),
+        ]);
+        let user = Settings {
+            local_auth_user: "user".into(),
+            local_auth_pass: "pass".into(),
+            ..Settings::default()
+        };
+
+        // Provider override wins for its prefix...
+        let auth = effective_local_auth("socks", &user, Some(&manual)).unwrap();
+        assert_eq!(auth.user, "prov");
+        assert_eq!(auth.password, "secret");
+        // ...but not for the other prefix: the user setting still applies there.
+        let auth = effective_local_auth("http", &user, Some(&manual)).unwrap();
+        assert_eq!(auth.user, "user");
+        assert_eq!(auth.password, "pass");
+
+        // No override: the user setting is used.
+        let auth = effective_local_auth("socks", &user, None).unwrap();
+        assert_eq!(auth.user, "user");
+
+        // A half-set user credential is ignored.
+        let half = Settings {
+            local_auth_user: "user".into(),
+            local_auth_pass: String::new(),
+            ..Settings::default()
+        };
+        assert!(effective_local_auth("socks", &half, None).is_none());
+
+        // Defaults: no auth at all.
+        assert!(effective_local_auth("socks", &Settings::default(), None).is_none());
+    }
+
+    #[test]
+    fn core_override_forces_and_falls_back() {
+        // One Xray-capable, one sing-box-capable server.
+        let ws = server(
+            Credentials::Vless {
+                uuid: "u".into(),
+                flow: None,
+                encryption: None,
+            },
+            Transport {
+                network: Network::Ws,
+                path: Some("/ws".into()),
+                ..Transport::default()
+            },
+        );
+        let hy2 = server(
+            Credentials::Hysteria2 {
+                password: "p".into(),
+                obfs: None,
+                obfs_password: None,
+                ports: None,
+                up_mbps: None,
+                down_mbps: None,
+            },
+            Transport::default(),
+        );
+
+        // "auto" keeps today's choice.
+        assert_eq!(plan(&ws, &Settings::default())[0].core, CoreKind::Xray);
+        assert_eq!(plan(&hy2, &Settings::default())[0].core, CoreKind::SingBox);
+
+        // "sing-box" forces sing-box for a server it can express...
+        let sb = Settings {
+            core_override: "sing-box".into(),
+            ..Settings::default()
+        };
+        assert_eq!(plan(&ws, &sb)[0].core, CoreKind::SingBox);
+        // ... and falls back to auto (Xray) for an xhttp server sing-box cannot express.
+        let xhttp = vless_xhttp();
+        assert_eq!(plan(&xhttp, &sb)[0].core, CoreKind::Xray);
+
+        // "xray" forces Xray when possible, else falls back to auto (sing-box).
+        let xray = Settings {
+            core_override: "xray".into(),
+            ..Settings::default()
+        };
+        assert_eq!(plan(&ws, &xray)[0].core, CoreKind::Xray);
+        assert_eq!(plan(&hy2, &xray)[0].core, CoreKind::SingBox);
+
+        // Unknown values are treated as "auto".
+        let bogus = Settings {
+            core_override: "whatever".into(),
+            ..Settings::default()
+        };
+        assert_eq!(plan(&hy2, &bogus)[0].core, CoreKind::SingBox);
     }
 
     #[test]
@@ -1605,6 +1751,80 @@ mod validation {
                     ));
                 }
             }
+        }
+        report(problems);
+    }
+
+    /// Every settings-overhaul knob (inbound, TUN, DNS, mux) against the real cores.
+    #[test]
+    fn settings_overhaul_knobs_are_accepted_by_the_real_cores() {
+        if std::env::var("FLAMIX_XRAY_BIN").is_err() && std::env::var("FLAMIX_SINGBOX_BIN").is_err()
+        {
+            return;
+        }
+        let Some((_, srv)) = samples().into_iter().find(|(n, _)| *n == "vless-ws") else {
+            return;
+        };
+        let mut problems = Vec::new();
+
+        // Xray proxy: UDP off, sniffing off, user auth, mux concurrency, DNS knobs.
+        let settings = Settings {
+            mode: ConnectionMode::Proxy,
+            udp_enabled: false,
+            sniffing: false,
+            mux: true,
+            mux_concurrency: 16,
+            local_auth_user: "user".into(),
+            local_auth_pass: "pass".into(),
+            dns: Dns {
+                parallel: true,
+                serve_stale: true,
+                hosts: BTreeMap::from([("host.example".into(), "10.0.0.7".into())]),
+                ..Dns::default()
+            },
+            ..Settings::default()
+        };
+        let api = api_port(CoreKind::Xray, &settings);
+        problems.extend(check_core(
+            CoreKind::Xray,
+            &xray::full_config(&srv, &settings, api),
+            "overhaul/proxy/xray",
+        ));
+
+        // sing-box proxy: mux on.
+        let api = api_port(CoreKind::SingBox, &settings);
+        problems.extend(check_core(
+            CoreKind::SingBox,
+            &singbox::full_config(&srv, &settings, false, None, api),
+            "overhaul/proxy/sing-box",
+        ));
+
+        // sing-box TUN: every ICMP mode with auto-route off, strict-route on, custom exclude,
+        // fake-ip range, bootstrap, SVCB blocking and static hosts.
+        for icmp in ["rule", "direct", "unreachable", "drop", "reply"] {
+            let settings = Settings {
+                mode: ConnectionMode::Tun,
+                tun_auto_route: false,
+                tun_strict_route: true,
+                tun_route_exclude: vec!["203.0.113.0/24".into()],
+                tun_icmp: icmp.into(),
+                dns: Dns {
+                    fake_ip: true,
+                    fake_ip_range: "198.19.0.0/16".into(),
+                    bootstrap: "77.88.8.8".into(),
+                    block_svcb: true,
+                    hosts: BTreeMap::from([("host.example".into(), "10.0.0.7".into())]),
+                    ..Dns::default()
+                },
+                ..Settings::default()
+            };
+            let api = api_port(CoreKind::SingBox, &settings);
+            let cfg = singbox::full_config(&srv, &settings, true, None, api);
+            problems.extend(check_core(
+                CoreKind::SingBox,
+                &cfg,
+                &format!("overhaul/tun/{icmp}/sing-box"),
+            ));
         }
         report(problems);
     }
