@@ -907,7 +907,14 @@ impl Controller {
         if self.geo_updating.load(Ordering::SeqCst) {
             tracing::debug!("skipping the geo refresh: a manual update is in flight");
         } else {
-            match geo::ensure(&geo_dir, &settings.geo, GEO_MAX_AGE).await {
+            // `geo_updated == 0` means "no data yet, or the source/URLs changed" (the settings page
+            // resets it on a geo change) — force a fresh download then; otherwise respect the cache.
+            let max_age = if self.with_state(|s| s.geo_updated == 0) {
+                0
+            } else {
+                GEO_MAX_AGE
+            };
+            match geo::ensure(&geo_dir, &settings.geo, max_age).await {
                 Ok(status) if status.downloaded => {
                     let now = chrono::Utc::now().timestamp();
                     self.mutate(|state| state.geo_updated = now);
