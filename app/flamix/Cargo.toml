@@ -23,6 +23,10 @@ anyhow.workspace = true
 chrono.workspace = true
 # Clipboard reading for `import-clipboard`.
 arboard = "3"
+# Native file dialogs for the backup export / import on the About page (T20).
+# `xdg-portal` keeps Linux free of a GTK build dependency; rfd requires an async
+# runtime feature (`tokio`) alongside it, and tokio is already a workspace dependency.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
 # Only used by the hidden `--screenshot` mode (offscreen software renderer -> PNG).
 png = "0.17"
 
