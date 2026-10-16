@@ -2,9 +2,8 @@
 // Rust side: src/pages/stats.rs talks to the page ONLY through the global StatsBridge.
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
-import { Icon } from "../components/icon.slint";
 
-// One header summary card (session / today / 30 days).
+// One header summary card (lifetime total / today / 30 days).
 export struct StatCard {
     title: string,
     value: string,
@@ -95,6 +94,8 @@ export component StatsPage inherits Rectangle {
 
     // Local UI state of the destructive "reset" confirm row.
     in-out property <bool> confirm-reset: false;
+    // Bar whose tooltip is pinned by a tap (-1 = none); hover shows the tooltip transiently.
+    in-out property <int> pinned-bar: -1;
 
     VerticalLayout {
         padding: 16px;
@@ -169,12 +170,17 @@ export component StatsPage inherits Rectangle {
                             HorizontalLayout {
                                 spacing: 3px;
                                 alignment: end;
-                                for b in StatsBridge.bars : Rectangle {
+                                for b[i] in StatsBridge.bars : Rectangle {
                                     horizontal-stretch: 1;
                                     height: parent.height;
-                                    background: bar-ta.has-hover ? Theme.hover : transparent;
-                                    bar-ta := TouchArea { mouse-cursor: pointer; }
-                                    column := Rectangle {
+                                    background: (bar-ta.has-hover || root.pinned-bar == i) ? Theme.hover : transparent;
+                                    bar-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => {
+                                            root.pinned-bar = root.pinned-bar == i ? -1 : i;
+                                        }
+                                    }
+                                    Rectangle {
                                         width: parent.width;
                                         y: parent.height - self.height;
                                         height: min(parent.height * (b.up-fraction + b.down-fraction), parent.height);
@@ -198,12 +204,16 @@ export component StatsPage inherits Rectangle {
                                             background: Theme.accent-strong;
                                         }
                                     }
-                                    // Tooltip on hover / tap.
-                                    if bar-ta.has-hover : Rectangle {
-                                        x: (parent.width - self.width) / 2;
-                                        y: 0px;
+                                    // Tooltip on hover / tap, clamped to the chart's horizontal edges.
+                                    if bar-ta.has-hover || root.pinned-bar == i : Rectangle {
                                         width: 96px;
                                         height: 46px;
+                                        x: clamp(
+                                            0px - (parent.absolute-position.x - chart.absolute-position.x),
+                                            (parent.width - self.width) / 2,
+                                            chart.width - self.width - (parent.absolute-position.x - chart.absolute-position.x)
+                                        );
+                                        y: 0px;
                                         border-radius: 8px;
                                         background: Theme.panel-bg;
                                         border-width: 1px;

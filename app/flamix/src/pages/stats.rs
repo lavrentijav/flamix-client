@@ -1,9 +1,13 @@
 //! "Статистика" page (page 4).
 //!
-//! Shows session / today / 30-day totals, a 30-day stacked bar chart, the servers with the
+//! Shows lifetime / today / 30-day totals, a 30-day stacked bar chart, the servers with the
 //! most locally accounted traffic and the subscription quotas. The page only talks to Slint
 //! through [`StatsBridge`] (see `ui/pages/stats-page.slint`); every value is derived from
 //! [`AppState`] and refreshed by a two-second timer while the page is visible.
+//!
+//! NOTE: [`Server::local_traffic`](flamix_core::model::Server) is cumulative and never reset,
+//! so the first card is labelled "Всего" (lifetime), not "Сессия". A true session counter would
+//! need the live connection totals; the controller does not expose them publicly yet (follow-up).
 
 use crate::controller::Controller;
 use crate::view;
@@ -13,7 +17,7 @@ use slint::{ComponentHandle, ModelRc, VecModel};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Days in the chart and in the "last 30 days" total.
 pub const CHART_DAYS: usize = 30;
@@ -23,6 +27,8 @@ pub const TOP_SERVERS: usize = 6;
 pub const MAX_SUBS: usize = 12;
 /// Refresh cadence while the page is visible.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+/// How often the timer checks the current page; short enough to react instantly on entry.
+const POLL_INTERVAL: Duration = Duration::from_millis(300);
 /// `AppWindow.page` value of this page.
 const PAGE_INDEX: i32 = 4;
 
@@ -78,8 +84,8 @@ pub fn bar_fractions(days: &[TrafficInfo]) -> Vec<(f32, f32)> {
 /// Summary shown in the three header cards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Totals {
-    /// Everything this client transferred locally (sum of every server's `local_traffic`).
-    pub session: TrafficInfo,
+    /// Lifetime total this client transferred locally (sum of every server's `local_traffic`).
+    pub total: TrafficInfo,
     /// The current day's counter.
     pub today: TrafficInfo,
     /// The sum over the last [`CHART_DAYS`] days.
@@ -88,7 +94,7 @@ pub struct Totals {
 
 /// Compute the header totals from the persisted state.
 pub fn header_totals(state: &AppState, today: chrono::NaiveDate) -> Totals {
-    let session = sum_infos(state.servers().map(|s| &s.local_traffic));
+    let total = sum_infos(state.servers().map(|s| &s.local_traffic));
     let key = today.format("%Y-%m-%d").to_string();
     let today_info = state.daily_traffic.get(&key).copied().unwrap_or_default();
     let month = sum_infos(
@@ -97,7 +103,7 @@ pub fn header_totals(state: &AppState, today: chrono::NaiveDate) -> Totals {
             .map(|(_, info)| info),
     );
     Totals {
-        session,
+        total,
         today: today_info,
         month,
     }
@@ -153,7 +159,11 @@ pub fn subscription_stats(state: &AppState, limit: usize) -> Vec<SubEntry> {
         .iter()
         .take(limit)
         .map(|sub| {
-            let quotas = sub.servers.iter().filter(|s| s.traffic.is_some()).count();
+            let quotas = sub
+                .servers
+                .iter()
+                .filter(|s| s.traffic.and_then(|t| t.remaining()).is_some())
+                .count();
             match sub.traffic {
                 Some(info) => SubEntry {
                     name: sub.name.clone(),
@@ -193,7 +203,7 @@ pub fn stat_card(title: &str, info: &TrafficInfo, highlight: bool) -> StatCard {
 
 pub fn build_cards(totals: &Totals) -> Vec<StatCard> {
     vec![
-        stat_card("Сессия", &totals.session, false),
+        stat_card("Всего", &totals.total, false),
         stat_card("Сегодня", &totals.today, true),
         stat_card("30 дней", &totals.month, false),
     ]
@@ -297,15 +307,27 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
 
     let ui_weak = ui.as_weak();
     let ctrl_timer = Arc::clone(&ctrl);
+    // Refresh on the page-entry edge (so a freshly opened page is never empty/stale) and then
+    // every REFRESH_INTERVAL while the page stays visible.
+    let mut was_visible = ui.get_page() == PAGE_INDEX;
+    let mut last_refresh: Option<Instant> = None;
     let timer = slint::Timer::default();
-    timer.start(slint::TimerMode::Repeated, REFRESH_INTERVAL, move || {
-        if let Some(ui) = ui_weak.upgrade() {
-            if ui.get_page() == PAGE_INDEX {
-                refresh_page(&ui, &ctrl_timer);
-            }
+    timer.start(slint::TimerMode::Repeated, POLL_INTERVAL, move || {
+        let Some(ui) = ui_weak.upgrade() else {
+            return;
+        };
+        let visible = ui.get_page() == PAGE_INDEX;
+        let due = last_refresh.is_none_or(|t| t.elapsed() >= REFRESH_INTERVAL);
+        if visible && (!was_visible || due) {
+            refresh_page(&ui, &ctrl_timer);
+            last_refresh = Some(Instant::now());
         }
+        was_visible = visible;
     });
     TIMER.with(|slot| *slot.borrow_mut() = Some(timer));
+
+    // Fill the page once at startup so the first visit shows data immediately.
+    refresh_page(ui, &ctrl);
 }
 
 // --- demo data ------------------------------------------------------------------
@@ -557,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn header_totals_session_today_and_month() {
+    fn header_totals_total_today_and_month() {
         let today = date(2026, 5, 10);
         let mut daily = BTreeMap::new();
         daily.insert("2026-05-10".to_string(), info(10, 90));
@@ -570,7 +592,7 @@ mod tests {
             ..AppState::default()
         };
         let totals = header_totals(&state, today);
-        assert_eq!(totals.session, info(3, 9));
+        assert_eq!(totals.total, info(3, 9));
         assert_eq!(totals.today, info(10, 90));
         // 30-day window includes May 10 and May 9, excludes April 1.
         assert_eq!(totals.month, info(11, 99));
@@ -630,7 +652,15 @@ mod tests {
             total: Some(100),
             expire: Some(0),
         });
-        sub.servers[0].traffic = Some(info(0, 0));
+        // Server "a" has a real limit (counted); server "b" reports traffic but no limit and
+        // must NOT be counted as a quota.
+        sub.servers[0].traffic = Some(TrafficInfo {
+            upload: 1,
+            download: 1,
+            total: Some(10),
+            expire: None,
+        });
+        sub.servers[1].traffic = Some(info(0, 0));
         let limited = subscription("s2", "Basic", vec![server("c", "C", "FI", 0, 0)]);
         let state = AppState {
             subscriptions: vec![sub, limited],
@@ -644,6 +674,59 @@ mod tests {
         assert_eq!(stats[0].quotas, 1);
         assert_eq!(stats[1].traffic, "∞");
         assert_eq!(stats[1].quotas, 0);
+    }
+
+    #[test]
+    fn build_top_maps_entries() {
+        let entries = vec![
+            TopEntry {
+                name: "Fast".to_string(),
+                iso: "DE".to_string(),
+                used: 1024 * 1024,
+                fraction: 1.0,
+            },
+            TopEntry {
+                name: "Slow".to_string(),
+                iso: "ru".to_string(),
+                used: 512,
+                fraction: 0.5,
+            },
+        ];
+        let rows = build_top(&entries);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Fast");
+        assert_eq!(rows[0].total, "1.0 MB");
+        assert!((rows[0].fraction - 1.0).abs() < 1e-6);
+        assert_eq!(rows[1].total, "512 B");
+        assert!((rows[1].fraction - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn build_subs_maps_entries() {
+        let entries = vec![
+            SubEntry {
+                name: "Premium".to_string(),
+                traffic: "20 B / 100 B".to_string(),
+                fraction: 0.2,
+                expire: "до 01.01.2027".to_string(),
+                quotas: 3,
+            },
+            SubEntry {
+                name: "Basic".to_string(),
+                traffic: "∞".to_string(),
+                fraction: 0.0,
+                expire: String::new(),
+                quotas: 0,
+            },
+        ];
+        let rows = build_subs(&entries);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Premium");
+        assert_eq!(rows[0].traffic, "20 B / 100 B");
+        assert!((rows[0].fraction - 0.2).abs() < 1e-6);
+        assert_eq!(rows[0].expire, "до 01.01.2027");
+        assert_eq!(rows[0].quotas, 3);
+        assert_eq!(rows[1].quotas, 0);
     }
 
     #[test]
