@@ -75,7 +75,9 @@ fi
 [ -n "$ISCC" ] || ISCC="$(command -v iscc || true)"
 [ -n "$ISCC" ] || { echo "error: ISCC.exe (Inno Setup) not found" >&2; exit 1; }
 
-"$ISCC" \
+# MSYS_NO_PATHCONV / MSYS2_ARG_CONV_EXCL stop Git Bash from rewriting the Inno Setup
+# `/D...` switches into Windows paths (which ISCC then reads as extra script filenames).
+MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' "$ISCC" \
     "/DAppVersion=$VER" \
     "/DSourceDir=$(cygpath -w "$STAGE")" \
     "/DOutputDir=$(cygpath -w "$DIST")" \
