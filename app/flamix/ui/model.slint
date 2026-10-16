@@ -1,0 +1,37 @@
+// Shared UI data model. Re-exported from `app.slint` (see the T07 contract).
+
+export enum ConnState {
+    disconnected,
+    connecting,
+    connected,
+    error,
+}
+
+export struct ServerItem {
+    id: string,
+    name: string,
+    country: string,
+    flag: image,
+    summary: string,
+    // -2 = untested, -1 = failed, otherwise latency in ms.
+    ping: int,
+    has-quota: bool,
+    quota-fraction: float,
+    quota-text: string,
+    selected: bool,
+}
+
+export struct SubscriptionItem {
+    id: string,
+    name: string,
+    pinned: bool,
+    collapsed: bool,
+    updating: bool,
+    has-traffic: bool,
+    traffic-fraction: float,
+    traffic-text: string,
+    expire-text: string,
+    announce: string,
+    error: string,
+    servers: [ServerItem],
+}

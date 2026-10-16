@@ -21,7 +21,7 @@ and [@alfalab/icons-flag](https://www.npmjs.com/package/@alfalab/icons-flag), MI
 | chevron-down.svg | ChevronDownMIcon |
 | chevron-right.svg | ChevronRightMIcon |
 | chevron-up.svg | ChevronUpMIcon |
-| pin.svg | PinMIcon |
+| pin.svg | PushpinMIcon |
 | refresh.svg | ArrowsCwMIcon |
 | power.svg | PowerButtonMIcon |
 | ping.svg | SpeedMIcon |

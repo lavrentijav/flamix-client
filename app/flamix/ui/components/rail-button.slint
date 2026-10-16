@@ -1,0 +1,51 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+
+// WinUI NavigationView-like item: pill highlight + accent indicator bar.
+export component RailButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> text: "";
+    in property <bool> selected: false;
+    in property <bool> expanded: false;
+    callback clicked();
+
+    height: 44px;
+    border-radius: 8px;
+    background: selected ? Theme.accent.with-alpha(0.16) : (ta.has-hover ? Theme.hover : transparent);
+    animate background { duration: 150ms; }
+
+    // Accent indicator bar on the left edge.
+    Rectangle {
+        x: 0;
+        y: 11px;
+        width: selected ? 3px : 0px;
+        height: parent.height - 22px;
+        border-radius: 2px;
+        background: Theme.accent;
+        animate width { duration: 150ms; }
+    }
+
+    Icon {
+        x: expanded ? 15px : (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 22px;
+        height: 22px;
+        source: icon;
+        tint: selected ? Theme.accent : Theme.muted;
+        animate x { duration: 150ms; }
+    }
+
+    if expanded : Text {
+        x: 47px;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: selected ? Theme.text : Theme.muted;
+        font-size: 14px;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

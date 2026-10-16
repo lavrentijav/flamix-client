@@ -1,0 +1,94 @@
+import { Theme } from "../theme.slint";
+import { RailButton } from "rail-button.slint";
+
+export component Rail inherits Rectangle {
+    in property <int> page: 0;
+    in-out property <bool> expanded: false;
+    callback navigate(int);
+
+    width: expanded ? 200px : 56px;
+    background: Theme.rail-bg;
+    animate width { duration: 180ms; easing: ease-in-out; }
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+
+        // Logo / home.
+        Rectangle {
+            height: 40px;
+            border-radius: 8px;
+            background: home-ta.has-hover ? Theme.hover : transparent;
+            Image {
+                x: 12px;
+                y: (parent.height - self.height) / 2;
+                width: 26px;
+                height: 26px;
+                source: @image-url("../../assets/app-icon.svg");
+            }
+            if root.expanded : Text {
+                x: 48px;
+                y: (parent.height - self.height) / 2;
+                text: "Flamix";
+                color: Theme.text;
+                font-size: 16px;
+                font-weight: 700;
+                vertical-alignment: center;
+            }
+            home-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.navigate(0); }
+            }
+        }
+
+        RailButton {
+            icon: root.expanded ? @image-url("../../assets/icons/sidebar-collapse.svg") : @image-url("../../assets/icons/sidebar-expand.svg");
+            text: "Свернуть";
+            expanded: root.expanded;
+            selected: false;
+            clicked => { root.expanded = !root.expanded; }
+        }
+
+        Rectangle { height: 6px; background: transparent; }
+
+        RailButton {
+            icon: @image-url("../../assets/icons/add.svg");
+            text: "Добавить";
+            expanded: root.expanded;
+            selected: root.page == 1;
+            clicked => { root.navigate(1); }
+        }
+        RailButton {
+            icon: @image-url("../../assets/icons/routing.svg");
+            text: "Маршрутизация";
+            expanded: root.expanded;
+            selected: root.page == 2;
+            clicked => { root.navigate(2); }
+        }
+        RailButton {
+            icon: @image-url("../../assets/icons/settings.svg");
+            text: "Настройки";
+            expanded: root.expanded;
+            selected: root.page == 3;
+            clicked => { root.navigate(3); }
+        }
+        RailButton {
+            icon: @image-url("../../assets/icons/stats.svg");
+            text: "Статистика";
+            expanded: root.expanded;
+            selected: root.page == 4;
+            clicked => { root.navigate(4); }
+        }
+
+        // Push "About" to the bottom.
+        Rectangle { vertical-stretch: 1; background: transparent; }
+
+        RailButton {
+            icon: @image-url("../../assets/icons/info.svg");
+            text: "О программе";
+            expanded: root.expanded;
+            selected: root.page == 5;
+            clicked => { root.navigate(5); }
+        }
+    }
+}

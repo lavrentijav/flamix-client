@@ -1,0 +1,70 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+import { ConnState } from "../model.slint";
+
+export component PowerButton inherits Rectangle {
+    in property <ConnState> state: ConnState.disconnected;
+    callback clicked();
+
+    width: 150px;
+    height: 150px;
+    background: transparent;
+
+    property <bool> is-connected: state == ConnState.connected;
+    property <bool> is-connecting: state == ConnState.connecting;
+    property <angle> spin: is-connecting ? 360deg : 0deg;
+    animate spin { duration: 1100ms; iteration-count: -1; easing: linear; }
+
+    // Soft accent glow when connected.
+    Rectangle {
+        x: -14px;
+        y: -14px;
+        width: parent.width + 28px;
+        height: parent.height + 28px;
+        border-radius: (parent.width + 28px) / 2;
+        background: root.is-connected ? Theme.accent.with-alpha(0.22) : transparent;
+        animate background { duration: 220ms; }
+    }
+
+    // Base disc / outline.
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: parent.width / 2;
+        background: root.is-connected ? Theme.accent : (root.is-connecting ? Theme.panel-bg : transparent);
+        border-width: root.is-connected ? 0px : 3px;
+        border-color: root.is-connecting ? Theme.track : Theme.muted;
+        animate background { duration: 220ms; }
+    }
+
+    // Rotating arc while connecting.
+    if root.is-connecting : Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-radius: parent.width / 2;
+        background: @conic-gradient(from root.spin, Theme.accent 0deg, transparent 300deg);
+    }
+    if root.is-connecting : Rectangle {
+        x: 9px;
+        y: 9px;
+        width: parent.width - 18px;
+        height: parent.height - 18px;
+        border-radius: (parent.width - 18px) / 2;
+        background: Theme.panel-bg;
+    }
+
+    Icon {
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        width: 46px;
+        height: 46px;
+        source: @image-url("../../assets/icons/power.svg");
+        tint: root.is-connected ? Theme.on-accent : Theme.text;
+        animate tint { duration: 220ms; }
+    }
+
+    TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}

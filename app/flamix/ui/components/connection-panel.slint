@@ -1,0 +1,139 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+import { PowerButton } from "power-button.slint";
+import { ConnState } from "../model.slint";
+
+export component ConnectionPanel inherits Rectangle {
+    in property <image> selected-flag;
+    in property <string> selected-name;
+    in property <string> ping-result;
+    in property <ConnState> state;
+    in property <string> status-text;
+    in property <string> speed-text;
+    in-out property <bool> tun-mode: false;
+    callback toggle-connect();
+    callback ping-selected();
+    callback mode-changed(bool);
+
+    width: 300px;
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 16px;
+
+        // Power button.
+        Rectangle {
+            height: 178px;
+            background: transparent;
+            PowerButton {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 150px;
+                height: 150px;
+                state: root.state;
+                clicked => { root.toggle-connect(); }
+            }
+        }
+
+        // Selected server.
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            Image {
+                width: 24px;
+                height: 18px;
+                source: root.selected-flag;
+            }
+            Text {
+                text: root.selected-name;
+                color: Theme.text;
+                font-size: 15px;
+                vertical-alignment: center;
+            }
+        }
+
+        // Ping button.
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 168px;
+                height: 36px;
+                border-radius: 8px;
+                background: ping-ta.has-hover ? Theme.hover : Theme.control-bg;
+                border-width: 1px;
+                border-color: Theme.stroke;
+                // Icon and text vertically centered on one line.
+                HorizontalLayout {
+                    alignment: center;
+                    cross-axis-alignment: center;
+                    spacing: 8px;
+                    Icon {
+                        width: 16px;
+                        height: 16px;
+                        source: @image-url("../../assets/icons/ping.svg");
+                        tint: Theme.text;
+                    }
+                    Text {
+                        text: "Тест пинга" + root.ping-result;
+                        color: Theme.text;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                }
+                ping-ta := TouchArea { mouse-cursor: pointer; clicked => { root.ping-selected(); } }
+            }
+        }
+
+        // Proxy / TUN segmented control.
+        Rectangle {
+            height: 34px;
+            border-radius: 8px;
+            background: Theme.track;
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    background: !root.tun-mode ? Theme.accent : transparent;
+                    Text {
+                        text: "Proxy";
+                        color: !root.tun-mode ? Theme.on-accent : Theme.muted;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.mode-changed(false); } }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    background: root.tun-mode ? Theme.accent : transparent;
+                    Text {
+                        text: "TUN";
+                        color: root.tun-mode ? Theme.on-accent : Theme.muted;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                    TouchArea { mouse-cursor: pointer; clicked => { root.mode-changed(true); } }
+                }
+            }
+        }
+
+        Text {
+            text: root.status-text;
+            color: Theme.muted;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
+        if root.state == ConnState.connected : Text {
+            text: root.speed-text;
+            color: Theme.text;
+            font-size: 13px;
+            horizontal-alignment: center;
+        }
+    }
+}

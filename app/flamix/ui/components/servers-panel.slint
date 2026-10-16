@@ -1,0 +1,193 @@
+import { ScrollView } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+import { SubscriptionItem, ServerItem } from "../model.slint";
+import { SubscriptionCard } from "subscription-card.slint";
+import { ServerRow } from "server-row.slint";
+
+export component ServersPanel inherits Rectangle {
+    in property <[SubscriptionItem]> subscriptions;
+    in property <[ServerItem]> local-servers;
+    in-out property <string> search-text;
+    in property <bool> edit-mode: false;
+
+    callback search-changed(string);
+    callback toggle-edit();
+    callback import-clipboard();
+    callback update-all();
+    callback ping-all();
+    callback sort-by-ping();
+    callback add-subscription();
+    callback toggle-collapse(string);
+    callback toggle-pin(string);
+    callback refresh(string);
+    callback subscription-settings(string);
+    callback delete-subscription(string);
+    callback select-server(string);
+    callback open-server(string);
+    callback delete-server(string);
+
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        // Title row.
+        HorizontalLayout {
+            height: 34px;
+            Text {
+                text: "Серверы";
+                color: Theme.text;
+                font-size: 20px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 8px;
+                background: (edit-ta.has-hover || root.edit-mode) ? Theme.hover : transparent;
+                Icon {
+                    x: (parent.width - 18px) / 2;
+                    y: (parent.height - 18px) / 2;
+                    width: 18px;
+                    height: 18px;
+                    source: @image-url("../../assets/icons/edit.svg");
+                    tint: root.edit-mode ? Theme.accent : Theme.muted;
+                }
+                edit-ta := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-edit(); } }
+            }
+            Rectangle {
+                width: 34px;
+                height: 34px;
+                border-radius: 8px;
+                background: more-ta.has-hover ? Theme.hover : transparent;
+                Icon {
+                    x: (parent.width - 18px) / 2;
+                    y: (parent.height - 18px) / 2;
+                    width: 18px;
+                    height: 18px;
+                    source: @image-url("../../assets/icons/more.svg");
+                    tint: Theme.muted;
+                }
+                more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.import-clipboard(); } }
+            }
+        }
+
+        // Search.
+        Rectangle {
+            height: 36px;
+            border-radius: 8px;
+            background: Theme.track;
+            Icon {
+                x: 11px;
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
+                source: @image-url("../../assets/icons/search.svg");
+                tint: Theme.muted;
+            }
+            if root.search-text == "" : Text {
+                x: 35px;
+                y: 0px;
+                width: parent.width - 47px;
+                height: parent.height;
+                text: "Поиск";
+                color: Theme.muted;
+                font-size: 13px;
+                vertical-alignment: center;
+            }
+            TextInput {
+                x: 35px;
+                y: 0px;
+                width: parent.width - 47px;
+                height: parent.height;
+                text <=> root.search-text;
+                color: Theme.text;
+                font-size: 13px;
+                vertical-alignment: center;
+                edited => { root.search-changed(self.text); }
+            }
+        }
+
+        if root.subscriptions.length == 0 && root.local-servers.length == 0 : VerticalLayout {
+            vertical-stretch: 1;
+            alignment: center;
+            spacing: 14px;
+            Text {
+                text: "Нет серверов";
+                color: Theme.muted;
+                font-size: 15px;
+                horizontal-alignment: center;
+            }
+            Rectangle {
+                width: 200px;
+                height: 36px;
+                border-radius: 8px;
+                background: add-ta.has-hover ? Theme.accent-strong : Theme.accent;
+                Text {
+                    text: "Добавить подписку";
+                    color: Theme.on-accent;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                add-ta := TouchArea { mouse-cursor: pointer; clicked => { root.add-subscription(); } }
+            }
+        }
+        if !(root.subscriptions.length == 0 && root.local-servers.length == 0) : ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 12px;
+                for sub in root.subscriptions : SubscriptionCard {
+                    sub: sub;
+                    edit-mode: root.edit-mode;
+                    toggle-collapse => { root.toggle-collapse(sub.id); }
+                    toggle-pin => { root.toggle-pin(sub.id); }
+                    refresh => { root.refresh(sub.id); }
+                    settings => { root.subscription-settings(sub.id); }
+                    delete-sub => { root.delete-subscription(sub.id); }
+                    select-server(id) => { root.select-server(id); }
+                    open-server(id) => { root.open-server(id); }
+                    delete-server(id) => { root.delete-server(id); }
+                }
+
+                if root.local-servers.length > 0 : Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    clip: true;
+                    height: local-content.preferred-height;
+                    local-content := VerticalLayout {
+                        padding: 0px;
+                        spacing: 0px;
+                        Rectangle {
+                            height: 46px;
+                            background: Theme.card-header;
+                            Text {
+                                x: 16px;
+                                y: (parent.height - self.height) / 2;
+                                text: "Локальные серверы";
+                                color: Theme.text;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                        }
+                        for s in root.local-servers : ServerRow {
+                            item: s;
+                            edit-mode: root.edit-mode;
+                            clicked => { root.select-server(s.id); }
+                            open => { root.open-server(s.id); }
+                            delete-clicked => { root.delete-server(s.id); }
+                        }
+                        Rectangle { height: 4px; background: transparent; }
+                    }
+                }
+            }
+        }
+    }
+}
