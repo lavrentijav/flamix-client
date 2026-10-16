@@ -618,7 +618,7 @@ pub struct Dns {
     pub bootstrap: String,
     /// Block SVCB/HTTPS (type 65) queries (sing-box TUN) so browsers use A/AAAA.
     pub block_svcb: bool,
-    /// Query upstreams in parallel (Xray `queryStrategy`/parallel).
+    /// Query upstreams in parallel (Xray `enableParallelQuery`).
     pub parallel: bool,
     /// Serve stale answers on failure (Xray `serveStale`).
     pub serve_stale: bool,
@@ -635,7 +635,7 @@ impl Default for Dns {
             fake_ip_range: "198.18.0.0/15".into(),
             bootstrap: String::new(),
             block_svcb: false,
-            parallel: true,
+            parallel: false,
             serve_stale: false,
             hosts: BTreeMap::new(),
         }
@@ -733,8 +733,8 @@ impl Default for Settings {
             ],
             udp_enabled: true,
             sniffing: true,
-            dest_override: vec!["http".into(), "tls".into()],
-            route_only: false,
+            dest_override: vec!["http".into(), "tls".into(), "quic".into()],
+            route_only: true,
             local_auth_user: String::new(),
             local_auth_pass: String::new(),
             routing: Routing::default(),
@@ -744,7 +744,7 @@ impl Default for Settings {
             tun_stack: "mixed".into(),
             tun_ipv6: false,
             tun_auto_route: true,
-            tun_strict_route: false,
+            tun_strict_route: true,
             tun_icmp: "reply".into(),
             tun_route_exclude: Vec::new(),
             mux: false,

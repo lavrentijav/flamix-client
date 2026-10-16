@@ -7,7 +7,7 @@
 //! 1.12 moved WireGuard out of `outbounds`); see [`outbound`].
 
 use crate::config::routing::{self, Rule};
-use crate::config::{local_auth, ConnectContext};
+use crate::config::{effective_local_auth, ConnectContext};
 use crate::model::{
     Credentials, Network, ProviderRouting, RoutingPreset, RuleAction, Security, Server, Settings,
     Transport,
@@ -206,13 +206,51 @@ pub fn outbound(server: &Server, settings: &Settings) -> Option<Value> {
     if is_domain(&server.address) {
         obj.insert("domain_resolver".into(), json!("direct"));
     }
+    // Outbound multiplexing, wired only for the protocols sing-box supports it on. Xray's
+    // `concurrency` maps to sing-box `max_streams` (both = concurrent streams per connection).
+    if settings.mux && mux_supported(server) {
+        let mut mux = Map::new();
+        mux.insert("enabled".into(), json!(true));
+        if settings.mux_concurrency > 0 {
+            mux.insert("max_streams".into(), json!(settings.mux_concurrency));
+        }
+        obj.insert("multiplex".into(), Value::Object(mux));
+    }
 
     Some(Value::Object(obj))
+}
+
+/// True when `multiplex` may be emitted for `server` (vless without an xtls flow, vmess,
+/// trojan, shadowsocks; hysteria2/tuic/wireguard/socks/http manage their own multiplexing).
+fn mux_supported(server: &Server) -> bool {
+    match &server.credentials {
+        Credentials::Vless { flow, .. } => flow.as_deref().unwrap_or("").is_empty(),
+        Credentials::Vmess { .. }
+        | Credentials::Trojan { .. }
+        | Credentials::Shadowsocks { .. } => true,
+        _ => false,
+    }
 }
 
 /// True when `value` is not a literal IP address (so it must be resolved).
 fn is_domain(value: &str) -> bool {
     value.parse::<std::net::IpAddr>().is_err()
+}
+
+/// Map Xray `destOverride` values to sing-box `sniff` action `sniffer` names.
+///
+/// sing-box sniffs all protocols unless a `sniffer` list is given; `fakedns` has no sing-box
+/// sniffer and is dropped (the fake-ip range is configured separately on the `fakeip` server).
+fn singbox_sniffers(dest_override: &[String]) -> Vec<&'static str> {
+    dest_override
+        .iter()
+        .filter_map(|value| match value.to_ascii_lowercase().as_str() {
+            "http" => Some("http"),
+            "tls" => Some("tls"),
+            "quic" => Some("quic"),
+            _ => None,
+        })
+        .collect()
 }
 
 /// A failover node outbound: the real outbound for `node`, tagged `node-<index>`.
@@ -355,6 +393,29 @@ fn build_config(
         .map(|d| d.direct.as_str())
         .unwrap_or(&settings.dns.direct);
     let fake_ip = provider.map(|p| p.fake_dns).unwrap_or(settings.dns.fake_ip);
+    let fake_ip_range = provider_dns
+        .map(|d| d.fake_ip_range.as_str())
+        .unwrap_or(&settings.dns.fake_ip_range);
+    let bootstrap = provider_dns
+        .map(|d| d.bootstrap.as_str())
+        .unwrap_or(&settings.dns.bootstrap)
+        .trim();
+    let block_svcb = provider_dns
+        .map(|d| d.block_svcb)
+        .unwrap_or(settings.dns.block_svcb);
+    // sing-box has no parallel-query switch and no Xray `serveStale`; both are ignored.
+    if provider_dns
+        .map(|d| d.parallel)
+        .unwrap_or(settings.dns.parallel)
+    {
+        tracing::debug!("dns.parallel is Xray-only; ignored by sing-box");
+    }
+    if provider_dns
+        .map(|d| d.serve_stale)
+        .unwrap_or(settings.dns.serve_stale)
+    {
+        tracing::debug!("dns.serve_stale is Xray-only; ignored by sing-box");
+    }
     let geo = GeoUrls::from_provider(provider);
 
     let wireguard = matches!(primary.credentials, Credentials::Wireguard { .. });
@@ -373,16 +434,47 @@ fn build_config(
     let proxy_in_endpoints = wireguard && upstream_socks.is_none();
 
     let mut rule_sets: BTreeMap<String, String> = BTreeMap::new();
-    let mut route_rules = vec![
-        json!({"action": "sniff"}),
-        json!({"protocol": "dns", "action": "hijack-dns"}),
-    ];
+    let mut route_rules = Vec::new();
+    if settings.sniffing {
+        let mut sniff = Map::new();
+        sniff.insert("action".into(), json!("sniff"));
+        let sniffer: Vec<&str> = singbox_sniffers(&settings.dest_override);
+        if !sniffer.is_empty() {
+            sniff.insert("sniffer".into(), json!(sniffer));
+        }
+        route_rules.push(Value::Object(sniff));
+        // LIMITATION: `route_only` (Xray: sniff for routing but do not override the destination
+        // the outbound dials) has no sing-box equivalent. The `sniff` action always makes the
+        // sniffed domain the destination, and sing-box has no "sniff without override" switch,
+        // so the flag is ignored (noted for the user, never a config failure).
+        if settings.route_only {
+            tracing::debug!("settings.route_only is Xray-only; ignored by sing-box");
+        }
+    } else {
+        tracing::debug!("settings.sniffing=false: omitting the sing-box `sniff` action");
+    }
+    route_rules.push(json!({"protocol": "dns", "action": "hijack-dns"}));
     if tun {
         // Prevent the chained Xray/sing-box processes from being routed into the tunnel.
         route_rules.push(json!({
             "process_name": ["xray", "xray.exe", "sing-box", "sing-box.exe"],
             "outbound": "direct",
         }));
+        // ICMP routing; `rule` (the neutral value) leaves ICMP to normal routing.
+        match settings.tun_icmp.as_str() {
+            "direct" => route_rules.push(json!({"network": "icmp", "outbound": "direct"})),
+            "unreachable" => route_rules.push(json!({"network": "icmp", "action": "reject"})),
+            "drop" => {
+                route_rules.push(json!({"network": "icmp", "action": "reject", "method": "drop"}))
+            }
+            "reply" => {
+                route_rules.push(json!({"network": "icmp", "action": "reject", "method": "reply"}))
+            }
+            "rule" => {}
+            other => {
+                tracing::debug!("unknown tun_icmp '{other}'; leaving ICMP to normal routing")
+            }
+        }
     }
     route_rules.push(json!({"ip_is_private": true, "outbound": "direct"}));
     // Provider rules replace the user's preset and go before the user's custom rules.
@@ -400,43 +492,69 @@ fn build_config(
         }
     }
 
+    // A bootstrap resolver (any IP form) is used to resolve the DNS servers' own domains.
+    let bootstrap_tag = (!bootstrap.is_empty()).then_some("bootstrap");
     let mut dns_servers = vec![
-        dns_server(remote_dns, "remote", Some("proxy"), "1.1.1.1"),
-        dns_server(direct_dns, "direct", None, "77.88.8.8"),
+        dns_server(
+            remote_dns,
+            "remote",
+            Some("proxy"),
+            "1.1.1.1",
+            bootstrap_tag,
+        ),
+        dns_server(direct_dns, "direct", None, "77.88.8.8", bootstrap_tag),
         json!({"type": "local", "tag": "local"}),
     ];
+    if bootstrap_tag.is_some() {
+        dns_servers.insert(
+            0,
+            json!({"type": "udp", "tag": "bootstrap", "server": bootstrap}),
+        );
+    }
     let mut dns_rules = Vec::new();
     if provider.is_none() && settings.routing.preset == RoutingPreset::BypassRu {
         rule_sets.insert("geosite-category-ru".into(), geosite_url("category-ru"));
         dns_rules.push(json!({"rule_set": ["geosite-category-ru"], "server": "direct"}));
     }
     if fake_ip && tun {
+        let range = fake_ip_range.trim();
+        let range = if range.is_empty() {
+            "198.18.0.0/15"
+        } else {
+            range
+        };
         dns_servers.push(json!({
             "type": "fakeip",
             "tag": "fakeip",
-            "inet4_range": "198.18.0.0/15",
+            "inet4_range": range,
             "inet6_range": "fc00::/18",
         }));
         dns_rules.insert(0, json!({"query_type": ["A", "AAAA"], "server": "fakeip"}));
     }
-    // Provider static hosts: a `hosts` DNS server consulted before anything else.
+    // Static hosts: the user `dns.hosts` first, then the provider `dns_hosts` override per key.
     let mut hosts_predefined: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (host, address) in &settings.dns.hosts {
+        hosts_predefined.insert(host.clone(), vec![address.clone()]);
+    }
     if let Some(provider) = provider {
         for (host, address) in &provider.dns_hosts {
             hosts_predefined.insert(host.clone(), vec![address.clone()]);
         }
     }
     if !hosts_predefined.is_empty() {
+        let domains: Vec<String> = hosts_predefined.keys().cloned().collect();
         dns_servers.insert(
             0,
             json!({"type": "hosts", "tag": "hosts", "predefined": hosts_predefined}),
         );
         // Xray `dns.hosts` covers the domain *and its subdomains*; match that with
         // `domain_suffix` (sing-box `domain` would only match the exact name).
-        let domains: Vec<&String> = provider
-            .map(|p| p.dns_hosts.keys().collect())
-            .unwrap_or_default();
         dns_rules.insert(0, json!({"domain_suffix": domains, "server": "hosts"}));
+    }
+    // Block SVCB/HTTPS (type 64/65) so browsers fall back to A/AAAA; sing-box accepts a DNS
+    // `reject` action (only in TUN the point is moot, but the rule is valid everywhere).
+    if block_svcb {
+        dns_rules.push(json!({"query_type": ["HTTPS", "SVCB"], "action": "reject"}));
     }
 
     let mut inbounds = Vec::new();
@@ -445,18 +563,34 @@ fn build_config(
         if settings.tun_ipv6 {
             address.push("fdfe:dcba:9876::1/126".into());
         }
+        // Always keep the private ranges excluded (loop prevention for the chained cores), then
+        // append the user's `tun_route_exclude` CIDRs (de-duplicated, blanks skipped).
+        let mut route_exclude: Vec<String> =
+            PRIVATE_RANGES.iter().map(|cidr| cidr.to_string()).collect();
+        for cidr in &settings.tun_route_exclude {
+            let cidr = cidr.trim();
+            if !cidr.is_empty() && !route_exclude.iter().any(|existing| existing == cidr) {
+                route_exclude.push(cidr.to_string());
+            }
+        }
         inbounds.push(json!({
             "type": "tun",
             "tag": "tun-in",
             "address": address,
             "mtu": settings.tun_mtu,
             "stack": settings.tun_stack,
-            "auto_route": true,
-            "strict_route": true,
-            "route_exclude_address": PRIVATE_RANGES,
+            "auto_route": settings.tun_auto_route,
+            "strict_route": settings.tun_strict_route,
+            "route_exclude_address": route_exclude,
         }));
     } else if upstream_socks.is_none() {
         // With an upstream SOCKS chain the Xray process binds the local listener.
+        // LIMITATION: sing-box's `mixed` inbound always serves UDP (TCP + UDP on one port);
+        // there is no per-inbound UDP toggle, so `udp_enabled=false` only applies to the Xray
+        // inbound. Noted for the user, never a config failure.
+        if !settings.udp_enabled {
+            tracing::debug!("settings.udp_enabled=false has no sing-box mixed equivalent; ignored");
+        }
         let mut inbound = Map::new();
         inbound.insert("type".into(), json!("mixed"));
         inbound.insert("tag".into(), json!("mixed-in"));
@@ -469,7 +603,7 @@ fn build_config(
             }),
         );
         inbound.insert("listen_port".into(), json!(settings.socks_port));
-        let users = mixed_users(ctx.overrides);
+        let users = mixed_users(settings, ctx.overrides);
         if !users.is_empty() {
             inbound.insert("users".into(), json!(users));
         }
@@ -543,11 +677,12 @@ fn build_config(
     Value::Object(cfg)
 }
 
-/// `socks-auth-*` / `http-auth-*` overrides as mixed-inbound `users` (deduplicated).
-fn mixed_users(overrides: Option<&BTreeMap<String, String>>) -> Vec<Value> {
+/// Mixed-inbound `users` from the provider `socks-auth-*` / `http-auth-*` overrides (which win
+/// per prefix) or, when neither is set, the user `local_auth_user`/`local_auth_pass`; de-duplicated.
+fn mixed_users(settings: &Settings, overrides: Option<&BTreeMap<String, String>>) -> Vec<Value> {
     let mut users: Vec<Value> = Vec::new();
     for prefix in ["socks", "http"] {
-        if let Some(auth) = local_auth(prefix, overrides) {
+        if let Some(auth) = effective_local_auth(prefix, settings, overrides) {
             let user = json!({"username": auth.user, "password": auth.password});
             if !users.contains(&user) {
                 users.push(user);
@@ -844,9 +979,15 @@ fn parse_ports(value: &str) -> (Vec<u16>, Vec<String>) {
 /// Parse an upstream DNS URL into the sing-box 1.12+ `{type, server, tag}` shape.
 ///
 /// `detour` is the outbound tag used to reach the server (`"proxy"` for the remote
-/// resolver, `None` for the direct one). A server given by domain name gets an
-/// explicit `domain_resolver` pointing at the `local` (system) resolver.
-fn dns_server(raw: &str, tag: &str, detour: Option<&str>, fallback: &str) -> Value {
+/// resolver, `None` for the direct one). A server given by domain name gets an explicit
+/// `domain_resolver` pointing at `bootstrap` when set, else the `local` (system) resolver.
+fn dns_server(
+    raw: &str,
+    tag: &str,
+    detour: Option<&str>,
+    fallback: &str,
+    bootstrap: Option<&str>,
+) -> Value {
     let mut m = Map::new();
     if raw == "localhost" || raw == "local" {
         m.insert("type".into(), json!("local"));
@@ -891,7 +1032,10 @@ fn dns_server(raw: &str, tag: &str, detour: Option<&str>, fallback: &str) -> Val
         m.insert("detour".into(), json!(detour));
     }
     if is_domain(&host) {
-        m.insert("domain_resolver".into(), json!("local"));
+        m.insert(
+            "domain_resolver".into(),
+            json!(bootstrap.unwrap_or("local")),
+        );
     }
     Value::Object(m)
 }
@@ -1067,7 +1211,10 @@ mod tests {
         assert_eq!(cfg["outbounds"][1]["tag"], json!("direct"));
 
         let rules = cfg["route"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0], json!({"action": "sniff"}));
+        assert_eq!(
+            rules[0],
+            json!({"action": "sniff", "sniffer": ["http", "tls", "quic"]})
+        );
         assert_eq!(rules[1], json!({"protocol": "dns", "action": "hijack-dns"}));
         assert!(rules
             .iter()
@@ -1381,5 +1528,207 @@ mod tests {
         assert_eq!(inbound["type"], json!("mixed"));
         assert_eq!(inbound["users"][0]["username"], json!("u"));
         assert_eq!(inbound["users"][0]["password"], json!("p"));
+    }
+
+    #[test]
+    fn mixed_inbound_sniffing_and_sniffers() {
+        // Default: sniff with the dest_override list.
+        let cfg = full_config(&vless(), &Settings::default(), false, None, 10819);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert_eq!(
+            rules[0],
+            json!({"action": "sniff", "sniffer": ["http", "tls", "quic"]})
+        );
+
+        // Sniffing off: no `sniff` action at all.
+        let off = Settings {
+            sniffing: false,
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless(), &off, false, None, 10819);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert!(!rules.iter().any(|r| r["action"] == json!("sniff")));
+
+        // `fakedns` has no sing-box sniffer: it is dropped and, with nothing left, the
+        // `sniffer` field is omitted (sniff everything).
+        let fake = Settings {
+            dest_override: vec!["fakedns".into()],
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless(), &fake, false, None, 10819);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0], json!({"action": "sniff"}));
+    }
+
+    #[test]
+    fn tun_auto_route_strict_route_and_exclude() {
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            tun_auto_route: false,
+            tun_strict_route: true,
+            tun_route_exclude: vec!["203.0.113.0/24".into(), "  10.0.0.0/8  ".into()],
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless(), &settings, true, None, 10819);
+        let tun = &cfg["inbounds"][0];
+        assert_eq!(tun["auto_route"], json!(false));
+        assert_eq!(tun["strict_route"], json!(true));
+        let excludes: Vec<&str> = tun["route_exclude_address"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(excludes.contains(&"203.0.113.0/24"));
+        // The user's private CIDR is de-duplicated against the built-in list.
+        assert_eq!(
+            excludes
+                .iter()
+                .filter(|cidr| **cidr == "10.0.0.0/8")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn tun_icmp_variants_map_to_route_rules() {
+        let cases = [
+            ("direct", json!({"network": "icmp", "outbound": "direct"})),
+            (
+                "unreachable",
+                json!({"network": "icmp", "action": "reject"}),
+            ),
+            (
+                "drop",
+                json!({"network": "icmp", "action": "reject", "method": "drop"}),
+            ),
+            (
+                "reply",
+                json!({"network": "icmp", "action": "reject", "method": "reply"}),
+            ),
+        ];
+        for (value, expected) in cases {
+            let settings = Settings {
+                mode: ConnectionMode::Tun,
+                tun_icmp: value.into(),
+                ..Settings::default()
+            };
+            let cfg = full_config(&vless(), &settings, true, None, 10819);
+            let rules = cfg["route"]["rules"].as_array().unwrap();
+            assert!(rules.contains(&expected), "value={value}");
+        }
+
+        // "rule" leaves ICMP to normal routing: no ICMP-specific rule.
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            tun_icmp: "rule".into(),
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless(), &settings, true, None, 10819);
+        let rules = cfg["route"]["rules"].as_array().unwrap();
+        assert!(!rules.iter().any(|rule| rule["network"] == json!("icmp")));
+    }
+
+    #[test]
+    fn dns_fakeip_range_bootstrap_block_svcb_and_hosts() {
+        let settings = Settings {
+            mode: ConnectionMode::Tun,
+            dns: Dns {
+                remote: "https://dns.google/dns-query".into(),
+                fake_ip: true,
+                fake_ip_range: "198.19.0.0/16".into(),
+                bootstrap: "77.88.8.8".into(),
+                block_svcb: true,
+                hosts: BTreeMap::from([("example.com".into(), "10.0.0.1".into())]),
+                ..Dns::default()
+            },
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless(), &settings, true, None, 10819);
+        let servers = cfg["dns"]["servers"].as_array().unwrap();
+
+        let bootstrap = servers
+            .iter()
+            .find(|s| s["tag"] == json!("bootstrap"))
+            .expect("bootstrap server");
+        assert_eq!(bootstrap["type"], json!("udp"));
+        assert_eq!(bootstrap["server"], json!("77.88.8.8"));
+        let remote = servers
+            .iter()
+            .find(|s| s["tag"] == json!("remote"))
+            .unwrap();
+        assert_eq!(remote["domain_resolver"], json!("bootstrap"));
+
+        let fakeip = servers
+            .iter()
+            .find(|s| s["type"] == json!("fakeip"))
+            .unwrap();
+        assert_eq!(fakeip["inet4_range"], json!("198.19.0.0/16"));
+
+        let hosts = servers
+            .iter()
+            .find(|s| s["type"] == json!("hosts"))
+            .unwrap();
+        assert_eq!(hosts["predefined"]["example.com"], json!(["10.0.0.1"]));
+
+        let rules = cfg["dns"]["rules"].as_array().unwrap();
+        assert!(rules
+            .iter()
+            .any(|rule| rule["query_type"] == json!(["HTTPS", "SVCB"])
+                && rule["action"] == json!("reject")));
+    }
+
+    #[test]
+    fn outbound_mux_wired_for_supported_protocols() {
+        let on = outbound(
+            &vless(),
+            &Settings {
+                mux: true,
+                mux_concurrency: 16,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(on["multiplex"]["enabled"], json!(true));
+        assert_eq!(on["multiplex"]["max_streams"], json!(16));
+
+        // Off by default.
+        let off = outbound(&vless(), &Settings::default()).unwrap();
+        assert!(off.get("multiplex").is_none());
+
+        // A vless xtls flow disables mux (mirrors Xray).
+        let flow = server(Credentials::Vless {
+            uuid: "u".into(),
+            flow: Some("xtls-rprx-vision".into()),
+            encryption: None,
+        });
+        let out = outbound(
+            &flow,
+            &Settings {
+                mux: true,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        assert!(out.get("multiplex").is_none());
+
+        // hysteria2 manages its own multiplexing.
+        let hy = server(Credentials::Hysteria2 {
+            password: "p".into(),
+            obfs: None,
+            obfs_password: None,
+            ports: None,
+            up_mbps: None,
+            down_mbps: None,
+        });
+        let out = outbound(
+            &hy,
+            &Settings {
+                mux: true,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
+        assert!(out.get("multiplex").is_none());
     }
 }

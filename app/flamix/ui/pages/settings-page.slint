@@ -1,35 +1,37 @@
-// Page "Настройки". OWNER: T17B.
+// Page "Настройки". OWNER: T24.
 // Rust side: src/pages/settings.rs talks to the page ONLY through the global SettingsBridge.
-import { ScrollView, LineEdit, TextEdit, Switch, ComboBox, SpinBox, Button } from "std-widgets.slint";
+// Two tiers: Основные (always visible) and a collapsible Дополнительно group.
+import { ScrollView, LineEdit, TextEdit, Switch, CheckBox, ComboBox, SpinBox, Button } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { SettingsCard, SettingsRow, SettingsField } from "settings-card.slint";
 
 export global SettingsBridge {
-    // --- Подключение -------------------------------------------------------
+    // --- Основные · Подключение ------------------------------------------
     in-out property <bool> tun-mode: false;
     in-out property <int> socks-port: 10808;
     in-out property <int> http-port: 10809;
     in-out property <bool> allow-lan: false;
     in-out property <bool> set-system-proxy: true;
-    in-out property <string> bypass: "";
-    in-out property <bool> mux: false;
-    in-out property <string> fingerprint: "chrome";
+    in-out property <bool> udp-enabled: true;
+    in-out property <bool> sniffing: true;
 
-    // --- TUN ---------------------------------------------------------------
+    // --- Основные · TUN ---------------------------------------------------
     in-out property <string> tun-stack: "mixed";
     in-out property <int> tun-mtu: 9000;
     in-out property <bool> tun-ipv6: false;
+    in-out property <bool> tun-auto-route: true;
+    in-out property <bool> tun-strict-route: false;
 
-    // --- DNS ---------------------------------------------------------------
+    // --- Основные · DNS ---------------------------------------------------
     in-out property <string> dns-remote: "";
     in-out property <string> dns-direct: "";
     in-out property <bool> dns-fake-ip: false;
 
-    // --- Пинг --------------------------------------------------------------
+    // --- Основные · Пинг --------------------------------------------------
     in-out property <string> ping-method: "url";
     in-out property <string> ping-url: "";
 
-    // --- Приложение --------------------------------------------------------
+    // --- Основные · Приложение -------------------------------------------
     in-out property <bool> launch-at-login: false;
     in-out property <bool> connect-on-launch: false;
     in-out property <bool> minimize-to-tray: true;
@@ -38,10 +40,34 @@ export global SettingsBridge {
     in-out property <int> language-index: 0; // 0 ru, 1 en
     in-out property <string> log-level: "warning";
 
-    // --- Состояние ---------------------------------------------------------
+    // --- Дополнительно ----------------------------------------------------
+    in-out property <bool> advanced-open: false;
+    in-out property <bool> dest-http: true;
+    in-out property <bool> dest-tls: true;
+    in-out property <bool> dest-quic: false;
+    in-out property <bool> dest-fakedns: false;
+    in-out property <bool> route-only: false;
+    in-out property <string> local-auth-user: "";
+    in-out property <string> local-auth-pass: "";
+    in-out property <string> tun-icmp: "reply";
+    in-out property <string> route-exclude: "";
+    in-out property <string> dns-fake-ip-range: "198.18.0.0/15";
+    in-out property <string> dns-bootstrap: "";
+    in-out property <bool> dns-block-svcb: false;
+    in-out property <bool> dns-parallel: true;
+    in-out property <bool> dns-serve-stale: false;
+    in-out property <string> dns-hosts: "";
+    in-out property <bool> mux: false;
+    in-out property <int> mux-concurrency: 8;
+    in-out property <string> core-override: "auto";
+    in-out property <string> fingerprint: "chrome";
+    in-out property <string> bypass: "";
+
+    // --- Состояние --------------------------------------------------------
     in property <string> ports-error: "";
     in property <string> dns-error: "";
     in property <string> ping-error: "";
+    in property <string> route-exclude-error: "";
     in property <string> save-status: "";
     in-out property <bool> reset-confirm: false;
 
@@ -117,6 +143,8 @@ export component SettingsPage inherits Rectangle {
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 12px;
+
+                // ==================== ОСНОВНЫЕ ====================
 
                 // ---------------- Подключение ----------------
                 SettingsCard {
@@ -212,7 +240,6 @@ export component SettingsPage inherits Rectangle {
                         color: Theme.danger;
                         font-size: 11px;
                     }
-
                     SettingsRow {
                         label: "Разрешить доступ из локальной сети";
                         hint: "слушать 0.0.0.0 вместо 127.0.0.1";
@@ -229,29 +256,19 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
                     SettingsRow {
-                        label: "Mux (мультиплексирование)";
-                        hint: "недоступно для потоков xtls";
+                        label: "UDP";
+                        hint: "UDP на локальном SOCKS/HTTP-входе";
                         Switch {
-                            checked <=> SettingsBridge.mux;
+                            checked <=> SettingsBridge.udp-enabled;
                             toggled => { SettingsBridge.changed(); }
                         }
                     }
                     SettingsRow {
-                        label: "Отпечаток (fingerprint)";
-                        ComboBox {
-                            width: 160px;
-                            model: ["chrome", "firefox", "safari", "edge", "random", "ios", "android"];
-                            current-value <=> SettingsBridge.fingerprint;
-                            selected => { SettingsBridge.changed(); }
-                        }
-                    }
-
-                    SettingsField {
-                        label: "Список исключений (по одному в строке)";
-                        TextEdit {
-                            height: 84px;
-                            text <=> SettingsBridge.bypass;
-                            edited => { SettingsBridge.changed(); }
+                        label: "Снифинг";
+                        hint: "определять домен из трафика";
+                        Switch {
+                            checked <=> SettingsBridge.sniffing;
+                            toggled => { SettingsBridge.changed(); }
                         }
                     }
                 }
@@ -283,6 +300,21 @@ export component SettingsPage inherits Rectangle {
                         label: "Поддержка IPv6";
                         Switch {
                             checked <=> SettingsBridge.tun-ipv6;
+                            toggled => { SettingsBridge.changed(); }
+                        }
+                    }
+                    SettingsRow {
+                        label: "Автоматическая маршрутизация";
+                        Switch {
+                            checked <=> SettingsBridge.tun-auto-route;
+                            toggled => { SettingsBridge.changed(); }
+                        }
+                    }
+                    SettingsRow {
+                        label: "Строгая маршрутизация";
+                        hint: "не откатываться к маршруту по умолчанию";
+                        Switch {
+                            checked <=> SettingsBridge.tun-strict-route;
                             toggled => { SettingsBridge.changed(); }
                         }
                     }
@@ -401,6 +433,198 @@ export component SettingsPage inherits Rectangle {
                             model: ["error", "warning", "info", "debug"];
                             current-value <=> SettingsBridge.log-level;
                             selected => { SettingsBridge.changed(); }
+                        }
+                    }
+                }
+
+                // ==================== ДОПОЛНИТЕЛЬНО ====================
+                SettingsCard {
+                    title: "Дополнительно";
+
+                    HorizontalLayout {
+                        spacing: 12px;
+                        alignment: center;
+                        Text {
+                            text: "Показать дополнительные настройки";
+                            color: Theme.text;
+                            font-size: 13px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Switch {
+                            checked <=> SettingsBridge.advanced-open;
+                        }
+                    }
+
+                    if SettingsBridge.advanced-open : VerticalLayout {
+                        spacing: 10px;
+
+                        SettingsField {
+                            label: "Снифинг destOverride";
+                            hint: "какие протоколы определять";
+                            HorizontalLayout {
+                                spacing: 18px;
+                                CheckBox {
+                                    text: "http";
+                                    checked <=> SettingsBridge.dest-http;
+                                    toggled => { SettingsBridge.changed(); }
+                                }
+                                CheckBox {
+                                    text: "tls";
+                                    checked <=> SettingsBridge.dest-tls;
+                                    toggled => { SettingsBridge.changed(); }
+                                }
+                                CheckBox {
+                                    text: "quic";
+                                    checked <=> SettingsBridge.dest-quic;
+                                    toggled => { SettingsBridge.changed(); }
+                                }
+                                CheckBox {
+                                    text: "fakedns";
+                                    checked <=> SettingsBridge.dest-fakedns;
+                                    toggled => { SettingsBridge.changed(); }
+                                }
+                                Rectangle { horizontal-stretch: 1; background: transparent; }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Только для маршрутизации";
+                            hint: "routeOnly: не подменять назначение";
+                            Switch {
+                                checked <=> SettingsBridge.route-only;
+                                toggled => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Логин локального входа";
+                            LineEdit {
+                                text <=> SettingsBridge.local-auth-user;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Пароль локального входа";
+                            hint: "провайдерские socks-auth/http-auth имеют приоритет";
+                            LineEdit {
+                                text <=> SettingsBridge.local-auth-pass;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Маршрутизация ICMP";
+                            ComboBox {
+                                width: 160px;
+                                model: ["rule", "direct", "unreachable", "drop", "reply"];
+                                current-value <=> SettingsBridge.tun-icmp;
+                                selected => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Исключения из auto-route (CIDR, по одному в строке)";
+                            TextEdit {
+                                height: 72px;
+                                text <=> SettingsBridge.route-exclude;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                            error: SettingsBridge.route-exclude-error;
+                        }
+
+                        Rectangle { height: 1px; background: Theme.stroke; }
+
+                        SettingsField {
+                            label: "Диапазон Fake-IP";
+                            LineEdit {
+                                text <=> SettingsBridge.dns-fake-ip-range;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Bootstrap DNS";
+                            hint: "резолвер для адресов DNS-серверов (sing-box)";
+                            LineEdit {
+                                text <=> SettingsBridge.dns-bootstrap;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Блокировать SVCB/HTTPS";
+                            hint: "sing-box, чтобы браузеры использовали A/AAAA";
+                            Switch {
+                                checked <=> SettingsBridge.dns-block-svcb;
+                                toggled => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Параллельные DNS-запросы";
+                            hint: "Xray";
+                            Switch {
+                                checked <=> SettingsBridge.dns-parallel;
+                                toggled => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Отдавать устаревшие ответы";
+                            hint: "Xray serveStale";
+                            Switch {
+                                checked <=> SettingsBridge.dns-serve-stale;
+                                toggled => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Hosts (domain ip, по одному в строке)";
+                            TextEdit {
+                                height: 72px;
+                                text <=> SettingsBridge.dns-hosts;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+
+                        Rectangle { height: 1px; background: Theme.stroke; }
+
+                        SettingsRow {
+                            label: "Mux (мультиплексирование)";
+                            hint: "недоступно для потоков xtls";
+                            Switch {
+                                checked <=> SettingsBridge.mux;
+                                toggled => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Mux concurrency";
+                            SpinBox {
+                                width: 130px;
+                                minimum: 1;
+                                maximum: 1024;
+                                value <=> SettingsBridge.mux-concurrency;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Отпечаток (fingerprint)";
+                            ComboBox {
+                                width: 160px;
+                                model: ["chrome", "firefox", "safari", "edge", "random", "ios", "android"];
+                                current-value <=> SettingsBridge.fingerprint;
+                                selected => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsField {
+                            label: "Список исключений системного прокси (по одному в строке)";
+                            TextEdit {
+                                height: 72px;
+                                text <=> SettingsBridge.bypass;
+                                edited => { SettingsBridge.changed(); }
+                            }
+                        }
+                        SettingsRow {
+                            label: "Ядро";
+                            hint: "auto | xray | sing-box";
+                            ComboBox {
+                                width: 160px;
+                                model: ["auto", "xray", "sing-box"];
+                                current-value <=> SettingsBridge.core-override;
+                                selected => { SettingsBridge.changed(); }
+                            }
                         }
                     }
                 }

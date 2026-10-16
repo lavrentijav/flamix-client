@@ -5,7 +5,7 @@
 //! DNS `servers` array takes `{address, domains}` objects.
 
 use crate::config::routing::{self, Rule};
-use crate::config::{local_auth, supported_by, ConnectContext, CoreKind};
+use crate::config::{effective_local_auth, supported_by, ConnectContext, CoreKind};
 use crate::model::{
     ConnectionMode, Credentials, FailoverMode, Network, ProviderRouting, RuleAction, Security,
     Server, Settings, Transport,
@@ -272,8 +272,8 @@ fn inbounds(
     overrides: Option<&BTreeMap<String, String>>,
 ) -> Value {
     let mut socks_settings = Map::new();
-    socks_settings.insert("udp".into(), json!(true));
-    match local_auth("socks", overrides) {
+    socks_settings.insert("udp".into(), json!(settings.udp_enabled));
+    match effective_local_auth("socks", settings, overrides) {
         Some(auth) => {
             socks_settings.insert("auth".into(), json!("password"));
             socks_settings.insert(
@@ -287,12 +287,24 @@ fn inbounds(
     }
 
     let mut http_settings = Map::new();
-    if let Some(auth) = local_auth("http", overrides) {
+    if let Some(auth) = effective_local_auth("http", settings, overrides) {
         http_settings.insert(
             "accounts".into(),
             json!([{"user": auth.user, "pass": auth.password}]),
         );
     }
+
+    // `sniffing` off (or a blank/absent override list) keeps `enabled: false`, which is Xray's
+    // own default; when on, the sniffed protocols and route-only mode come from the settings.
+    let sniffing = if settings.sniffing {
+        json!({
+            "enabled": true,
+            "destOverride": settings.dest_override,
+            "routeOnly": settings.route_only,
+        })
+    } else {
+        json!({"enabled": false})
+    };
 
     json!([
         {
@@ -301,11 +313,7 @@ fn inbounds(
             "port": settings.socks_port,
             "protocol": "socks",
             "settings": Value::Object(socks_settings),
-            "sniffing": {
-                "enabled": true,
-                "destOverride": ["http", "tls", "quic"],
-                "routeOnly": true,
-            },
+            "sniffing": sniffing,
         },
         {
             "tag": "http",
@@ -350,12 +358,35 @@ fn dns_config(settings: &Settings, provider: Option<&ProviderRouting>) -> Value 
             json!(dns.direct)
         };
     let mut config = Map::new();
+
+    // Static hosts: the user `dns.hosts` first, then the provider `dns_hosts` override per key
+    // (a provider profile wins over the user setting, matching the remote/direct precedence).
+    let mut hosts = settings.dns.hosts.clone();
     if let Some(provider) = provider {
-        if !provider.dns_hosts.is_empty() {
-            config.insert("hosts".into(), json!(provider.dns_hosts));
+        for (host, address) in &provider.dns_hosts {
+            hosts.insert(host.clone(), address.clone());
         }
     }
+    if !hosts.is_empty() {
+        config.insert("hosts".into(), json!(hosts));
+    }
+
     config.insert("servers".into(), json!([dns.remote, direct]));
+    // Xray accepts `enableParallelQuery` / `serveStale` at the DNS level.
+    if dns.parallel {
+        config.insert("enableParallelQuery".into(), json!(true));
+    }
+    if dns.serve_stale {
+        config.insert("serveStale".into(), json!(true));
+    }
+    // SVCB/HTTPS blocking and a bootstrap resolver are sing-box TUN features; Xray has no
+    // equivalent fields here, so they are ignored (with a debug note) rather than failing.
+    if dns.block_svcb {
+        tracing::debug!("dns.block_svcb is sing-box-only; ignored by Xray");
+    }
+    if !dns.bootstrap.is_empty() {
+        tracing::debug!("dns.bootstrap is sing-box-only; ignored by Xray");
+    }
     Value::Object(config)
 }
 
@@ -468,7 +499,10 @@ fn non_empty(value: &Option<String>) -> Option<&str> {
 
 fn add_mux(obj: &mut Map<String, Value>, settings: &Settings, allow: bool) {
     if settings.mux && allow {
-        obj.insert("mux".into(), json!({"enabled": true}));
+        obj.insert(
+            "mux".into(),
+            json!({"enabled": true, "concurrency": settings.mux_concurrency}),
+        );
     }
 }
 
@@ -902,6 +936,10 @@ mod tests {
             inbounds[0]["sniffing"]["destOverride"],
             json!(["http", "tls", "quic"])
         );
+        assert_eq!(inbounds[0]["sniffing"]["routeOnly"], json!(true));
+        // `parallel` defaults off, so no Xray parallel-query flag (matches the old behaviour).
+        assert!(cfg["dns"].get("enableParallelQuery").is_none());
+        assert!(cfg["dns"].get("serveStale").is_none());
         assert_eq!(inbounds[1]["tag"], json!("http"));
         assert_eq!(inbounds[1]["port"], json!(10809));
         assert_eq!(inbounds[2]["tag"], json!("api"));
@@ -1117,6 +1155,93 @@ mod tests {
         };
         let cfg = full_config_with(&vless_server(), &Settings::default(), 10818, &ctx);
         assert_eq!(cfg["inbounds"][0]["settings"]["auth"], json!("noauth"));
+    }
+
+    #[test]
+    fn inbound_udp_sniffing_and_user_auth() {
+        let settings = Settings {
+            udp_enabled: false,
+            sniffing: false,
+            local_auth_user: "u".into(),
+            local_auth_pass: "p".into(),
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless_server(), &settings, 10818);
+        assert_eq!(cfg["inbounds"][0]["settings"]["udp"], json!(false));
+        assert_eq!(cfg["inbounds"][0]["sniffing"]["enabled"], json!(false));
+        assert_eq!(cfg["inbounds"][0]["settings"]["auth"], json!("password"));
+        assert_eq!(
+            cfg["inbounds"][0]["settings"]["accounts"][0]["user"],
+            json!("u")
+        );
+        assert_eq!(
+            cfg["inbounds"][1]["settings"]["accounts"][0]["pass"],
+            json!("p")
+        );
+    }
+
+    #[test]
+    fn dest_override_and_route_only_wire_through() {
+        let settings = Settings {
+            dest_override: vec!["http".into(), "tls".into(), "quic".into(), "fakedns".into()],
+            route_only: true,
+            ..Settings::default()
+        };
+        let cfg = full_config(&vless_server(), &settings, 10818);
+        assert_eq!(
+            cfg["inbounds"][0]["sniffing"]["destOverride"],
+            json!(["http", "tls", "quic", "fakedns"])
+        );
+        assert_eq!(cfg["inbounds"][0]["sniffing"]["routeOnly"], json!(true));
+    }
+
+    #[test]
+    fn mux_concurrency_wired_only_when_enabled() {
+        let s = server(Credentials::Vless {
+            uuid: "u".into(),
+            flow: None,
+            encryption: None,
+        });
+        let off = outbound(&s, &Settings::default());
+        assert!(off.get("mux").is_none());
+        let on = outbound(
+            &s,
+            &Settings {
+                mux: true,
+                mux_concurrency: 16,
+                ..Settings::default()
+            },
+        );
+        assert_eq!(on["mux"]["enabled"], json!(true));
+        assert_eq!(on["mux"]["concurrency"], json!(16));
+    }
+
+    #[test]
+    fn dns_hosts_parallel_and_serve_stale() {
+        let mut settings = Settings {
+            dns: Dns {
+                parallel: true,
+                serve_stale: true,
+                ..Dns::default()
+            },
+            ..Settings::default()
+        };
+        settings
+            .dns
+            .hosts
+            .insert("example.com".into(), "10.0.0.1".into());
+        let cfg = full_config(&vless_server(), &settings, 10818);
+        assert_eq!(cfg["dns"]["hosts"]["example.com"], json!("10.0.0.1"));
+        assert_eq!(cfg["dns"]["enableParallelQuery"], json!(true));
+        assert_eq!(cfg["dns"]["serveStale"], json!(true));
+
+        // A provider `dns_hosts` entry overrides the user host for the same key.
+        let mut provider = provider_profile(true, Vec::new());
+        provider
+            .dns_hosts
+            .insert("example.com".into(), "10.0.0.9".into());
+        let cfg = full_config_with(&vless_server(), &settings, 10818, &ctx_of(&provider));
+        assert_eq!(cfg["dns"]["hosts"]["example.com"], json!("10.0.0.9"));
     }
 
     use crate::model::Failover;

@@ -9,6 +9,7 @@ use crate::{AppWindow, SettingsBridge, Theme};
 use flamix_core::model::{ConnectionMode, Dns, Settings, Theme as SettingsTheme};
 use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -245,14 +246,36 @@ fn write_bridge(bridge: &SettingsBridge, s: &Settings) {
     bridge.set_allow_lan(s.allow_lan);
     bridge.set_set_system_proxy(s.set_system_proxy);
     bridge.set_bypass(bypass_to_text(&s.proxy_bypass).into());
+    bridge.set_udp_enabled(s.udp_enabled);
+    bridge.set_sniffing(s.sniffing);
+    let (dest_http, dest_tls, dest_quic, dest_fakedns) = dest_override_flags(&s.dest_override);
+    bridge.set_dest_http(dest_http);
+    bridge.set_dest_tls(dest_tls);
+    bridge.set_dest_quic(dest_quic);
+    bridge.set_dest_fakedns(dest_fakedns);
+    bridge.set_route_only(s.route_only);
+    bridge.set_local_auth_user(s.local_auth_user.clone().into());
+    bridge.set_local_auth_pass(s.local_auth_pass.clone().into());
     bridge.set_mux(s.mux);
+    bridge.set_mux_concurrency(s.mux_concurrency as i32);
+    bridge.set_core_override(s.core_override.clone().into());
     bridge.set_fingerprint(s.default_fingerprint.clone().into());
     bridge.set_tun_stack(s.tun_stack.clone().into());
     bridge.set_tun_mtu(s.tun_mtu as i32);
     bridge.set_tun_ipv6(s.tun_ipv6);
+    bridge.set_tun_auto_route(s.tun_auto_route);
+    bridge.set_tun_strict_route(s.tun_strict_route);
+    bridge.set_tun_icmp(s.tun_icmp.clone().into());
+    bridge.set_route_exclude(list_to_text(&s.tun_route_exclude).into());
     bridge.set_dns_remote(s.dns.remote.clone().into());
     bridge.set_dns_direct(s.dns.direct.clone().into());
     bridge.set_dns_fake_ip(s.dns.fake_ip);
+    bridge.set_dns_fake_ip_range(s.dns.fake_ip_range.clone().into());
+    bridge.set_dns_bootstrap(s.dns.bootstrap.clone().into());
+    bridge.set_dns_block_svcb(s.dns.block_svcb);
+    bridge.set_dns_parallel(s.dns.parallel);
+    bridge.set_dns_serve_stale(s.dns.serve_stale);
+    bridge.set_dns_hosts(hosts_to_text(&s.dns.hosts).into());
     bridge.set_ping_method(s.ping_method.clone().into());
     bridge.set_ping_url(s.ping_url.clone().into());
     bridge.set_launch_at_login(s.launch_at_login);
@@ -276,18 +299,47 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         allow_lan: bridge.get_allow_lan(),
         set_system_proxy: bridge.get_set_system_proxy(),
         proxy_bypass: bypass_from_text(&bridge.get_bypass()),
+        udp_enabled: bridge.get_udp_enabled(),
+        sniffing: bridge.get_sniffing(),
+        dest_override: dest_override_from_flags(
+            bridge.get_dest_http(),
+            bridge.get_dest_tls(),
+            bridge.get_dest_quic(),
+            bridge.get_dest_fakedns(),
+        ),
+        route_only: bridge.get_route_only(),
+        local_auth_user: bridge.get_local_auth_user().to_string(),
+        local_auth_pass: bridge.get_local_auth_pass().to_string(),
         routing: base.routing.clone(),
         failover: base.failover.clone(),
         dns: Dns {
             remote: bridge.get_dns_remote().to_string(),
             direct: bridge.get_dns_direct().to_string(),
             fake_ip: bridge.get_dns_fake_ip(),
-            ..base.dns.clone()
+            fake_ip_range: bridge.get_dns_fake_ip_range().to_string(),
+            bootstrap: bridge.get_dns_bootstrap().to_string(),
+            block_svcb: bridge.get_dns_block_svcb(),
+            parallel: bridge.get_dns_parallel(),
+            serve_stale: bridge.get_dns_serve_stale(),
+            hosts: hosts_from_text(&bridge.get_dns_hosts()),
         },
         tun_mtu: bridge.get_tun_mtu().max(0) as u32,
         tun_stack: bridge.get_tun_stack().to_string(),
         tun_ipv6: bridge.get_tun_ipv6(),
+        tun_auto_route: bridge.get_tun_auto_route(),
+        tun_strict_route: bridge.get_tun_strict_route(),
+        tun_icmp: bridge.get_tun_icmp().to_string(),
+        tun_route_exclude: list_from_text(&bridge.get_route_exclude()),
         mux: bridge.get_mux(),
+        mux_concurrency: bridge.get_mux_concurrency().max(1) as u32,
+        core_override: {
+            let value = bridge.get_core_override().to_string();
+            if value.is_empty() {
+                "auto".into()
+            } else {
+                value
+            }
+        },
         default_fingerprint: bridge.get_fingerprint().to_string(),
         ping_url: bridge.get_ping_url().to_string(),
         ping_method: bridge.get_ping_method().to_string(),
@@ -298,7 +350,6 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         theme: theme_from_index(bridge.get_theme_index()),
         language: language_from_index(bridge.get_language_index()).to_string(),
         log_level: bridge.get_log_level().to_string(),
-        ..base.clone()
     }
 }
 
@@ -308,11 +359,15 @@ struct Errors {
     ports: String,
     dns: String,
     ping: String,
+    route_exclude: String,
 }
 
 impl Errors {
     fn is_empty(&self) -> bool {
-        self.ports.is_empty() && self.dns.is_empty() && self.ping.is_empty()
+        self.ports.is_empty()
+            && self.dns.is_empty()
+            && self.ping.is_empty()
+            && self.route_exclude.is_empty()
     }
 }
 
@@ -329,8 +384,24 @@ fn validate(s: &Settings) -> Errors {
     if !is_valid_dns(&s.dns.direct) {
         bad_dns.push("прямой");
     }
+    if s.dns.fake_ip && !is_valid_cidr(&s.dns.fake_ip_range) {
+        bad_dns.push("диапазон fake-ip");
+    }
+    if !s.dns.bootstrap.trim().is_empty() && !is_valid_dns(&s.dns.bootstrap) {
+        bad_dns.push("bootstrap");
+    }
     if !bad_dns.is_empty() {
-        errors.dns = format!("Некорректный {} DNS", bad_dns.join(" и "));
+        errors.dns = format!("Некорректный {} DNS", bad_dns.join(", "));
+    }
+
+    let bad_excludes: Vec<&str> = s
+        .tun_route_exclude
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && !is_valid_cidr(value))
+        .collect();
+    if !bad_excludes.is_empty() {
+        errors.route_exclude = format!("Некорректный CIDR: {}", bad_excludes.join(", "));
     }
 
     if s.ping_method == "url" && !is_valid_url(&s.ping_url) {
@@ -343,6 +414,7 @@ fn publish_errors(bridge: &SettingsBridge, errors: &Errors) {
     bridge.set_ports_error(errors.ports.clone().into());
     bridge.set_dns_error(errors.dns.clone().into());
     bridge.set_ping_error(errors.ping.clone().into());
+    bridge.set_route_exclude_error(errors.route_exclude.clone().into());
 }
 
 /// True when a change must be applied by restarting the running core.
@@ -353,12 +425,27 @@ fn core_affecting_changed(a: &Settings, b: &Settings) -> bool {
         || a.allow_lan != b.allow_lan
         || a.set_system_proxy != b.set_system_proxy
         || a.proxy_bypass != b.proxy_bypass
+        || a.udp_enabled != b.udp_enabled
+        || a.sniffing != b.sniffing
+        || a.dest_override != b.dest_override
+        || a.route_only != b.route_only
+        || a.local_auth_user != b.local_auth_user
+        || a.local_auth_pass != b.local_auth_pass
         || a.dns != b.dns
         || a.tun_mtu != b.tun_mtu
         || a.tun_stack != b.tun_stack
         || a.tun_ipv6 != b.tun_ipv6
+        || a.tun_auto_route != b.tun_auto_route
+        || a.tun_strict_route != b.tun_strict_route
+        || a.tun_icmp != b.tun_icmp
+        || a.tun_route_exclude != b.tun_route_exclude
         || a.mux != b.mux
+        || a.mux_concurrency != b.mux_concurrency
+        || a.core_override != b.core_override
         || a.default_fingerprint != b.default_fingerprint
+        // Core-level failover is owned by the routing page, but a change to it still needs a
+        // reconnect when it lands while this page is saving (documented gap).
+        || a.failover != b.failover
 }
 
 fn is_valid_url(value: &str) -> bool {
@@ -393,16 +480,90 @@ fn is_valid_dns(value: &str) -> bool {
     host.parse::<std::net::IpAddr>().is_ok()
 }
 
-fn bypass_to_text(list: &[String]) -> String {
+/// One item per line (proxy bypass, route-exclude CIDRs, ...).
+fn list_to_text(list: &[String]) -> String {
     list.join("\n")
 }
 
-fn bypass_from_text(text: &str) -> Vec<String> {
+fn list_from_text(text: &str) -> Vec<String> {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn bypass_to_text(list: &[String]) -> String {
+    list_to_text(list)
+}
+
+fn bypass_from_text(text: &str) -> Vec<String> {
+    list_from_text(text)
+}
+
+/// `dest_override` <-> the four checkboxes (http/tls/quic/fakedns); order is canonical.
+fn dest_override_flags(list: &[String]) -> (bool, bool, bool, bool) {
+    let has = |name: &str| list.iter().any(|value| value.eq_ignore_ascii_case(name));
+    (has("http"), has("tls"), has("quic"), has("fakedns"))
+}
+
+fn dest_override_from_flags(http: bool, tls: bool, quic: bool, fakedns: bool) -> Vec<String> {
+    let mut list = Vec::new();
+    if http {
+        list.push("http".to_string());
+    }
+    if tls {
+        list.push("tls".to_string());
+    }
+    if quic {
+        list.push("quic".to_string());
+    }
+    if fakedns {
+        list.push("fakedns".to_string());
+    }
+    list
+}
+
+/// `dns.hosts` <-> `domain ip` lines (one mapping per line, `domain` first).
+fn hosts_to_text(hosts: &BTreeMap<String, String>) -> String {
+    hosts
+        .iter()
+        .map(|(domain, address)| format!("{domain} {address}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn hosts_from_text(text: &str) -> BTreeMap<String, String> {
+    let mut hosts = BTreeMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if let (Some(domain), Some(address)) = (parts.next(), parts.next()) {
+            hosts.insert(domain.to_string(), address.to_string());
+        }
+    }
+    hosts
+}
+
+/// True for an IP or an `addr/prefix` CIDR (the tun route-exclude format).
+fn is_valid_cidr(value: &str) -> bool {
+    let value = value.trim();
+    match value.split_once('/') {
+        Some((addr, prefix)) => {
+            let Ok(prefix) = prefix.trim().parse::<u8>() else {
+                return false;
+            };
+            match addr.trim().parse::<std::net::IpAddr>() {
+                Ok(std::net::IpAddr::V4(_)) => prefix <= 32,
+                Ok(std::net::IpAddr::V6(_)) => prefix <= 128,
+                Err(_) => false,
+            }
+        }
+        None => value.parse::<std::net::IpAddr>().is_ok(),
+    }
 }
 
 fn theme_index(theme: SettingsTheme) -> i32 {
@@ -601,5 +762,127 @@ mod tests {
         assert_eq!(target.mode, ConnectionMode::Tun);
         assert_eq!(target.routing.custom_rules.len(), 1);
         assert_eq!(target.mux, edited.mux);
+    }
+
+    #[test]
+    fn list_text_roundtrip_for_route_exclude() {
+        let list = vec!["203.0.113.0/24".to_string(), "2001:db8::/32".to_string()];
+        assert_eq!(list_to_text(&list), "203.0.113.0/24\n2001:db8::/32");
+        assert_eq!(
+            list_from_text("203.0.113.0/24\n\n  2001:db8::/32  \n"),
+            list
+        );
+    }
+
+    #[test]
+    fn dest_override_flags_roundtrip() {
+        let flags = dest_override_flags(&["http".into(), "quic".into(), "FAKEDNS".into()]);
+        assert_eq!(flags, (true, false, true, true));
+        assert_eq!(
+            dest_override_from_flags(true, false, true, true),
+            vec!["http", "quic", "fakedns"]
+        );
+        assert_eq!(
+            dest_override_from_flags(false, false, false, false),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn hosts_text_roundtrip() {
+        let hosts = BTreeMap::from([
+            ("a.example".to_string(), "10.0.0.1".to_string()),
+            ("b.example".to_string(), "10.0.0.2".to_string()),
+        ]);
+        // BTreeMap iterates in key order, so the text is deterministic.
+        assert_eq!(
+            hosts_to_text(&hosts),
+            "a.example 10.0.0.1\nb.example 10.0.0.2"
+        );
+        assert_eq!(
+            hosts_from_text("a.example 10.0.0.1\n\n  b.example   10.0.0.2  \n"),
+            hosts
+        );
+        // Lines without exactly two tokens are ignored.
+        assert!(hosts_from_text("broken\nonlydomain ").is_empty());
+    }
+
+    #[test]
+    fn cidr_validation() {
+        assert!(is_valid_cidr("10.0.0.0/8"));
+        assert!(is_valid_cidr("203.0.113.5"));
+        assert!(is_valid_cidr("2001:db8::/32"));
+        assert!(!is_valid_cidr("10.0.0.0/33"));
+        assert!(!is_valid_cidr("2001:db8::/129"));
+        assert!(!is_valid_cidr("nonsense"));
+        assert!(!is_valid_cidr("10.0.0.0/"));
+    }
+
+    #[test]
+    fn validate_reports_bad_route_exclude_and_fake_ip() {
+        let s = Settings {
+            tun_route_exclude: vec!["10.0.0.0/8".into(), "nope".into()],
+            dns: Dns {
+                fake_ip: true,
+                fake_ip_range: "not-a-cidr".into(),
+                ..Dns::default()
+            },
+            ..settings()
+        };
+        let errors = validate(&s);
+        assert!(errors.route_exclude.contains("nope"));
+        assert!(errors.dns.contains("fake-ip"));
+    }
+
+    #[test]
+    fn core_affecting_detects_new_core_fields() {
+        let base = settings();
+        for changed in [
+            Settings {
+                udp_enabled: !base.udp_enabled,
+                ..base.clone()
+            },
+            Settings {
+                sniffing: !base.sniffing,
+                ..base.clone()
+            },
+            Settings {
+                route_only: !base.route_only,
+                ..base.clone()
+            },
+            Settings {
+                tun_strict_route: !base.tun_strict_route,
+                ..base.clone()
+            },
+            Settings {
+                tun_icmp: "drop".into(),
+                ..base.clone()
+            },
+            Settings {
+                mux_concurrency: 32,
+                ..base.clone()
+            },
+            Settings {
+                core_override: "xray".into(),
+                ..base.clone()
+            },
+            Settings {
+                dns: Dns {
+                    serve_stale: !base.dns.serve_stale,
+                    ..base.dns.clone()
+                },
+                ..base.clone()
+            },
+        ] {
+            assert!(core_affecting_changed(&base, &changed));
+        }
+
+        let mut dest = base.clone();
+        dest.dest_override.push("quic".into());
+        assert!(core_affecting_changed(&base, &dest));
+
+        let mut failover = base.clone();
+        failover.failover.enabled = true;
+        assert!(core_affecting_changed(&base, &failover));
     }
 }
