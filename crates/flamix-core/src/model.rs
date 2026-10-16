@@ -489,6 +489,50 @@ pub enum ConnectionMode {
     Tun,
 }
 
+/// How the core-level balancer spreads new connections across the primary and its backups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FailoverMode {
+    /// Send everything to the lowest-latency healthy node (`leastPing` / `urltest`).
+    #[default]
+    Failover,
+    /// Spread new connections over the healthy nodes (`roundRobin`).
+    LoadBalance,
+}
+
+/// Core-level failover settings (stage 1, proxy mode only).
+///
+/// Primary is the selected server; `backups` are ordered server ids. This is the fallback
+/// path without the local gate: one core process with an outbound per node and an
+/// auto-selecting balancer (Xray `observatory` + `routing.balancers`, sing-box `urltest`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Failover {
+    pub enabled: bool,
+    pub mode: FailoverMode,
+    /// Backup server ids, ordered; the primary is the selected server.
+    pub backups: Vec<String>,
+    /// Health-probe interval in milliseconds.
+    pub probe_interval_ms: u32,
+    /// Probe URL; empty means use `Settings::ping_url`.
+    pub probe_url: String,
+    /// sing-box urltest tolerance in milliseconds.
+    pub tolerance_ms: u32,
+}
+
+impl Default for Failover {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            mode: FailoverMode::default(),
+            backups: Vec::new(),
+            probe_interval_ms: 15000,
+            probe_url: String::new(),
+            tolerance_ms: 50,
+        }
+    }
+}
+
 /// Where a routing rule sends matching traffic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -606,6 +650,8 @@ pub struct Settings {
     pub proxy_bypass: Vec<String>,
     pub routing: Routing,
     pub dns: Dns,
+    /// Core-level failover (proxy mode only, stage 1).
+    pub failover: Failover,
     /// TUN interface MTU and stack ("system", "gvisor", "mixed").
     pub tun_mtu: u32,
     pub tun_stack: String,
@@ -646,6 +692,7 @@ impl Default for Settings {
             ],
             routing: Routing::default(),
             dns: Dns::default(),
+            failover: Failover::default(),
             tun_mtu: 9000,
             tun_stack: "mixed".into(),
             tun_ipv6: false,
@@ -741,6 +788,24 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: AppState = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn failover_defaults_and_serde() {
+        let f = Failover::default();
+        assert!(!f.enabled);
+        assert_eq!(f.mode, FailoverMode::Failover);
+        assert!(f.backups.is_empty());
+        assert_eq!(f.probe_interval_ms, 15000);
+        assert!(f.probe_url.is_empty());
+        assert_eq!(f.tolerance_ms, 50);
+        assert_eq!(Settings::default().failover, f);
+
+        // Old state files (no `failover` key) keep loading with the defaults.
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.failover, f);
+        let json = serde_json::to_string(&f).unwrap();
+        assert_eq!(serde_json::from_str::<Failover>(&json).unwrap(), f);
     }
 
     #[test]
