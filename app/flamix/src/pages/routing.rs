@@ -6,9 +6,9 @@
 
 use crate::controller::Controller;
 use crate::{AppWindow, ProviderRoutingItem, RoutingBridge, RoutingRuleItem};
-use flamix_core::model::{AppState, Routing, RoutingPreset, RoutingRule, RuleAction};
+use flamix_core::model::{AppState, Routing, RoutingPreset, RoutingRule, RuleAction, Subscription};
 use slint::ComponentHandle;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,19 +167,87 @@ fn rule_mut(routing: &mut Routing, index: i32) -> Option<&mut RoutingRule> {
         .and_then(|i| routing.custom_rules.get_mut(i))
 }
 
-fn move_rule(rules: &mut [RoutingRule], index: i32, delta: i32) {
+/// Swap a rule with its neighbour `delta` places away. Returns whether anything moved.
+/// Both ends of the swap are bounds-checked (`from` included: an out-of-range index must not
+/// panic on the other side even when `to` happens to be valid).
+fn move_rule(rules: &mut [RoutingRule], index: i32, delta: i32) -> bool {
     let Ok(from) = usize::try_from(index) else {
-        return;
+        return false;
     };
+    if from >= rules.len() {
+        return false;
+    }
     let to = from as i64 + i64::from(delta);
     if to < 0 || to >= rules.len() as i64 {
-        return;
+        return false;
     }
     rules.swap(from, to as usize);
+    true
 }
 
-fn rule_item(index: usize, rule: &RoutingRule) -> RoutingRuleItem {
-    let kind = kind_index(rule);
+/// Remembers the chip kind chosen for each rule.
+///
+/// The model cannot tell an empty `domains` list from an empty `ips`/`processes` list, so
+/// [`kind_index`] always reports 0 for a rule with no values. Without this cache an empty rule
+/// would snap back to "Домены" on every repaint (structural edits, enable toggle, ...).
+#[derive(Default)]
+struct KindCache {
+    kinds: Vec<i32>,
+}
+
+impl KindCache {
+    /// Align the cache with the current rules: keep the chosen kind for empty rules, take the
+    /// authoritative derived kind for rules that already contain values.
+    fn sync(&mut self, routing: &Routing) {
+        let count = routing.custom_rules.len();
+        self.kinds.resize(count, 0);
+        for (index, rule) in routing.custom_rules.iter().enumerate() {
+            if !is_empty_rule(rule) {
+                self.kinds[index] = kind_index(rule) as i32;
+            }
+        }
+    }
+
+    fn set(&mut self, index: i32, kind: i32) {
+        if let Some(slot) = usize::try_from(index)
+            .ok()
+            .and_then(|index| self.kinds.get_mut(index))
+        {
+            *slot = kind;
+        }
+    }
+
+    /// Mirror a reorder of the model (uses the same bounds rules as [`move_rule`]).
+    fn swap(&mut self, index: i32, delta: i32) {
+        let Ok(from) = usize::try_from(index) else {
+            return;
+        };
+        if from >= self.kinds.len() {
+            return;
+        }
+        let to = from as i64 + i64::from(delta);
+        if to < 0 || to >= self.kinds.len() as i64 {
+            return;
+        }
+        self.kinds.swap(from, to as usize);
+    }
+
+    fn remove(&mut self, index: i32) {
+        if let Some(index) = usize::try_from(index)
+            .ok()
+            .filter(|index| *index < self.kinds.len())
+        {
+            self.kinds.remove(index);
+        }
+    }
+}
+
+fn rule_item(index: usize, rule: &RoutingRule, preferred_kind: i32) -> RoutingRuleItem {
+    let kind = if is_empty_rule(rule) {
+        kind_from_index(preferred_kind).unwrap_or(0)
+    } else {
+        kind_index(rule)
+    };
     RoutingRuleItem {
         index: index as i32,
         action: action_index(rule.action),
@@ -189,13 +257,25 @@ fn rule_item(index: usize, rule: &RoutingRule) -> RoutingRuleItem {
     }
 }
 
-fn build_rule_items(routing: &Routing) -> Vec<RoutingRuleItem> {
+fn build_rule_items(routing: &Routing, kinds: &[i32]) -> Vec<RoutingRuleItem> {
     routing
         .custom_rules
         .iter()
         .enumerate()
-        .map(|(index, rule)| rule_item(index, rule))
+        .map(|(index, rule)| rule_item(index, rule, kinds.get(index).copied().unwrap_or(0)))
         .collect()
+}
+
+/// Number of rules that actually take effect: none while the profile is disabled or the user
+/// ignores it, otherwise only the individual enabled rules.
+fn effective_rule_count(sub: &Subscription) -> usize {
+    let Some(routing) = sub.provider.routing.as_ref() else {
+        return 0;
+    };
+    if !routing.enabled || sub.options.ignore_provider_routing {
+        return 0;
+    }
+    routing.rules.iter().filter(|rule| rule.enabled).count()
 }
 
 fn provider_items(state: &AppState) -> Vec<ProviderRoutingItem> {
@@ -212,7 +292,7 @@ fn provider_items(state: &AppState) -> Vec<ProviderRoutingItem> {
             Some(ProviderRoutingItem {
                 id: sub.id.clone().into(),
                 name: name.into(),
-                rules_text: rules_label(routing.rules.len()).into(),
+                rules_text: rules_label(effective_rule_count(sub)).into(),
                 enabled: routing.enabled,
                 ignored: sub.options.ignore_provider_routing,
             })
@@ -222,26 +302,35 @@ fn provider_items(state: &AppState) -> Vec<ProviderRoutingItem> {
 
 // --- bridge publishing ----------------------------------------------------
 
-fn publish(ui: &AppWindow, routing: &Routing, providers: Vec<ProviderRoutingItem>, error: String) {
+fn publish(
+    ui: &AppWindow,
+    routing: &Routing,
+    rules: Vec<RoutingRuleItem>,
+    providers: Vec<ProviderRoutingItem>,
+    error: String,
+) {
     let bridge = ui.global::<RoutingBridge>();
     bridge.set_preset(preset_index(routing.preset));
     bridge.set_domain_strategy(strategy_index(&routing.domain_strategy));
     bridge.set_block_quic(routing.block_quic);
-    bridge.set_rules(crate::view::model(build_rule_items(routing)));
+    bridge.set_rules(crate::view::model(rules));
     bridge.set_has_providers(!providers.is_empty());
     bridge.set_providers(crate::view::model(providers));
     bridge.set_error_text(error.into());
 }
 
-fn refresh(ui: &AppWindow, ctrl: &Controller) {
+fn refresh(ui: &AppWindow, ctrl: &Controller, cache: &Rc<RefCell<KindCache>>) {
     let (routing, providers) = ctrl.with_state(|s| (s.settings.routing.clone(), provider_items(s)));
     let error = validation_error(&routing);
-    publish(ui, &routing, providers, error);
+    let mut cache = cache.borrow_mut();
+    cache.sync(&routing);
+    let rules = build_rule_items(&routing, &cache.kinds);
+    publish(ui, &routing, rules, providers, error);
 }
 
-fn repaint(weak: &slint::Weak<AppWindow>, ctrl: &Controller) {
+fn repaint(weak: &slint::Weak<AppWindow>, ctrl: &Controller, cache: &Rc<RefCell<KindCache>>) {
     if let Some(ui) = weak.upgrade() {
-        refresh(&ui, ctrl);
+        refresh(&ui, ctrl, cache);
     }
 }
 
@@ -276,23 +365,26 @@ impl Defer {
 // --- live wiring ----------------------------------------------------------
 
 fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
-    refresh(ui, &ctrl);
+    let cache: Rc<RefCell<KindCache>> = Rc::new(RefCell::new(KindCache::default()));
+    refresh(ui, &ctrl, &cache);
     let defer = Defer::new(Arc::clone(&ctrl));
 
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_preset_selected(move |index| {
                 ctrl.mutate(|s| s.settings.routing.preset = preset_from_index(index));
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_rule_action_changed(move |index, action| {
@@ -301,12 +393,13 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         rule.action = action_from_index(action);
                     }
                 });
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_rule_kind_changed(move |index, kind| {
@@ -318,12 +411,14 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         change_rule_kind(rule, kind);
                     }
                 });
+                cache.borrow_mut().set(index, kind as i32);
                 // No refresh: keep the chips on the chosen kind so the next edit lands in it.
                 defer.schedule();
             });
     }
     {
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_rule_values_changed(move |index, kind, text| {
@@ -333,6 +428,7 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         set_rule_values(rule, kind, text.as_str());
                     }
                 });
+                cache.borrow_mut().set(index, kind as i32);
                 // No refresh: preserve the LineEdit cursor while typing.
                 defer.schedule();
             });
@@ -340,6 +436,7 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_rule_enabled_changed(move |index, enabled| {
@@ -348,24 +445,29 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         rule.enabled = enabled;
                     }
                 });
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_rule_move(move |index, delta| {
-                ctrl.mutate(|s| move_rule(&mut s.settings.routing.custom_rules, index, delta));
-                repaint(&weak, &ctrl);
+                ctrl.mutate(|s| {
+                    move_rule(&mut s.settings.routing.custom_rules, index, delta);
+                });
+                cache.borrow_mut().swap(index, delta);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>().on_rule_delete(move |index| {
             ctrl.mutate(|s| {
@@ -375,13 +477,15 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                     }
                 }
             });
-            repaint(&weak, &ctrl);
+            cache.borrow_mut().remove(index);
+            repaint(&weak, &ctrl, &cache);
             defer.schedule();
         });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>().on_rule_add(move || {
             ctrl.mutate(|s| {
@@ -395,13 +499,14 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                     enabled: true,
                 });
             });
-            repaint(&weak, &ctrl);
+            repaint(&weak, &ctrl, &cache);
             defer.schedule();
         });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_domain_strategy_changed(move |label| {
@@ -409,24 +514,26 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                     return;
                 };
                 ctrl.mutate(|s| s.settings.routing.domain_strategy = strategy.to_string());
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_block_quic_changed(move |enabled| {
                 ctrl.mutate(|s| s.settings.routing.block_quic = enabled);
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_provider_enabled_changed(move |id, enabled| {
@@ -437,13 +544,14 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         }
                     }
                 });
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
     {
         let weak = ui.as_weak();
         let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
             .on_provider_ignored_changed(move |id, ignored| {
@@ -452,16 +560,13 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
                         sub.options.ignore_provider_routing = ignored;
                     }
                 });
-                repaint(&weak, &ctrl);
+                repaint(&weak, &ctrl, &cache);
                 defer.schedule();
             });
     }
 }
 
-fn subscription_mut<'a>(
-    state: &'a mut AppState,
-    id: &str,
-) -> Option<&'a mut flamix_core::model::Subscription> {
+fn subscription_mut<'a>(state: &'a mut AppState, id: &str) -> Option<&'a mut Subscription> {
     state.subscriptions.iter_mut().find(|s| s.id == id)
 }
 
@@ -534,13 +639,15 @@ fn demo_providers() -> Vec<ProviderRoutingItem> {
 
 /// `--demo` / `--screenshot` mode: realistic static data, callbacks are not wired.
 fn fill_demo(ui: &AppWindow) {
-    publish(ui, &demo_routing(), demo_providers(), String::new());
+    let routing = demo_routing();
+    let rules = build_rule_items(&routing, &[]);
+    publish(ui, &routing, rules, demo_providers(), String::new());
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flamix_core::model::{ProviderRouting, Subscription, SubscriptionOptions};
+    use flamix_core::model::{ProviderRouting, SubscriptionOptions};
 
     fn subscription(id: &str, name: &str) -> Subscription {
         Subscription {
@@ -678,25 +785,129 @@ mod tests {
             demo_rule(RuleAction::Proxy, &["b"], &[], &[]),
             demo_rule(RuleAction::Proxy, &["c"], &[], &[]),
         ];
-        move_rule(&mut rules, 0, 1);
+        assert!(move_rule(&mut rules, 0, 1));
         assert_eq!(rules[0].domains, vec!["b"]);
         assert_eq!(rules[1].domains, vec!["a"]);
-        // Out of bounds is ignored.
-        move_rule(&mut rules, 0, -1);
-        move_rule(&mut rules, 2, 1);
+        // Out of bounds is ignored on either end.
+        assert!(!move_rule(&mut rules, 0, -1));
+        assert!(!move_rule(&mut rules, 2, 1));
         assert_eq!(rules[0].domains, vec!["b"]);
         assert_eq!(rules[2].domains, vec!["c"]);
     }
 
     #[test]
+    fn move_rule_from_out_of_range_does_not_panic() {
+        let mut rules = vec![
+            demo_rule(RuleAction::Proxy, &["a"], &[], &[]),
+            demo_rule(RuleAction::Proxy, &["b"], &[], &[]),
+        ];
+        // `from == len` while `to` is a valid index: `from` must be checked before swapping.
+        assert!(!move_rule(&mut rules, 2, -1));
+        assert!(!move_rule(&mut rules, 5, -2));
+        assert!(!move_rule(&mut rules, -1, 1));
+        assert_eq!(rules[0].domains, vec!["a"]);
+        assert_eq!(rules[1].domains, vec!["b"]);
+    }
+
+    #[test]
     fn rule_item_reflects_model() {
         let rule = demo_rule(RuleAction::Block, &["geosite:ads"], &[], &[]);
-        let item = rule_item(3, &rule);
+        let item = rule_item(3, &rule, 0);
         assert_eq!(item.index, 3);
         assert_eq!(item.action, 2);
         assert_eq!(item.kind, 0);
         assert_eq!(item.values.as_str(), "geosite:ads");
         assert!(item.enabled);
+    }
+
+    #[test]
+    fn rule_item_keeps_preferred_kind_for_empty_rule() {
+        let empty = demo_rule(RuleAction::Proxy, &[], &[], &[]);
+        let item = rule_item(0, &empty, 2);
+        assert_eq!(item.kind, 2);
+        assert_eq!(item.values.as_str(), "");
+        // A populated rule ignores the preferred kind and uses the real one.
+        let ips = demo_rule(RuleAction::Proxy, &[], &["geoip:ru"], &[]);
+        assert_eq!(rule_item(0, &ips, 2).kind, 1);
+    }
+
+    #[test]
+    fn build_rule_items_maps_every_rule_and_uses_kinds() {
+        let routing = Routing {
+            custom_rules: vec![
+                demo_rule(RuleAction::Proxy, &["a.com"], &[], &[]),
+                demo_rule(RuleAction::Block, &[], &[], &[]),
+            ],
+            ..Routing::default()
+        };
+        let items = build_rule_items(&routing, &[0, 2]);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].index, 0);
+        assert_eq!(items[0].values.as_str(), "a.com");
+        assert_eq!(items[1].index, 1);
+        assert_eq!(items[1].kind, 2);
+        // A missing kind entry falls back to domains.
+        let items = build_rule_items(&routing, &[]);
+        assert_eq!(items[1].kind, 0);
+    }
+
+    #[test]
+    fn kind_cache_sync_set_swap_remove() {
+        let mut routing = Routing {
+            custom_rules: vec![
+                demo_rule(RuleAction::Proxy, &[], &[], &[]),
+                demo_rule(RuleAction::Proxy, &[], &[], &["p.exe"]),
+            ],
+            ..Routing::default()
+        };
+        let mut cache = KindCache::default();
+        cache.sync(&routing);
+        // Domains for the empty rule, processes derived for the populated one.
+        assert_eq!(cache.kinds, vec![0, 2]);
+        cache.set(0, 1);
+        cache.sync(&routing);
+        assert_eq!(cache.kinds, vec![1, 2]);
+        cache.swap(0, 1);
+        assert_eq!(cache.kinds, vec![2, 1]);
+        cache.remove(0);
+        assert_eq!(cache.kinds, vec![1]);
+        // Shrinking to zero and regrowing fills with the default kind.
+        routing.custom_rules.clear();
+        cache.sync(&routing);
+        assert!(cache.kinds.is_empty());
+    }
+
+    #[test]
+    fn subscription_mut_finds_and_mutates_only_the_matching_id() {
+        let mut state = AppState::default();
+        state.subscriptions.push(subscription("a", "Alpha"));
+        state.subscriptions.push(subscription("b", "Beta"));
+        assert!(subscription_mut(&mut state, "missing").is_none());
+        let sub = subscription_mut(&mut state, "b").expect("b exists");
+        sub.name = "Beta2".to_string();
+        assert_eq!(state.subscriptions[1].name, "Beta2");
+        assert_eq!(state.subscriptions[0].name, "Alpha");
+    }
+
+    #[test]
+    fn effective_rule_count_counts_only_enabled_and_active() {
+        let mut sub = subscription("s", "S");
+        sub.provider.routing = Some(ProviderRouting {
+            enabled: true,
+            rules: vec![
+                demo_rule(RuleAction::Proxy, &["x"], &[], &[]),
+                demo_rule(RuleAction::Direct, &[], &["y"], &[]),
+            ],
+            ..ProviderRouting::default()
+        });
+        assert_eq!(effective_rule_count(&sub), 2);
+        sub.provider.routing.as_mut().unwrap().rules[1].enabled = false;
+        assert_eq!(effective_rule_count(&sub), 1);
+        sub.provider.routing.as_mut().unwrap().enabled = false;
+        assert_eq!(effective_rule_count(&sub), 0);
+        sub.provider.routing.as_mut().unwrap().enabled = true;
+        sub.options.ignore_provider_routing = true;
+        assert_eq!(effective_rule_count(&sub), 0);
     }
 
     #[test]
@@ -720,9 +931,26 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].id.as_str(), "b");
         assert_eq!(items[0].name.as_str(), "Pro");
-        assert_eq!(items[0].rules_text.as_str(), "2 правила");
+        // The profile is ignored, so no rules are effective.
+        assert_eq!(items[0].rules_text.as_str(), "0 правил");
         assert!(items[0].enabled);
         assert!(items[0].ignored);
+    }
+
+    #[test]
+    fn provider_items_report_effective_rule_count() {
+        let mut state = AppState::default();
+        let mut sub = subscription("c", "Gamma");
+        let mut disabled = demo_rule(RuleAction::Proxy, &["z"], &[], &[]);
+        disabled.enabled = false;
+        sub.provider.routing = Some(ProviderRouting {
+            enabled: true,
+            rules: vec![demo_rule(RuleAction::Proxy, &["x"], &[], &[]), disabled],
+            ..ProviderRouting::default()
+        });
+        state.subscriptions.push(sub);
+        let items = provider_items(&state);
+        assert_eq!(items[0].rules_text.as_str(), "1 правило");
     }
 
     #[test]
