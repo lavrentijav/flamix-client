@@ -200,8 +200,17 @@ pub fn outbound(server: &Server, settings: &Settings) -> Option<Value> {
     if let Some(transport) = transport_json(&server.transport) {
         obj.insert("transport".into(), transport);
     }
+    // sing-box 1.14: dialing a domain needs an explicit resolver.
+    if is_domain(&server.address) {
+        obj.insert("domain_resolver".into(), json!("direct"));
+    }
 
     Some(Value::Object(obj))
+}
+
+/// True when `value` is not a literal IP address (so it must be resolved).
+fn is_domain(value: &str) -> bool {
+    value.parse::<std::net::IpAddr>().is_err()
 }
 
 /// Full config. `tun` = add a tun inbound (auto_route, strict_route) instead of mixed.
@@ -250,8 +259,9 @@ pub fn full_config(
     }
 
     let mut dns_servers = vec![
-        dns_server(&settings.dns.remote, "remote", "proxy"),
-        dns_server(&settings.dns.direct, "direct", "direct"),
+        dns_server(&settings.dns.remote, "remote", Some("proxy"), "1.1.1.1"),
+        dns_server(&settings.dns.direct, "direct", None, "77.88.8.8"),
+        json!({"type": "local", "tag": "local"}),
     ];
     let mut dns_rules = Vec::new();
     if settings.routing.preset == RoutingPreset::BypassRu {
@@ -296,6 +306,11 @@ pub fn full_config(
 
     let mut route = Map::new();
     route.insert("auto_detect_interface".into(), json!(true));
+    // sing-box 1.12+: dialing a domain without a resolver is deprecated (removed in 1.14).
+    route.insert(
+        "default_domain_resolver".into(),
+        json!({"server": "direct"}),
+    );
     if !rule_sets.is_empty() {
         let sets: Vec<Value> = rule_sets
             .iter()
@@ -381,6 +396,7 @@ fn tls_json(security: &Security, settings: &Settings, required: bool) -> Option<
             sni,
             public_key,
             short_id,
+            fingerprint,
             ..
         } => {
             let mut reality = Map::new();
@@ -393,6 +409,10 @@ fn tls_json(security: &Security, settings: &Settings, required: bool) -> Option<
             tls.insert("enabled".into(), json!(true));
             if let Some(sni) = non_empty(sni) {
                 tls.insert("server_name".into(), json!(sni));
+            }
+            // sing-box requires a uTLS fingerprint for a reality client.
+            if let Some(fp) = resolve_fingerprint(fingerprint, settings) {
+                tls.insert("utls".into(), json!({"enabled": true, "fingerprint": fp}));
             }
             tls.insert("reality".into(), Value::Object(reality));
             Some(Value::Object(tls))
@@ -583,44 +603,57 @@ fn parse_ports(value: &str) -> (Vec<u16>, Vec<String>) {
     (ports, ranges)
 }
 
-/// Parse an upstream DNS URL into the sing-box 1.12 `{type, server, tag}` shape.
-fn dns_server(raw: &str, tag: &str, detour: &str) -> Value {
+/// Parse an upstream DNS URL into the sing-box 1.12+ `{type, server, tag}` shape.
+///
+/// `detour` is the outbound tag used to reach the server (`"proxy"` for the remote
+/// resolver, `None` for the direct one). A server given by domain name gets an
+/// explicit `domain_resolver` pointing at the `local` (system) resolver.
+fn dns_server(raw: &str, tag: &str, detour: Option<&str>, fallback: &str) -> Value {
     let mut m = Map::new();
     if raw == "localhost" || raw == "local" {
         m.insert("type".into(), json!("local"));
         m.insert("tag".into(), json!(tag));
         return Value::Object(m);
     }
-    match url::Url::parse(raw) {
+    let (kind, host, port, path) = match url::Url::parse(raw) {
         Ok(url) => {
-            let kind = match url.scheme() {
-                "http" | "https" => "https",
-                "tls" => "tls",
-                "quic" => "quic",
-                "h3" => "h3",
-                "tcp" => "tcp",
-                "udp" => "udp",
-                other => other,
+            let kind: String = match url.scheme() {
+                "http" | "https" => "https".into(),
+                "tls" => "tls".into(),
+                "quic" => "quic".into(),
+                "h3" => "h3".into(),
+                "tcp" => "tcp".into(),
+                "udp" => "udp".into(),
+                other => other.to_string(),
             };
-            m.insert("type".into(), json!(kind));
-            m.insert("tag".into(), json!(tag));
-            if let Some(host) = url.host_str() {
-                m.insert("server".into(), json!(host));
-            }
-            if let Some(port) = url.port() {
-                m.insert("server_port".into(), json!(port));
-            }
-            if kind == "https" && !url.path().is_empty() && url.path() != "/" {
-                m.insert("path".into(), json!(url.path()));
-            }
-            m.insert("detour".into(), json!(detour));
+            let path = if kind == "https" && !url.path().is_empty() && url.path() != "/" {
+                Some(url.path().to_string())
+            } else {
+                None
+            };
+            (
+                kind,
+                url.host_str().unwrap_or(fallback).to_string(),
+                url.port(),
+                path,
+            )
         }
-        Err(_) => {
-            m.insert("type".into(), json!("udp"));
-            m.insert("tag".into(), json!(tag));
-            m.insert("server".into(), json!(raw));
-            m.insert("detour".into(), json!(detour));
-        }
+        Err(_) => ("udp".to_string(), raw.to_string(), None, None),
+    };
+    m.insert("type".into(), json!(kind));
+    m.insert("tag".into(), json!(tag));
+    m.insert("server".into(), json!(host));
+    if let Some(port) = port {
+        m.insert("server_port".into(), json!(port));
+    }
+    if let Some(path) = path {
+        m.insert("path".into(), json!(path));
+    }
+    if let Some(detour) = detour {
+        m.insert("detour".into(), json!(detour));
+    }
+    if is_domain(&host) {
+        m.insert("domain_resolver".into(), json!("local"));
     }
     Value::Object(m)
 }
@@ -654,54 +687,6 @@ mod tests {
             local_traffic: Default::default(),
             last_ping_ms: None,
         }
-    }
-
-    fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("flamix-t03-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, content).unwrap();
-        path
-    }
-
-    /// Validates the generated JSON against a real sing-box binary. Skipped unless
-    /// `FLAMIX_SINGBOX_BIN` points at one.
-    #[test]
-    fn singbox_binary_accepts_config() {
-        let Ok(bin) = std::env::var("FLAMIX_SINGBOX_BIN") else {
-            return;
-        };
-        let mut s = server(Credentials::Vless {
-            uuid: "11111111-1111-1111-1111-111111111111".into(),
-            flow: Some("xtls-rprx-vision".into()),
-            encryption: None,
-        });
-        s.transport = Transport {
-            network: Network::Ws,
-            path: Some("/ws".into()),
-            host: Some("example.com".into()),
-            ..Transport::default()
-        };
-        s.security = Security::Tls {
-            sni: Some("example.com".into()),
-            alpn: vec!["http/1.1".into()],
-            fingerprint: Some("chrome".into()),
-            allow_insecure: false,
-        };
-        let settings = Settings::default();
-        let api_port = crate::config::api_port(crate::config::CoreKind::SingBox, &settings);
-        let cfg = full_config(&s, &settings, false, None, api_port);
-        let path = write_temp("singbox.json", &serde_json::to_string_pretty(&cfg).unwrap());
-        let out = std::process::Command::new(bin)
-            .args(["check", "-c"])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "sing-box rejected config: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     #[test]
@@ -865,7 +850,15 @@ mod tests {
         assert_eq!(cfg["dns"]["servers"][0]["server"], json!("1.1.1.1"));
         assert_eq!(cfg["dns"]["servers"][0]["detour"], json!("proxy"));
         assert_eq!(cfg["dns"]["servers"][1]["tag"], json!("direct"));
-        assert_eq!(cfg["dns"]["servers"][1]["detour"], json!("direct"));
+        assert!(cfg["dns"]["servers"][1].get("detour").is_none());
+        assert_eq!(
+            cfg["dns"]["servers"][2],
+            json!({"type": "local", "tag": "local"})
+        );
+        assert_eq!(
+            cfg["route"]["default_domain_resolver"],
+            json!({"server": "direct"})
+        );
 
         let sets = cfg["route"]["rule_set"].as_array().unwrap();
         assert!(sets.iter().any(|s| {

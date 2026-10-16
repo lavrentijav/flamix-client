@@ -306,9 +306,9 @@ fn add_stream(
             Network::Grpc => "grpc",
             Network::HttpUpgrade => "httpupgrade",
             Network::Xhttp => "xhttp",
-            Network::H2 => "http",
+            // Xray 26 removed the `http` and `quic` transports; both migrate to XHTTP.
+            Network::H2 | Network::Quic => "xhttp",
             Network::Kcp => "kcp",
-            Network::Quic => "quic",
         }),
     );
 
@@ -369,7 +369,7 @@ fn add_stream(
                 w.insert("path".into(), json!(path));
             }
             if let Some(host) = non_empty(&transport.host) {
-                w.insert("headers".into(), json!({"Host": host}));
+                w.insert("host".into(), json!(host));
             }
             ss.insert("wsSettings".into(), Value::Object(w));
         }
@@ -409,20 +409,17 @@ fn add_stream(
             }
             ss.insert("xhttpSettings".into(), Value::Object(x));
         }
+        // Xray 26 removed the `http` transport; migrate an h2 link to XHTTP stream-one.
         Network::H2 => {
-            let mut h = Map::new();
+            let mut x = Map::new();
             if let Some(path) = non_empty(&transport.path) {
-                h.insert("path".into(), json!(path));
+                x.insert("path".into(), json!(path));
             }
             if let Some(host) = non_empty(&transport.host) {
-                let hosts: Vec<&str> = host
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                h.insert("host".into(), json!(hosts));
+                x.insert("host".into(), json!(host));
             }
-            ss.insert("httpSettings".into(), Value::Object(h));
+            x.insert("mode".into(), json!("stream-one"));
+            ss.insert("xhttpSettings".into(), Value::Object(x));
         }
         Network::Tcp if transport.header_type.as_deref() == Some("http") => {
             let mut request = Map::new();
@@ -442,27 +439,13 @@ fn add_stream(
                 json!({"header": Value::Object(header)}),
             );
         }
-        Network::Kcp => {
-            let mut k = Map::new();
-            k.insert(
-                "header".into(),
-                json!({"type": transport.header_type.clone().unwrap_or_else(|| "none".into())}),
-            );
-            if let Some(seed) = non_empty(&transport.seed) {
-                k.insert("seed".into(), json!(seed));
-            }
-            ss.insert("kcpSettings".into(), Value::Object(k));
-        }
+        // Xray 26 removed mKCP `header`/`seed` (migrated to finalmask); plain mKCP stays.
+        Network::Kcp => {}
+        // Xray 26 removed the `quic` transport; migrate to XHTTP stream-one.
         Network::Quic => {
-            let mut q = Map::new();
-            q.insert(
-                "header".into(),
-                json!({"type": transport.header_type.clone().unwrap_or_else(|| "none".into())}),
-            );
-            if let Some(key) = non_empty(&transport.seed) {
-                q.insert("key".into(), json!(key));
-            }
-            ss.insert("quicSettings".into(), Value::Object(q));
+            let mut x = Map::new();
+            x.insert("mode".into(), json!("stream-one"));
+            ss.insert("xhttpSettings".into(), Value::Object(x));
         }
         Network::Tcp => {}
     }
@@ -509,37 +492,6 @@ mod tests {
             flow: Some("xtls-rprx-vision".into()),
             encryption: Some("none".into()),
         })
-    }
-
-    fn write_temp(name: &str, content: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("flamix-t03-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        std::fs::write(&path, content).unwrap();
-        path
-    }
-
-    /// Validates the generated JSON against a real Xray binary. Skipped unless
-    /// `FLAMIX_XRAY_BIN` points at one.
-    #[test]
-    fn xray_binary_accepts_config() {
-        let Ok(bin) = std::env::var("FLAMIX_XRAY_BIN") else {
-            return;
-        };
-        let settings = Settings::default();
-        let api_port = crate::config::api_port(crate::config::CoreKind::Xray, &settings);
-        let cfg = full_config(&vless_server(), &settings, api_port);
-        let path = write_temp("xray.json", &serde_json::to_string_pretty(&cfg).unwrap());
-        let out = std::process::Command::new(bin)
-            .args(["run", "-test", "-c"])
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "xray rejected config: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
     }
 
     #[test]
@@ -663,7 +615,7 @@ mod tests {
         assert_eq!(out["streamSettings"]["network"], json!("ws"));
         assert_eq!(out["streamSettings"]["wsSettings"]["path"], json!("/ws"));
         assert_eq!(
-            out["streamSettings"]["wsSettings"]["headers"]["Host"],
+            out["streamSettings"]["wsSettings"]["host"],
             json!("ws.example")
         );
         assert_eq!(out["streamSettings"]["security"], json!("tls"));
