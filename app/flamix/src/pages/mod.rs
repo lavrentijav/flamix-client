@@ -20,3 +20,20 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     stats::init(ui, ctrl);
     about::init(ui, ctrl);
 }
+
+/// Switch the app to dark or light: our own `Theme` and, in lockstep, the std-widgets `Palette`
+/// (LineEdit/TextEdit/ComboBox/Button/… otherwise follow the OS colour scheme and look out of
+/// place on our custom background).
+pub fn apply_theme(ui: &AppWindow, dark: bool) {
+    use slint::ComponentHandle;
+    ui.global::<crate::Theme>().set_dark(dark);
+    // `ColorScheme` is exported through Slint's re-export module; the generated `Palette` global
+    // expects exactly this type.
+    use slint::private_unstable_api::re_exports::ColorScheme;
+    let scheme = if dark {
+        ColorScheme::Dark
+    } else {
+        ColorScheme::Light
+    };
+    ui.global::<crate::Palette>().set_color_scheme(scheme);
+}

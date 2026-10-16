@@ -5,6 +5,10 @@ import "../assets/fonts/DejaVuSans-Bold.ttf";
 // Re-exported so Rust can switch the theme via `ui.global::<Theme>().set_dark(..)`.
 import { Theme } from "theme.slint";
 export { Theme } from "theme.slint";
+// std-widgets (LineEdit, TextEdit, ComboBox, Button, …) paint from the global `Palette`, whose
+// colour scheme defaults to the OS one — Rust forces it to follow our theme (see `apply_theme`).
+import { Palette } from "std-widgets.slint";
+export { Palette } from "std-widgets.slint";
 import { Rail } from "components/rail.slint";
 import { ServersPanel } from "components/servers-panel.slint";
 import { ConnectionPanel } from "components/connection-panel.slint";

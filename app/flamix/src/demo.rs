@@ -567,7 +567,7 @@ pub fn screenshot(
     // The build host has no system fonts; use the bundled DejaVu family for the shot.
     ui.set_font_family("DejaVu Sans".into());
     ui.set_dark(!light);
-    ui.global::<crate::Theme>().set_dark(!light);
+    crate::pages::apply_theme(&ui, !light);
     ui.set_page(page);
     ui.set_state(ConnState::Connected);
     ui.set_status_text("Подключено".into());

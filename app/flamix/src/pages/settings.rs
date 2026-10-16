@@ -5,7 +5,7 @@
 //! mapping, core-affecting comparison) are unit-tested at the bottom.
 
 use crate::controller::Controller;
-use crate::{AppWindow, SettingsBridge, Theme};
+use crate::{AppWindow, SettingsBridge};
 use flamix_core::model::{ConnectionMode, Dns, Settings, Theme as SettingsTheme};
 use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
@@ -220,7 +220,7 @@ fn merge_owned(live: &Settings, src: &Settings) -> Settings {
 
 /// Mirror the theme into the UI immediately (System follows the app default = dark).
 fn apply_theme(ui: &AppWindow, theme: SettingsTheme) {
-    ui.global::<Theme>().set_dark(theme_is_dark(theme));
+    super::apply_theme(ui, theme_is_dark(theme));
 }
 
 fn theme_is_dark(theme: SettingsTheme) -> bool {
