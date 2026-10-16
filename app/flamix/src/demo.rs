@@ -90,6 +90,23 @@ fn rebuild(ui: &AppWindow, subs: &Subs, locals: &Locals) {
     ui.set_local_servers(model(locals.borrow().clone()));
 }
 
+/// Name + ISO code of the server currently flagged `selected` (if any).
+fn selected_server(subs: &Subs, locals: &Locals) -> Option<(String, String)> {
+    for sub in subs.borrow().iter() {
+        for sv in sub.servers.iter() {
+            if sv.selected {
+                return Some((sv.name.to_string(), sv.country.to_string()));
+            }
+        }
+    }
+    for sv in locals.borrow().iter() {
+        if sv.selected {
+            return Some((sv.name.to_string(), sv.country.to_string()));
+        }
+    }
+    None
+}
+
 fn select(ui: &AppWindow, subs: &Subs, locals: &Locals, id: &str) {
     let mut found: Option<(String, String)> = None;
     for sub in subs.borrow_mut().iter_mut() {
@@ -179,9 +196,12 @@ pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
     ui.set_state(ConnState::Disconnected);
     ui.set_status_text("Не подключено".into());
     ui.set_speed_text("↑ 0 KB/s   ↓ 0 KB/s".into());
-    ui.set_selected_name("Frankfurt · Reality".into());
-    ui.set_selected_flag(flags::flag("DE"));
     rebuild(ui, &subs, &locals);
+    // The connection panel must mirror the server flagged selected in the demo data.
+    if let Some((name, iso)) = selected_server(&subs, &locals) {
+        ui.set_selected_name(name.into());
+        ui.set_selected_flag(flags::flag(&iso));
+    }
 
     {
         let w = ui.as_weak();

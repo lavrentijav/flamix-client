@@ -61,9 +61,13 @@ export component ConnectionPanel inherits Rectangle {
                 width: 168px;
                 height: 36px;
                 border-radius: 8px;
-                background: ping-ta.has-hover ? Theme.hover : Theme.card-header;
+                background: ping-ta.has-hover ? Theme.hover : Theme.control-bg;
+                border-width: 1px;
+                border-color: Theme.stroke;
+                // Icon and text vertically centered on one line.
                 HorizontalLayout {
                     alignment: center;
+                    cross-axis-alignment: center;
                     spacing: 8px;
                     Icon {
                         width: 16px;
