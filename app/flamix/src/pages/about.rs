@@ -8,12 +8,17 @@ use crate::{AboutBridge, AppWindow};
 use flamix_core::config::CoreKind;
 use flamix_sys::runner;
 use slint::{ComponentHandle, Weak};
+use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Project links opened by the buttons.
 const GITHUB: &str = "https://github.com/lavrentijav/flamix-client";
 const RELEASES: &str = "https://github.com/lavrentijav/flamix-client/releases";
 const ISSUES: &str = "https://github.com/lavrentijav/flamix-client/issues";
+
+/// Upper bound for a `<core> version` probe so a hung binary cannot pin a task forever.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Core versions shown in `--demo` / screenshot mode.
 const DEMO_XRAY: &str = "25.3.6";
@@ -84,13 +89,42 @@ fn core_label(kind: CoreKind) -> String {
 /// Run `<core> version` and parse the version token.
 fn core_version(kind: CoreKind) -> Option<String> {
     let binary = runner::find_core(kind).ok()?;
-    let output = std::process::Command::new(binary)
-        .arg("version")
-        .output()
+    let mut cmd = Command::new(binary);
+    cmd.arg("version");
+    let output = run_with_timeout(cmd, VERSION_TIMEOUT)?;
+    parse_core_output(output.status.success(), &output.stdout, &output.stderr)
+}
+
+/// Run `cmd`, reaping the child; `None` on spawn error or when it exceeds `timeout`.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .ok()?;
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Parse a finished core's output: a successful run's stdout first, then stderr.
+fn parse_core_output(success: bool, stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    if !success {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(stdout).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&output.stderr).into_owned();
+        text = String::from_utf8_lossy(stderr).into_owned();
     }
     parse_version(&text)
 }
@@ -109,10 +143,18 @@ fn parse_version(output: &str) -> Option<String> {
 }
 
 /// Open `url` in the default browser without blocking the UI.
+///
+/// The child is waited on from a detached thread so it is reaped instead of lingering as a
+/// zombie for the whole app lifetime.
 fn open_link(url: &str) {
     let (program, args) = open_command(url);
-    if let Err(err) = std::process::Command::new(program).args(args).spawn() {
-        tracing::warn!(%err, url, "could not open the link in a browser");
+    match Command::new(program).args(args).spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(err) => tracing::warn!(%err, url, "could not open the link in a browser"),
     }
 }
 
@@ -166,6 +208,46 @@ mod tests {
         assert_eq!(parse_version(""), None);
         assert_eq!(parse_version("   \n  \n"), None);
         assert_eq!(parse_version("usage: xray version"), None);
+    }
+
+    #[test]
+    fn parse_core_output_requires_success_and_falls_back_to_stderr() {
+        assert_eq!(parse_core_output(false, b"Xray 1.2.3", b""), None);
+        assert_eq!(
+            parse_core_output(true, b"", b"sing-box version 1.11.5"),
+            Some("1.11.5".to_string())
+        );
+        assert_eq!(parse_core_output(true, b"no digits here", b""), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_collects_output_and_kills_hung_commands() {
+        let output = run_with_timeout(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "printf 'Xray 1.2.3'"]);
+                cmd
+            },
+            Duration::from_secs(5),
+        )
+        .expect("command should run");
+        assert_eq!(
+            parse_core_output(output.status.success(), &output.stdout, &output.stderr).as_deref(),
+            Some("1.2.3")
+        );
+
+        let started = Instant::now();
+        let hung = run_with_timeout(
+            {
+                let mut cmd = Command::new("sh");
+                cmd.args(["-c", "sleep 30"]);
+                cmd
+            },
+            Duration::from_millis(100),
+        );
+        assert!(hung.is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

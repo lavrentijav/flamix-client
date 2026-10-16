@@ -2,11 +2,12 @@
 //!
 //! The subscription form is applied in two steps: [`Controller::import`] parses the URL and adds
 //! the subscription (and starts its fetch), then we fill the optional name / backup URLs by
-//! matching the freshly added subscription by URL.
+//! matching it by URL. See the note on [`add_subscription`] about the resulting race.
 
 use crate::controller::Controller;
 use crate::{AddBridge, AppWindow};
 use flamix_core::model::AppState;
+use flamix_core::{deeplink, link};
 use slint::{ComponentHandle, Weak};
 use std::sync::Arc;
 
@@ -54,6 +55,13 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
 }
 
 /// "Add" button: import a subscription URL, then apply the optional name / backup URLs.
+///
+/// Note: [`Controller::import`] starts the subscription fetch immediately, before the name /
+/// backup URLs are filled in. The fetch clones the subscription at its start, and
+/// `subscription::update` keeps a user-visible name (it only overwrites the auto title), so the
+/// meta normally survives; but if the fetch clones before our `mutate`, the typed name is
+/// overwritten. The public controller API exposes no hook to set the meta before the fetch or to
+/// re-apply it after the fetch completes, so the meta is applied as early as possible here.
 fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
     let Some(window) = ui.upgrade() else {
         return;
@@ -68,9 +76,11 @@ fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
         return;
     }
 
+    bridge.set_busy(true);
     ctrl.import(&url);
     let found = ctrl.with_state(|state| state.subscriptions.iter().any(|s| s.url == url));
     if !found {
+        bridge.set_busy(false);
         set_status(&ui, "Не удалось распознать ссылку на подписку");
         return;
     }
@@ -82,6 +92,7 @@ fn add_subscription(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
     bridge.set_url("".into());
     bridge.set_name("".into());
     bridge.set_backups("".into());
+    bridge.set_busy(false);
     window.set_page(0);
 }
 
@@ -94,47 +105,79 @@ fn import_links(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
     if text.trim().is_empty() {
         return;
     }
-    let before = ctrl.with_state(|state| state.local_servers.len());
-    ctrl.import(&text);
-    let added = ctrl
-        .with_state(|state| state.local_servers.len())
-        .saturating_sub(before);
+    let bridge = window.global::<AddBridge>();
+    bridge.set_busy(true);
 
-    if added == 0 {
-        set_status(&ui, "Не удалось распознать ссылки");
-        return;
+    let import = match deeplink::parse_import(&text) {
+        Some(import) => import,
+        None => {
+            bridge.set_busy(false);
+            set_status(&ui, "Не удалось распознать ссылки");
+            return;
+        }
+    };
+
+    let before = ctrl.with_state(|state| (state.subscriptions.len(), state.local_servers.len()));
+    ctrl.import(&text);
+    let added = ctrl.with_state(|state| {
+        state.subscriptions.len().saturating_sub(before.0)
+            + state.local_servers.len().saturating_sub(before.1)
+    });
+
+    bridge.set_links("".into());
+    bridge.set_busy(false);
+
+    if matches!(import, deeplink::Import::Links(_)) {
+        let skipped = link::parse_links(&text, "local").1.len();
+        let message = if added == 0 && skipped == 0 {
+            "Все серверы уже добавлены".to_string()
+        } else {
+            links_status(added, skipped)
+        };
+        set_status(&ui, message);
     }
-    window.global::<AddBridge>().set_links("".into());
-    window
-        .global::<AddBridge>()
-        .set_status(links_status(added).into());
-    window.set_page(0);
+    if added > 0 {
+        window.set_page(0);
+    }
 }
 
 /// "Из буфера обмена": read the clipboard off-thread and import it (URL, links or deep link).
 fn import_clipboard(ui: Weak<AppWindow>, ctrl: Arc<Controller>) {
+    if let Some(window) = ui.upgrade() {
+        window.global::<AddBridge>().set_busy(true);
+    }
     let worker = Arc::clone(&ctrl);
     let result_ui = ui.clone();
     ctrl.runtime().spawn_blocking(move || {
         let text = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
             Ok(text) => text,
             Err(_) => {
-                set_status(&result_ui, "Буфер обмена пуст");
+                finish(&result_ui, "Буфер обмена пуст", false);
                 return;
             }
         };
-        let (subs, locals) =
+        let recognized = deeplink::parse_import(&text).is_some();
+        let before =
             worker.with_state(|state| (state.subscriptions.len(), state.local_servers.len()));
         worker.import(&text);
         let added = worker.with_state(|state| {
-            (state.subscriptions.len() - subs) + (state.local_servers.len() - locals)
+            state.subscriptions.len().saturating_sub(before.0)
+                + state.local_servers.len().saturating_sub(before.1)
         });
-        if added == 0 {
-            set_status(&result_ui, "Буфер обмена: нечего импортировать");
-            return;
+        finish(&result_ui, import_result(added, recognized), added > 0);
+    });
+}
+
+/// Publish a one-off result: set the status, clear the busy flag and optionally navigate away.
+fn finish(ui: &Weak<AppWindow>, text: impl Into<String>, navigate: bool) {
+    let text = text.into();
+    let _ = ui.upgrade_in_event_loop(move |ui| {
+        let bridge = ui.global::<AddBridge>();
+        bridge.set_status(text.into());
+        bridge.set_busy(false);
+        if navigate {
+            ui.set_page(0);
         }
-        set_status(&result_ui, format!("Импортировано: {added}"));
-        let _ = result_ui.upgrade_in_event_loop(|ui| ui.set_page(0));
     });
 }
 
@@ -189,16 +232,30 @@ fn apply_subscription_meta(
     true
 }
 
-/// Result line for a share-link import.
-fn links_status(added: usize) -> String {
-    format!("Добавлено серверов: {added}")
+/// Result line for a share-link import (matches the controller's wording, skipped kept).
+fn links_status(added: usize, skipped: usize) -> String {
+    let mut text = format!("Добавлено серверов: {added}");
+    if skipped > 0 {
+        text.push_str(&format!(", пропущено: {skipped}"));
+    }
+    text
+}
+
+/// Result line for the generic clipboard import.
+fn import_result(added: usize, recognized: bool) -> String {
+    if added > 0 {
+        format!("Импортировано: {added}")
+    } else if recognized {
+        "Уже добавлено".to_string()
+    } else {
+        "Не удалось распознать".to_string()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::controller::apply_import;
-    use flamix_core::deeplink;
 
     fn state_with_subscription(url: &str) -> AppState {
         let mut state = AppState::default();
@@ -280,8 +337,16 @@ mod tests {
     }
 
     #[test]
-    fn links_status_counts_added_servers() {
-        assert_eq!(links_status(0), "Добавлено серверов: 0");
-        assert_eq!(links_status(3), "Добавлено серверов: 3");
+    fn links_status_includes_skipped_only_when_present() {
+        assert_eq!(links_status(0, 0), "Добавлено серверов: 0");
+        assert_eq!(links_status(3, 0), "Добавлено серверов: 3");
+        assert_eq!(links_status(2, 5), "Добавлено серверов: 2, пропущено: 5");
+    }
+
+    #[test]
+    fn import_result_covers_added_duplicate_and_unknown() {
+        assert_eq!(import_result(0, false), "Не удалось распознать");
+        assert_eq!(import_result(0, true), "Уже добавлено");
+        assert_eq!(import_result(4, true), "Импортировано: 4");
     }
 }
