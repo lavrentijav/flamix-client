@@ -1,12 +1,146 @@
-// Page "Добавить". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Page "Добавить". OWNER: T17A (docs/tasks/T17-pages.md).
 // Rust side: src/pages/add.rs talks to the page ONLY through the global AddBridge.
-import { PlaceholderPage } from "placeholder-page.slint";
+import { ScrollView, LineEdit, TextEdit, Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
 
 export global AddBridge {
+    // Subscription form.
+    in-out property <string> url: "";
+    in-out property <string> name: "";
+    in-out property <string> backups: "";
+    // Share links (one per line).
+    in-out property <string> links: "";
+    // Result / error line shown next to the clipboard button.
+    in property <string> status: "";
+    in property <bool> busy: false;
+
+    callback add-subscription();
+    callback import-links();
+    callback import-clipboard();
+}
+
+component CardTitle inherits Text {
+    color: Theme.text;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+component Hint inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+    wrap: word-wrap;
 }
 
 export component AddPage inherits Rectangle {
-    PlaceholderPage {
-        title: "Добавить";
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 10px;
+
+        Text {
+            text: "Добавить";
+            color: Theme.text;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                spacing: 10px;
+
+                // --- Subscription URL -------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: subscription.preferred-height;
+                    subscription := VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        CardTitle { text: "Подписка"; }
+                        LineEdit {
+                            enabled: !AddBridge.busy;
+                            text <=> AddBridge.url;
+                            placeholder-text: "Ссылка на подписку (https://…), как в v2rayN и Happ";
+                        }
+                        LineEdit {
+                            enabled: !AddBridge.busy;
+                            text <=> AddBridge.name;
+                            placeholder-text: "Название (необязательно)";
+                        }
+                        TextEdit {
+                            enabled: !AddBridge.busy;
+                            height: 52px;
+                            text <=> AddBridge.backups;
+                            placeholder-text: "Резервные ссылки (необязательно), по одной в строке";
+                        }
+                        HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Добавить";
+                                enabled: AddBridge.url != "" && !AddBridge.busy;
+                                clicked => { AddBridge.add-subscription(); }
+                            }
+                        }
+                    }
+                }
+
+                // --- Share links ------------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: links-card.preferred-height;
+                    links-card := VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        CardTitle { text: "Ссылки"; }
+                        Hint {
+                            text: "vless, vmess, trojan, ss, hy2, tuic, wg; подписки https://; диплинки flamix://, happ://, v2raytun:// — по одной в строке.";
+                        }
+                        TextEdit {
+                            enabled: !AddBridge.busy;
+                            height: 84px;
+                            text <=> AddBridge.links;
+                            placeholder-text: "vless://…\nvmess://…\ntrojan://…\nss://…\nhy2://…\ntuic://…\nwg://…";
+                        }
+                        HorizontalLayout {
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Импортировать";
+                                enabled: AddBridge.links != "" && !AddBridge.busy;
+                                clicked => { AddBridge.import-links(); }
+                            }
+                        }
+                    }
+                }
+
+                // --- Clipboard --------------------------------------------------------
+                HorizontalLayout {
+                    spacing: 12px;
+                    Button {
+                        text: "Из буфера обмена";
+                        enabled: !AddBridge.busy;
+                        clicked => { AddBridge.import-clipboard(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    if AddBridge.status != "" : Text {
+                        text: AddBridge.status;
+                        color: Theme.muted;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
+                }
+
+                Rectangle { height: 4px; background: transparent; }
+            }
+        }
     }
 }

@@ -1,12 +1,185 @@
-// Page "О программе". OWNER: the task that implements this page (see docs/tasks/T17-pages.md).
+// Page "О программе". OWNER: T17A (docs/tasks/T17-pages.md).
 // Rust side: src/pages/about.rs talks to the page ONLY through the global AboutBridge.
-import { PlaceholderPage } from "placeholder-page.slint";
+import { ScrollView, Button } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
 
 export global AboutBridge {
+    in property <string> version: "";
+    in property <string> xray-version: "…";
+    in property <string> singbox-version: "…";
+
+    callback open-github();
+    callback open-releases();
+    callback open-issues();
+    callback refresh-cores();
+}
+
+component CardTitle inherits Text {
+    color: Theme.text;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+component Muted inherits Text {
+    color: Theme.muted;
+    font-size: 12px;
+}
+
+// One "name ...... license" row inside the licences card.
+component LicenceRow inherits HorizontalLayout {
+    in property <string> name: "";
+    in property <string> licence: "";
+    Text {
+        text: root.name;
+        color: Theme.text;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    Rectangle { horizontal-stretch: 1; }
+    Text {
+        text: root.licence;
+        color: Theme.muted;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+}
+
+// One "core ...... version" row inside the cores card.
+component CoreRow inherits HorizontalLayout {
+    in property <string> name: "";
+    in property <string> version: "";
+    Text {
+        text: root.name;
+        color: Theme.text;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    Rectangle { horizontal-stretch: 1; }
+    Text {
+        text: root.version;
+        color: Theme.muted;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
 }
 
 export component AboutPage inherits Rectangle {
-    PlaceholderPage {
-        title: "О программе";
+    background: Theme.panel-bg;
+    border-radius: 16px;
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Text {
+            text: "О программе";
+            color: Theme.text;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                spacing: 12px;
+
+                // --- Header -----------------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: header.preferred-height;
+                    header := VerticalLayout {
+                        padding: 14px;
+                        spacing: 6px;
+                        alignment: center;
+                        HorizontalLayout {
+                            alignment: center;
+                            Image {
+                                width: 72px;
+                                height: 72px;
+                                source: @image-url("../../assets/app-icon.svg");
+                            }
+                        }
+                        Text {
+                            text: "Flamix";
+                            color: Theme.text;
+                            font-size: 26px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Версия " + AboutBridge.version;
+                            color: Theme.muted;
+                            font-size: 13px;
+                            horizontal-alignment: center;
+                        }
+                        Text {
+                            text: "Кроссплатформенный VPN-клиент на Rust с интерфейсом Slint (WinUI 3).";
+                            color: Theme.muted;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                        HorizontalLayout {
+                            alignment: center;
+                            spacing: 8px;
+                            Button { text: "GitHub"; clicked => { AboutBridge.open-github(); } }
+                            Button { text: "Релизы"; clicked => { AboutBridge.open-releases(); } }
+                            Button { text: "Проблемы"; clicked => { AboutBridge.open-issues(); } }
+                        }
+                    }
+                }
+
+                // --- Cores ------------------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: cores.preferred-height;
+                    cores := VerticalLayout {
+                        padding: 12px;
+                        spacing: 6px;
+                        HorizontalLayout {
+                            CardTitle { text: "Ядра"; vertical-alignment: center; }
+                            Rectangle { horizontal-stretch: 1; }
+                            Button {
+                                text: "Проверить";
+                                clicked => { AboutBridge.refresh-cores(); }
+                            }
+                        }
+                        CoreRow { name: "Xray-core"; version: AboutBridge.xray-version; }
+                        CoreRow { name: "sing-box"; version: AboutBridge.singbox-version; }
+                        Muted {
+                            text: "Ядра запускаются как внешние процессы и не входят в дистрибутив приложения.";
+                        }
+                    }
+                }
+
+                // --- Licences ---------------------------------------------------------
+                Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    height: licences.preferred-height;
+                    licences := VerticalLayout {
+                        padding: 12px;
+                        spacing: 4px;
+                        CardTitle { text: "Лицензии"; }
+                        LicenceRow { name: "Flamix"; licence: "GPL-3.0-or-later"; }
+                        LicenceRow { name: "Xray-core"; licence: "MPL-2.0"; }
+                        LicenceRow { name: "sing-box"; licence: "GPL-3.0"; }
+                        LicenceRow { name: "Slint"; licence: "royalty-free / GPL-3.0"; }
+                        LicenceRow { name: "Alfa-Bank icons"; licence: "MIT"; }
+                    }
+                }
+
+                Rectangle { height: 4px; background: transparent; }
+            }
+        }
     }
 }
