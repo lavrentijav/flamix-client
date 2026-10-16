@@ -10,12 +10,16 @@ mod flags;
 mod instance;
 mod pages;
 mod persist;
+mod tray;
 mod view;
 
 use controller::Controller;
 use slint::ComponentHandle;
+use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 slint::include_modules!();
 
@@ -111,6 +115,107 @@ fn start_listener(
     Ok((listener, token))
 }
 
+/// The tray, kept in a slot so the sync timer and the close handler can reach it.
+type TraySlot = Rc<RefCell<Option<tray::Tray>>>;
+
+/// Construct the tray (if the platform/environment provides one) and marshal its commands
+/// back onto the Slint event loop and the controller.
+fn build_tray(ui: &AppWindow, controller: &Arc<Controller>) -> Option<tray::Tray> {
+    let (connected, server, tun) = controller.connection_state();
+    let ui = ui.as_weak();
+    let ctl = Arc::clone(controller);
+    tray::Tray::new(tray::TrayHandle {
+        on_command: Box::new(move |command| {
+            let ctl = Arc::clone(&ctl);
+            let ui = ui.clone();
+            let _ = slint::invoke_from_event_loop(move || match command {
+                tray::TrayCommand::ToggleConnect => ctl.toggle_connect_public(),
+                tray::TrayCommand::SetMode(tun) => ctl.set_mode_public(tun),
+                tray::TrayCommand::Show => {
+                    if let Some(ui) = ui.upgrade() {
+                        let _ = ui.show();
+                    }
+                }
+                tray::TrayCommand::Quit => ctl.quit(),
+            });
+        }),
+        initial: tray::TrayState {
+            connected,
+            server,
+            tun,
+        },
+        rt: Some(controller.runtime()),
+    })
+}
+
+/// Create the tray and start a timer that keeps it in sync with the controller. On macOS
+/// `tray-icon` must be created while the event loop is already running, so creation is
+/// deferred by one event-loop turn there. Returns the tray slot (kept alive by the caller)
+/// and the sync timer (dropping it stops the updates).
+fn install_tray(
+    ui: &AppWindow,
+    controller: Arc<Controller>,
+    minimize: bool,
+) -> (TraySlot, slint::Timer) {
+    let slot: TraySlot = Rc::new(RefCell::new(None));
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = minimize;
+        *slot.borrow_mut() = build_tray(ui, &controller);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let slot = Rc::clone(&slot);
+        let ui_weak = ui.as_weak();
+        let ctl = Arc::clone(&controller);
+        slint::Timer::single_shot(Duration::from_millis(0), move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                let tray = build_tray(&ui, &ctl);
+                let has_tray = tray.is_some();
+                *slot.borrow_mut() = tray;
+                if minimize && has_tray {
+                    let _ = ui.hide();
+                }
+            }
+        });
+    }
+
+    // Close-to-tray: hide when a tray exists and the setting is on, otherwise quit through
+    // the regular shutdown path. Without a tray this mirrors the old close behaviour.
+    {
+        let slot = Rc::clone(&slot);
+        let ctl = Arc::clone(&controller);
+        ui.window().on_close_requested(move || {
+            if slot.borrow().is_some() && ctl.with_state(|s| s.settings.minimize_to_tray) {
+                slint::CloseRequestResponse::HideWindow
+            } else {
+                ctl.quit();
+                slint::CloseRequestResponse::KeepWindowShown
+            }
+        });
+    }
+
+    let timer = slint::Timer::default();
+    {
+        let slot = Rc::clone(&slot);
+        let ctl = Arc::clone(&controller);
+        timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_millis(500),
+            move || {
+                if let Some(tray) = slot.borrow().as_ref() {
+                    let (connected, server, tun) = ctl.connection_state();
+                    tray.set_connected(connected, &server);
+                    tray.set_mode(tun);
+                }
+            },
+        );
+    }
+    (slot, timer)
+}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -147,7 +252,7 @@ fn main() -> anyhow::Result<()> {
     let minimize = args.minimized && state.settings.minimize_to_tray;
 
     let ui = AppWindow::new()?;
-    let _controller = if args.demo {
+    let controller = if args.demo {
         demo::setup(&ui)?;
         pages::init(&ui, None);
         None
@@ -166,7 +271,14 @@ fn main() -> anyhow::Result<()> {
         Some(controller)
     };
 
-    if minimize {
+    // Tray + close-to-tray (real mode only). `_tray_timer` must stay alive for the whole run.
+    let (tray_slot, _tray_timer) = match &controller {
+        Some(controller) => install_tray(&ui, Arc::clone(controller), minimize),
+        None => (Rc::new(RefCell::new(None)), slint::Timer::default()),
+    };
+
+    // Start hidden only when a tray actually exists to bring the window back.
+    if minimize && tray_slot.borrow().is_some() {
         ui.hide()?;
     }
     ui.run()?;

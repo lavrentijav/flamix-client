@@ -1233,6 +1233,39 @@ impl Controller {
     }
 }
 
+/// Small wrappers used by the system tray (`src/tray.rs`). They must run on the UI thread
+/// or hand work to the runtime themselves, exactly like the UI callbacks do.
+impl Controller {
+    /// Snapshot the tray renders: `(connected, server name, tun mode)`.
+    pub(crate) fn connection_state(&self) -> (bool, String, bool) {
+        let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false)
+            || self.connecting.load(Ordering::Relaxed);
+        let (server, tun) = {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                view::selected_name(&state),
+                state.settings.mode == ConnectionMode::Tun,
+            )
+        };
+        (connected, server, tun)
+    }
+
+    /// Tray "Подключиться"/"Отключиться".
+    pub(crate) fn toggle_connect_public(self: &Arc<Self>) {
+        self.toggle_connect();
+    }
+
+    /// Tray Proxy/TUN switch.
+    pub(crate) fn set_mode_public(self: &Arc<Self>, tun: bool) {
+        self.mode_changed(tun);
+    }
+
+    /// Tray "Выход": disconnect, save and stop the event loop.
+    pub(crate) fn quit(self: &Arc<Self>) {
+        self.initiate_shutdown();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
