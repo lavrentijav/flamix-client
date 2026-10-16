@@ -395,6 +395,13 @@ impl Controller {
             .upgrade_in_event_loop(move |ui| ui.set_status_text(text.into()));
     }
 
+    /// Show or hide the "restart as administrator" button in the connection panel.
+    fn set_needs_admin(&self, value: bool) {
+        let _ = self
+            .ui
+            .upgrade_in_event_loop(move |ui| ui.set_needs_admin(value));
+    }
+
     /// Parse and apply a deep link / pasted text on the calling thread, then repaint.
     fn import_text(self: &Arc<Self>, text: &str) {
         let Some(import) = deeplink::parse_import(text) else {
@@ -667,9 +674,11 @@ impl Controller {
         };
 
         if settings.mode == ConnectionMode::Tun && cfg!(windows) && !elevation::is_elevated() {
+            self.set_needs_admin(true);
             self.set_conn_state(ConnState::Error, "Для TUN нужен запуск от администратора");
             return;
         }
+        self.set_needs_admin(false);
 
         self.set_conn_state(ConnState::Connecting, "Подключение…");
         let plans = config::plan(&server, &settings);
@@ -900,7 +909,9 @@ impl Controller {
     }
 
     fn mode_changed(self: &Arc<Self>, tun: bool) {
-        if tun && cfg!(windows) && !elevation::is_elevated() {
+        let needs_admin = tun && cfg!(windows) && !elevation::is_elevated();
+        self.set_needs_admin(needs_admin);
+        if needs_admin {
             self.set_status("Для TUN нужен запуск от администратора");
         }
         let new_mode = if tun {

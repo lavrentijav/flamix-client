@@ -10,10 +10,12 @@ export component ConnectionPanel inherits Rectangle {
     in property <ConnState> state;
     in property <string> status-text;
     in property <string> speed-text;
+    in property <bool> needs-admin: false;
     in-out property <bool> tun-mode: false;
     callback toggle-connect();
     callback ping-selected();
     callback mode-changed(bool);
+    callback restart-as-admin();
 
     width: 300px;
     background: Theme.panel-bg;
@@ -128,6 +130,20 @@ export component ConnectionPanel inherits Rectangle {
             color: Theme.muted;
             font-size: 12px;
             horizontal-alignment: center;
+        }
+        // Shown when TUN needs elevation (Windows): offer to restart as administrator.
+        if root.needs-admin : Rectangle {
+            height: 34px;
+            border-radius: 8px;
+            background: admin-ta.has-hover ? Theme.accent-strong : Theme.accent;
+            Text {
+                text: "Перезапустить от администратора";
+                color: Theme.on-accent;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            admin-ta := TouchArea { mouse-cursor: pointer; clicked => { root.restart-as-admin(); } }
         }
         if root.state == ConnState.connected : Text {
             text: root.speed-text;
