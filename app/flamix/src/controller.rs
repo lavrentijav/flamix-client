@@ -522,7 +522,12 @@ impl Controller {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let before = state.subscriptions.len();
             state.subscriptions.retain(|s| s.id != id);
-            if state.selected_server.as_deref() == Some(id) {
+            let selected_gone = state
+                .selected_server
+                .as_deref()
+                .map(|selected| state.server(selected).is_none())
+                .unwrap_or(false);
+            if selected_gone {
                 state.selected_server = None;
             }
             before != state.subscriptions.len()
