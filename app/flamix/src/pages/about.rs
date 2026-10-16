@@ -10,10 +10,8 @@ use flamix_core::config::CoreKind;
 use flamix_core::model::AppState;
 use flamix_sys::runner;
 use slint::{ComponentHandle, Weak};
-use std::cell::RefCell;
 use std::process::{Command, Output, Stdio};
-use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// Project links opened by the buttons.
@@ -77,7 +75,7 @@ fn wire_backup(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
     bridge.set_import_confirm(false);
 
     // The state parsed from the chosen file is kept until the user confirms the overwrite.
-    let imported: Rc<RefCell<Option<AppState>>> = Rc::new(RefCell::new(None));
+    let imported: Arc<Mutex<Option<AppState>>> = Arc::new(Mutex::new(None));
 
     {
         let weak = ui.as_weak();
@@ -100,7 +98,8 @@ fn wire_backup(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
             let Some(ui) = weak.upgrade() else { return };
             let bridge = ui.global::<AboutBridge>();
             bridge.set_import_confirm(false);
-            let Some(state) = imported.borrow_mut().take() else {
+            let state = imported.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let Some(state) = state else {
                 return;
             };
             match ctrl.as_ref() {
@@ -118,7 +117,7 @@ fn wire_backup(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
         let weak = ui.as_weak();
         let imported = imported.clone();
         ui.global::<AboutBridge>().on_import_cancelled(move || {
-            imported.borrow_mut().take();
+            imported.lock().unwrap_or_else(|e| e.into_inner()).take();
             if let Some(ui) = weak.upgrade() {
                 let bridge = ui.global::<AboutBridge>();
                 bridge.set_import_confirm(false);
@@ -143,44 +142,62 @@ fn export_backup(ui: Weak<AppWindow>, ctrl: Option<Arc<Controller>>) {
     else {
         return;
     };
-    let result = ctrl
-        .with_state(backup::export)
-        .and_then(|text| std::fs::write(&path, text).map_err(flamix_core::Error::from));
-    match result {
-        Ok(()) => bridge.set_backup_status(format!("Сохранено: {}", path.display()).into()),
-        Err(err) => bridge.set_backup_status(format!("Ошибка: {err}").into()),
-    }
+    // Serialise on the UI thread without holding any lock for long, then write off the UI thread.
+    let text = match ctrl.with_state(backup::export) {
+        Ok(text) => text,
+        Err(err) => {
+            bridge.set_backup_status(format!("Ошибка: {err}").into());
+            return;
+        }
+    };
+    let ui_for_task = ui.as_weak();
+    ctrl.runtime().spawn_blocking(move || {
+        let status = match std::fs::write(&path, text) {
+            Ok(()) => format!("Сохранено: {}", path.display()),
+            Err(err) => format!("Ошибка: {err}"),
+        };
+        let _ = ui_for_task.upgrade_in_event_loop(move |ui| {
+            ui.global::<AboutBridge>().set_backup_status(status.into());
+        });
+    });
 }
 
 /// "Импортировать…": read and parse a file, then ask for confirmation before overwriting.
 fn pick_import(
     ui: Weak<AppWindow>,
     ctrl: Option<Arc<Controller>>,
-    imported: Rc<RefCell<Option<AppState>>>,
+    imported: Arc<Mutex<Option<AppState>>>,
 ) {
     let Some(ui) = ui.upgrade() else { return };
     let bridge = ui.global::<AboutBridge>();
-    if ctrl.is_none() {
+    let Some(ctrl) = ctrl else {
         bridge.set_backup_status("Импортировано (демо)".into());
         return;
-    }
+    };
     let Some(path) = rfd::FileDialog::new()
         .add_filter(BACKUP_FILTER, &["json"])
         .pick_file()
     else {
         return;
     };
-    let parsed = std::fs::read_to_string(&path)
-        .map_err(flamix_core::Error::from)
-        .and_then(|text| backup::import(&text));
-    match parsed {
-        Ok(state) => {
-            *imported.borrow_mut() = Some(state);
-            bridge.set_import_confirm(true);
-            bridge.set_backup_status(format!("Выбран файл: {}", path.display()).into());
-        }
-        Err(err) => bridge.set_backup_status(format!("Ошибка: {err}").into()),
-    }
+    let display = path.display().to_string();
+    let ui_for_task = ui.as_weak();
+    ctrl.runtime().spawn_blocking(move || {
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(flamix_core::Error::from)
+            .and_then(|text| backup::import(&text));
+        let _ = ui_for_task.upgrade_in_event_loop(move |ui| {
+            let bridge = ui.global::<AboutBridge>();
+            match parsed {
+                Ok(state) => {
+                    *imported.lock().unwrap_or_else(|e| e.into_inner()) = Some(state);
+                    bridge.set_import_confirm(true);
+                    bridge.set_backup_status(format!("Выбран файл: {display}").into());
+                }
+                Err(err) => bridge.set_backup_status(format!("Ошибка: {err}").into()),
+            }
+        });
+    });
 }
 
 /// Probe both cores off the UI thread and publish the labels back.

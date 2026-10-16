@@ -43,19 +43,31 @@ pub fn export(state: &AppState) -> Result<String> {
     Ok(serde_json::to_string_pretty(&backup)?)
 }
 
+/// Format metadata read before the (potentially large / malformed) `state` is parsed.
+#[derive(Debug, Deserialize)]
+struct Header {
+    format: String,
+    version: u32,
+}
+
 /// Parse a backup file and return the contained state (with `device_id` removed).
 ///
 /// Rejects files that are not Flamix backups and those written by a newer format version.
+/// The small header is validated first, so a foreign or malformed document gets the friendly
+/// `Error::Parse` message instead of a raw serde error.
 pub fn import(text: &str) -> Result<AppState> {
-    let mut backup: Backup = serde_json::from_str(text)?;
-    if backup.format != FORMAT {
+    let header: Header = serde_json::from_str(text)
+        .map_err(|_| Error::Parse("это не резервная копия Flamix".to_string()))?;
+    if header.format != FORMAT {
         return Err(Error::Parse("это не резервная копия Flamix".to_string()));
     }
-    if backup.version > VERSION {
+    if header.version > VERSION {
         return Err(Error::Parse(
             "копия новее этой версии приложения".to_string(),
         ));
     }
+    let mut backup: Backup = serde_json::from_str(text)
+        .map_err(|err| Error::Parse(format!("повреждённая резервная копия: {err}")))?;
     backup.state.device_id = None;
     Ok(backup.state)
 }
@@ -192,6 +204,25 @@ mod tests {
             Err(Error::Parse(msg)) => assert_eq!(msg, "это не резервная копия Flamix"),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn arbitrary_foreign_document_is_rejected_with_parse() {
+        for text in ["{\"foo\":1}", "[]", "not json at all", "{}"] {
+            match import(text) {
+                Err(Error::Parse(_)) => {}
+                other => panic!("{text}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn import_strips_device_id_from_wrapper() {
+        let mut backup = backup_of(&sample_state());
+        backup.state.device_id = Some("foreign".to_string());
+        let text = serde_json::to_string(&backup).unwrap();
+        let back = import(&text).unwrap();
+        assert!(back.device_id.is_none());
     }
 
     #[test]
