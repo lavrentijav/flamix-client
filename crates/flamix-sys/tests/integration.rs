@@ -91,7 +91,9 @@ async fn logs_and_stops_a_running_core() {
 
     let work = dir.join("work");
     let plans = vec![plan()];
-    let mut running = flamix_sys::runner::start(&plans, &work).await.unwrap();
+    let mut running = flamix_sys::runner::start(&plans, &work, None)
+        .await
+        .unwrap();
 
     assert!(running.is_alive());
     assert!(work.join("xray.json").is_file());
@@ -122,7 +124,7 @@ async fn early_exit_is_reported_as_core_exited() {
 
     let work = dir.join("work");
     let plans = vec![plan()];
-    let err = match flamix_sys::runner::start(&plans, &work).await {
+    let err = match flamix_sys::runner::start(&plans, &work, None).await {
         Ok(_) => panic!("expected the fake core to fail"),
         Err(e) => e,
     };
@@ -139,7 +141,8 @@ async fn early_exit_is_reported_as_core_exited() {
 
 /// Run the generated watchdog script directly (no pkexec) with `app_pid` as the app process.
 fn launch_watchdog(dir: &Path, core: &Path, cfg: &Path, app_pid: u32) -> std::process::Child {
-    let script = flamix_sys::runner::elevated_watchdog_script(CoreKind::SingBox, core, cfg, dir);
+    let script =
+        flamix_sys::runner::elevated_watchdog_script(CoreKind::SingBox, core, cfg, dir, None);
     Command::new("sh")
         .arg("-c")
         .arg(&script)
