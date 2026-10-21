@@ -651,7 +651,7 @@ impl Controller {
             let Some(sub) = state.subscriptions.iter().find(|s| s.id == id).cloned() else {
                 return;
             };
-            (sub, state.device_id.clone(), state.settings.socks_port)
+            (sub, state.effective_hwid(), state.settings.socks_port)
         };
         let connected = self.conn.lock().map(|c| c.is_some()).unwrap_or(false);
         let opts = FetchOptions {
