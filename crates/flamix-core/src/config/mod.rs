@@ -1126,8 +1126,8 @@ mod tests {
 mod validation {
     use super::*;
     use crate::model::{
-        Credentials, Dns, FailoverMode, Network, Routing, RoutingPreset, RoutingRule, RuleAction,
-        Security, Transport,
+        Credentials, Dns, FailoverMode, MirrorMode, Network, Routing, RoutingPreset, RoutingRule,
+        RuleAction, Security, Transport,
     };
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1428,6 +1428,7 @@ mod validation {
     fn custom_routing() -> Routing {
         Routing {
             preset: RoutingPreset::Custom,
+            anixart_mirror: MirrorMode::default(),
             custom_rules: vec![
                 RoutingRule {
                     domains: vec![

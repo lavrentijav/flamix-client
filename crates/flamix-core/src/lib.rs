@@ -23,5 +23,6 @@ pub mod ping;
 pub mod provider_routing;
 pub mod store;
 pub mod subscription;
+pub mod support;
 
 pub use error::{Error, Result};

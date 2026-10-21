@@ -155,6 +155,7 @@ mod tests {
 
         AppState {
             version: AppState::VERSION,
+            hwid_override: Some("manual-hwid-01".to_string()),
             subscriptions: vec![subscription("sub-1")],
             local_servers: vec![server("local-1")],
             selected_server: Some("sub-1-srv".to_string()),
