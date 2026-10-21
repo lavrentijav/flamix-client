@@ -1,0 +1,31 @@
+import { Theme } from "../theme.slint";
+
+// Segmented control: equal-width options, the current one filled with the accent.
+export component Segmented inherits Rectangle {
+    in property <[string]> options;
+    in property <int> current: 0;
+    callback selected(int);
+
+    height: 32px;
+    border-radius: 8px;
+    background: Theme.track;
+
+    HorizontalLayout {
+        padding: 3px;
+        spacing: 3px;
+        for option[i] in root.options : Rectangle {
+            horizontal-stretch: 1;
+            border-radius: 6px;
+            background: i == root.current ? Theme.accent : (seg-ta.has-hover ? Theme.hover : transparent);
+            Text {
+                text: option;
+                color: i == root.current ? Theme.on-accent : Theme.muted;
+                font-size: 12px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            seg-ta := TouchArea { mouse-cursor: pointer; clicked => { root.selected(i); } }
+        }
+    }
+}

@@ -2,6 +2,9 @@ import { Theme } from "../theme.slint";
 import { Icon } from "icon.slint";
 import { ServerItem } from "../model.slint";
 
+// One server: flag, name, a muted second line (protocol, plus the measured exit IP only when it
+// is known), an optional quota bar, the ping and a chevron that opens the details.
+// Fixed height (no per-row variation from the exit IP) so rows never jump or overlap.
 export component ServerRow inherits Rectangle {
     in property <ServerItem> item;
     in property <bool> edit-mode: false;
@@ -9,130 +12,132 @@ export component ServerRow inherits Rectangle {
     callback open();
     callback delete-clicked();
 
-    height: (item.has-quota ? 64px : 50px) + (item.exit-ip == "" ? 0px : 18px);
+    height: item.has-quota ? 62px : 48px;
     border-radius: 8px;
     background: item.selected ? Theme.accent.with-alpha(0.18) : (ta.has-hover ? Theme.hover : transparent);
     animate background { duration: 140ms; }
 
     property <color> ping-color: item.ping == -1 ? Theme.danger : item.ping < 0 ? Theme.muted : item.ping < 150 ? Theme.success : item.ping < 400 ? Theme.warning : Theme.danger;
     property <string> ping-text: item.ping < -1 ? "" : item.ping == -1 ? "—" : "\{item.ping} ms";
-
-    // Flag.
-    Image {
-        x: 12px;
-        y: (parent.height - self.height) / 2;
-        width: 26px;
-        height: 20px;
-        source: item.flag;
-    }
-
-    // Name + subtitle.
-    Text {
-        x: 48px;
-        y: item.has-quota ? 9px : 7px;
-        width: parent.width - 48px - 104px;
-        text: item.name;
-        color: Theme.text;
-        font-size: 14px;
-        overflow: elide;
-        vertical-alignment: top;
-    }
-    Text {
-        x: 48px;
-        y: 25px;
-        width: parent.width - 48px - 104px;
-        text: item.summary;
-        color: Theme.muted;
-        font-size: 12px;
-        overflow: elide;
-    }
-
-    // Per-server quota: thin bar + remaining text.
-    if item.has-quota : Rectangle {
-        x: 48px;
-        y: 52px;
-        width: 150px;
-        height: 3px;
-        border-radius: 2px;
-        background: Theme.track;
-        Rectangle {
-            x: 0;
-            y: 0;
-            width: min(parent.width * item.quota-fraction, parent.width);
-            height: parent.height;
-            border-radius: 2px;
-            background: Theme.accent;
-        }
-    }
-    if item.has-quota : Text {
-        x: 204px;
-        y: 40px;
-        text: item.quota-text;
-        color: Theme.muted;
-        font-size: 11px;
-    }
-
-    // Measured egress IP (muted, small), with a badge when several servers share it.
-    // The row reserves a dedicated 18px slot at its bottom (see `height`), below the
-    // summary and the quota bar, so nothing overlaps.
-    if item.exit-ip != "" : Text {
-        x: 48px;
-        y: parent.height - 18px;
-        height: 16px;
-        text: item.exit-group > 1 ? "\{item.exit-ip}   IP ×\{item.exit-group}" : item.exit-ip;
-        color: item.exit-group > 1 ? Theme.accent : Theme.muted;
-        font-size: 11px;
-        vertical-alignment: center;
-    }
-
-    // Ping badge.
-    if item.ping != -2 : Text {
-        x: parent.width - 104px;
-        y: (parent.height - self.height) / 2;
-        width: 48px;
-        text: root.ping-text;
-        color: root.ping-color;
-        font-size: 12px;
-        horizontal-alignment: right;
-        vertical-alignment: center;
-    }
-
-    // Chevron -> open details.
-    Icon {
-        x: parent.width - 30px;
-        y: (parent.height - self.height) / 2;
-        width: 16px;
-        height: 16px;
-        source: @image-url("../../assets/icons/chevron-right.svg");
-        tint: Theme.muted;
-    }
-
-    // Delete (edit mode).
-    if edit-mode : Icon {
-        x: parent.width - 58px;
-        y: (parent.height - self.height) / 2;
-        width: 18px;
-        height: 18px;
-        source: @image-url("../../assets/icons/trash.svg");
-        tint: Theme.muted;
-    }
+    // Summary line: protocol / transport, then "· exit IP" when measured.
+    property <string> second-line: item.exit-ip == "" ? item.summary : "\{item.summary}  ·  \{item.exit-ip}";
 
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
-    if edit-mode : TouchArea {
-        x: parent.width - 68px;
-        width: 34px;
-        height: parent.height;
-        mouse-cursor: pointer;
-        clicked => { root.delete-clicked(); }
-    }
-    TouchArea {
-        x: parent.width - 36px;
-        width: 36px;
-        height: parent.height;
-        mouse-cursor: pointer;
-        clicked => { root.open(); }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 4px;
+        spacing: 12px;
+
+        Rectangle {
+            width: 26px;
+            Image {
+                y: (parent.height - self.height) / 2;
+                width: 26px;
+                height: 20px;
+                source: item.flag;
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: item.name;
+                color: Theme.text;
+                font-size: 14px;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                cross-axis-alignment: center;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.second-line;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+                // Several servers leave through the same measured exit.
+                if item.exit-group > 1 : Text {
+                    text: "×\{item.exit-group}";
+                    color: Theme.accent;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+            }
+            if item.has-quota : HorizontalLayout {
+                spacing: 8px;
+                height: 12px;
+                Rectangle {
+                    width: 96px;
+                    Rectangle {
+                        y: (parent.height - self.height) / 2;
+                        height: 3px;
+                        border-radius: 2px;
+                        background: Theme.track;
+                        Rectangle {
+                            x: 0;
+                            width: min(parent.width * item.quota-fraction, parent.width);
+                            height: parent.height;
+                            border-radius: 2px;
+                            background: Theme.accent;
+                        }
+                    }
+                }
+                Text {
+                    text: item.quota-text;
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+
+        Text {
+            width: 52px;
+            text: root.ping-text;
+            color: root.ping-color;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+
+        // Delete (edit mode).
+        if edit-mode : Rectangle {
+            width: 30px;
+            Icon {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                size: 18px;
+                source: @image-url("../../assets/icons/trash.svg");
+                tint: Theme.danger;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.delete-clicked(); }
+            }
+        }
+
+        // Chevron -> details.
+        Rectangle {
+            width: 30px;
+            Icon {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                size: 16px;
+                source: @image-url("../../assets/icons/chevron-right.svg");
+                tint: Theme.muted;
+            }
+            TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.open(); }
+            }
+        }
     }
 }

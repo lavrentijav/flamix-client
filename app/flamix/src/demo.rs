@@ -25,9 +25,19 @@ struct SubData {
     traffic_text: String,
     expire_text: String,
     announce: String,
+    support_url: String,
+    support_kind: i32,
+    web_url: String,
+    banner_text: String,
+    banner_tone: i32,
+    banner_button_text: String,
+    banner_link: String,
     error: String,
     servers: Vec<ServerItem>,
 }
+
+/// Device id shown in the demo HWID dialog.
+const DEMO_DEVICE_ID: &str = "3f9c1a7e5b2d40869ac1e7d2b4f80c35";
 
 type Subs = Rc<RefCell<Vec<SubData>>>;
 type Locals = Rc<RefCell<Vec<ServerItem>>>;
@@ -107,6 +117,14 @@ fn build_subscriptions(all: &[SubData], query: &str) -> Vec<SubscriptionItem> {
                 traffic_text: s.traffic_text.clone().into(),
                 expire_text: s.expire_text.clone().into(),
                 announce: s.announce.clone().into(),
+                support_url: s.support_url.clone().into(),
+                support_kind: s.support_kind,
+                web_url: s.web_url.clone().into(),
+                banner_text: s.banner_text.clone().into(),
+                banner_tone: s.banner_tone,
+                banner_color: slint::Color::from_argb_u8(0, 0, 0, 0),
+                banner_button_text: s.banner_button_text.clone().into(),
+                banner_link: s.banner_link.clone().into(),
                 error: s.error.clone().into(),
                 servers: model(servers),
             })
@@ -241,7 +259,15 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
             traffic_fraction: 0.15,
             traffic_text: "15 GB / 100 GB".into(),
             expire_text: "до 01.01.2027".into(),
-            announce: "Скорость удвоена до 1 Гбит/с".into(),
+            announce: "".into(),
+            // Telegram support + site + a green info banner with a button.
+            support_url: "https://t.me/flamix_support".into(),
+            support_kind: 1,
+            web_url: "https://example.com".into(),
+            banner_text: "Скорость удвоена до 1 Гбит/с до конца месяца".into(),
+            banner_tone: view::TONE_GREEN,
+            banner_button_text: "Подробнее".into(),
+            banner_link: "https://example.com/news".into(),
             error: "".into(),
             servers: premium,
         },
@@ -252,12 +278,49 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
             collapsed: true,
             updating: false,
             has_traffic: true,
-            traffic_fraction: 0.0,
-            traffic_text: "∞ / ∞".into(),
-            expire_text: "".into(),
+            traffic_fraction: 0.92,
+            traffic_text: "92 GB / 100 GB".into(),
+            expire_text: "до 24.10.2026".into(),
             announce: "".into(),
+            // E-mail support, no site; the expiry notice replaces any info banner.
+            support_url: "mailto:help@example.com".into(),
+            support_kind: 2,
+            web_url: "".into(),
+            banner_text: "Подписка истекает через 3 дня".into(),
+            banner_tone: view::TONE_WARNING,
+            banner_button_text: "Продлить".into(),
+            banner_link: "https://example.com/pay".into(),
             error: "".into(),
             servers: basic,
+        },
+        SubData {
+            id: "sub-reserve".into(),
+            name: "Резерв".into(),
+            pinned: false,
+            collapsed: true,
+            updating: false,
+            has_traffic: false,
+            traffic_fraction: 0.0,
+            traffic_text: "".into(),
+            expire_text: "".into(),
+            announce: "".into(),
+            // Website/chat support, no site button, a red banner without a button.
+            support_url: "https://example.com/chat".into(),
+            support_kind: 3,
+            web_url: "".into(),
+            banner_text: "Технические работы 25 октября, возможны перебои".into(),
+            banner_tone: view::TONE_RED,
+            banner_button_text: "".into(),
+            banner_link: "".into(),
+            error: "".into(),
+            servers: vec![server(
+                "fr-1",
+                "FR",
+                "Paris",
+                "vless / tcp / reality",
+                -2,
+                "",
+            )],
         },
     ];
 
@@ -278,7 +341,17 @@ fn build_demo_data() -> (Vec<SubData>, Vec<ServerItem>) {
 
 /// Fill the window with demo data and wire all callbacks (temporary until the controller exists).
 pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
-    let (subs_vec, locals_vec) = build_demo_data();
+    setup_with(ui, false)
+}
+
+/// Like [`setup`]; `collapse_all` starts with every subscription collapsed (screenshots).
+fn setup_with(ui: &AppWindow, collapse_all: bool) -> anyhow::Result<()> {
+    let (mut subs_vec, locals_vec) = build_demo_data();
+    if collapse_all {
+        for sub in subs_vec.iter_mut() {
+            sub.collapsed = true;
+        }
+    }
     let subs: Subs = Rc::new(RefCell::new(subs_vec));
     let locals: Locals = Rc::new(RefCell::new(locals_vec));
 
@@ -325,6 +398,52 @@ pub fn setup(ui: &AppWindow) -> anyhow::Result<()> {
         });
     }
     ui.on_open_server(|id| tracing::debug!(server = %id, "open server details"));
+    {
+        let w = ui.as_weak();
+        ui.on_open_url(move |url| {
+            let Some(ui) = w.upgrade() else { return };
+            let text = match crate::links::safe_url(&url) {
+                Some(url) => format!("Демо: открылась бы ссылка {url}"),
+                None => "Ссылка отклонена: разрешены только http, https, tg и mailto".to_string(),
+            };
+            ui.set_status_text(text.into());
+        });
+    }
+    ui.set_device_id(DEMO_DEVICE_ID.into());
+    {
+        let w = ui.as_weak();
+        let saved: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+        {
+            let (w, saved) = (w.clone(), saved.clone());
+            ui.on_hwid_opened(move || {
+                if let Some(ui) = w.upgrade() {
+                    ui.set_hwid_input(saved.borrow().clone().into());
+                }
+            });
+        }
+        {
+            let (w, saved) = (w.clone(), saved.clone());
+            ui.on_hwid_save(move |value| {
+                let Some(ui) = w.upgrade() else { return };
+                match crate::controller::hwid_from_input(&value) {
+                    Ok(v) => {
+                        *saved.borrow_mut() = v.unwrap_or_default();
+                        ui.set_hwid_open(false);
+                        ui.set_status_text("HWID сохранён (демо)".into());
+                    }
+                    Err(error) => ui.set_hwid_error(error.into()),
+                }
+            });
+        }
+        ui.on_hwid_reset(move || {
+            if let Some(ui) = w.upgrade() {
+                saved.borrow_mut().clear();
+                ui.set_hwid_input("".into());
+                ui.set_hwid_open(false);
+                ui.set_status_text("HWID сброшен (демо)".into());
+            }
+        });
+    }
     {
         let w = ui.as_weak();
         ui.on_ping_selected(move || {
@@ -528,16 +647,38 @@ fn apply_state(ui: &AppWindow, state: &AppState) {
     ui.set_tun_mode(state.settings.mode == ConnectionMode::Tun);
 }
 
+/// What `--screenshot` renders.
+pub struct ShotOptions {
+    pub light: bool,
+    /// Page to show (0 servers .. 5 about).
+    pub page: i32,
+    /// Demo only: start with every subscription collapsed.
+    pub collapsed: bool,
+    /// `menu` (the "⋯" menu), `hwid` or `hwid-error` (the HWID dialog).
+    pub overlay: Option<String>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for ShotOptions {
+    fn default() -> Self {
+        Self {
+            light: false,
+            page: 0,
+            collapsed: false,
+            overlay: None,
+            width: 960,
+            height: 600,
+        }
+    }
+}
+
 /// Render the window offscreen (software renderer) and save it as a PNG.
 ///
 /// `state` is `Some` for the real data path (loaded from `FLAMIX_HOME`) and `None` for the
 /// `--demo` screenshot.
-pub fn screenshot(
-    path: &Path,
-    light: bool,
-    page: i32,
-    state: Option<&AppState>,
-) -> anyhow::Result<()> {
+pub fn screenshot(path: &Path, opts: &ShotOptions, state: Option<&AppState>) -> anyhow::Result<()> {
+    let (light, page) = (opts.light, opts.page);
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
 
     struct ShotPlatform {
@@ -560,7 +701,7 @@ pub fn screenshot(
     let ui = AppWindow::new()?;
     match state {
         Some(state) => apply_state(&ui, state),
-        None => setup(&ui)?,
+        None => setup_with(&ui, opts.collapsed)?,
     }
     crate::pages::init(&ui, None);
 
@@ -574,8 +715,18 @@ pub fn screenshot(
     ui.set_speed_text("↑ 1.2 MB/s   ↓ 3.4 MB/s".into());
     ui.set_ping_result(" · 42 ms".into());
 
-    let width = 960u32;
-    let height = 600u32;
+    match opts.overlay.as_deref() {
+        Some("menu") => ui.set_menu_open(true),
+        Some("hwid") => ui.invoke_show_hwid(),
+        Some("hwid-error") => {
+            ui.invoke_show_hwid();
+            ui.set_hwid_input("bad id".into());
+            ui.set_hwid_error(crate::controller::HWID_ERROR.into());
+        }
+        _ => {}
+    }
+
+    let (width, height) = (opts.width, opts.height);
     ui.show()?;
     window.set_size(slint::PhysicalSize::new(width, height));
     window.request_redraw();

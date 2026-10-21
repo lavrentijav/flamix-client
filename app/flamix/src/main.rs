@@ -8,6 +8,7 @@ mod controller;
 mod demo;
 mod flags;
 mod instance;
+mod links;
 mod pages;
 mod persist;
 mod tray;
@@ -29,6 +30,12 @@ struct Args {
     light: bool,
     /// `--page N` for `--screenshot`: which page to render (0 servers .. 5 about).
     page: i32,
+    /// `--collapsed` for the demo screenshot: every subscription collapsed.
+    collapsed: bool,
+    /// `--overlay menu|hwid|hwid-error` for `--screenshot`.
+    overlay: Option<String>,
+    /// `--size WxH` for `--screenshot` (default 960x600).
+    size: Option<(u32, u32)>,
     minimized: bool,
     screenshot: Option<String>,
     import: Option<String>,
@@ -43,6 +50,14 @@ fn parse_args(raw: &[String]) -> Args {
             "--light" => args.light = true,
             "--page" => args.page = it.next().and_then(|v| v.parse().ok()).unwrap_or(0),
             "--demo" => args.demo = true,
+            "--collapsed" => args.collapsed = true,
+            "--overlay" => args.overlay = it.next().cloned(),
+            "--size" => {
+                args.size = it.next().and_then(|v| {
+                    let (w, h) = v.split_once('x')?;
+                    Some((w.parse().ok()?, h.parse().ok()?))
+                })
+            }
             "--minimized" => args.minimized = true,
             other if other.starts_with('-') => {
                 tracing::warn!(argument = other, "ignoring unknown argument")
@@ -234,7 +249,16 @@ fn main() -> anyhow::Result<()> {
         } else {
             Some(persist::load(&data_dir)?)
         };
-        return demo::screenshot(Path::new(path), args.light, args.page, state.as_ref());
+        let (width, height) = args.size.unwrap_or((960, 600));
+        let opts = demo::ShotOptions {
+            light: args.light,
+            page: args.page,
+            collapsed: args.collapsed,
+            overlay: args.overlay.clone(),
+            width,
+            height,
+        };
+        return demo::screenshot(Path::new(path), &opts, state.as_ref());
     }
 
     // Hand our arguments to a running instance (unless this is the demo).

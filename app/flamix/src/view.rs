@@ -197,13 +197,140 @@ fn sort_servers(servers: &mut [&Server]) {
     });
 }
 
+/// Plain announce line; hidden when the info banner already shows the same text.
 fn subscription_announce(sub: &Subscription) -> String {
-    if let Some(banner) = &sub.provider.info_banner {
-        if !banner.text.trim().is_empty() {
-            return banner.text.clone();
-        }
+    let announce = sub.announce.clone().unwrap_or_default();
+    match banner_view(sub) {
+        Some(banner) if banner.text.trim() == announce.trim() => String::new(),
+        _ => announce,
     }
-    sub.announce.clone().unwrap_or_default()
+}
+
+/// `SubscriptionItem.banner-tone`: info / blue (also the fallback for unknown names).
+pub const TONE_INFO: i32 = 0;
+pub const TONE_RED: i32 = 1;
+pub const TONE_GREEN: i32 = 2;
+/// Custom `#hex` colour, carried in [`BannerView::color`].
+pub const TONE_CUSTOM: i32 = 3;
+/// Expiry notice.
+pub const TONE_WARNING: i32 = 4;
+
+/// Banner above a subscription's server list, ready for the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerView {
+    pub text: String,
+    pub tone: i32,
+    /// RGBA, only for [`TONE_CUSTOM`].
+    pub color: Option<[u8; 4]>,
+    /// Empty when there is no (valid) button.
+    pub button_text: String,
+    /// Already checked with [`crate::links::safe_url`]; empty when there is no button.
+    pub link: String,
+}
+
+/// Map a Happ banner colour (`red|blue|green|#RGB|#RRGGBB|#RRGGBBAA`) to a tone.
+pub fn banner_tone(color: Option<&str>) -> (i32, Option<[u8; 4]>) {
+    let Some(raw) = color.map(str::trim).filter(|c| !c.is_empty()) else {
+        return (TONE_INFO, None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "red" => return (TONE_RED, None),
+        "green" => return (TONE_GREEN, None),
+        "blue" => return (TONE_INFO, None),
+        _ => {}
+    }
+    match parse_hex_color(raw) {
+        Some(rgba) => (TONE_CUSTOM, Some(rgba)),
+        None => (TONE_INFO, None),
+    }
+}
+
+/// `#RGB`, `#RRGGBB` or `#RRGGBBAA` (the `#` is required).
+fn parse_hex_color(raw: &str) -> Option<[u8; 4]> {
+    let hex = raw.strip_prefix('#')?;
+    if !hex.is_ascii() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    match hex.len() {
+        3 => {
+            let nibble = |i: usize| u8::from_str_radix(&hex[i..i + 1], 16).ok().map(|n| n * 17);
+            Some([nibble(0)?, nibble(1)?, nibble(2)?, 255])
+        }
+        6 => Some([byte(0)?, byte(2)?, byte(4)?, 255]),
+        8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
+        _ => None,
+    }
+}
+
+/// The banner of a subscription: the expiry notice has priority over the info banner (Happ).
+pub fn banner_view(sub: &Subscription) -> Option<BannerView> {
+    let provider = &sub.provider;
+    if let Some(text) = provider
+        .expire_notice
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let link = provider
+            .expire_button_link
+            .as_deref()
+            .and_then(crate::links::safe_url);
+        return Some(BannerView {
+            text: text.to_string(),
+            tone: TONE_WARNING,
+            color: None,
+            button_text: link
+                .as_ref()
+                .map(|_| "Продлить".to_string())
+                .unwrap_or_default(),
+            link: link.unwrap_or_default(),
+        });
+    }
+    let banner = provider.info_banner.as_ref()?;
+    let text = banner.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (tone, color) = banner_tone(banner.color.as_deref());
+    let link = banner
+        .button_link
+        .as_deref()
+        .and_then(crate::links::safe_url);
+    let button_text = match (&link, banner.button_text.as_deref().map(str::trim)) {
+        (None, _) => String::new(),
+        (Some(_), Some(t)) if !t.is_empty() => t.to_string(),
+        (Some(_), _) => "Открыть".to_string(),
+    };
+    Some(BannerView {
+        text: text.to_string(),
+        tone,
+        color,
+        button_text,
+        link: link.unwrap_or_default(),
+    })
+}
+
+/// Support link of a subscription as (url, kind): kind 0 none, 1 Telegram, 2 e-mail, 3 website.
+/// Links with a scheme we would not open are treated as absent.
+pub fn support_link(sub: &Subscription) -> (String, i32) {
+    let Some(url) = sub.support_url.as_deref().and_then(crate::links::safe_url) else {
+        return (String::new(), 0);
+    };
+    let kind = match flamix_core::support::support_kind(&url) {
+        flamix_core::support::SupportKind::Telegram => 1,
+        flamix_core::support::SupportKind::Email => 2,
+        flamix_core::support::SupportKind::Website => 3,
+    };
+    (url, kind)
+}
+
+/// Provider site link, empty when unset or not openable.
+pub fn web_link(sub: &Subscription) -> String {
+    sub.web_page_url
+        .as_deref()
+        .and_then(crate::links::safe_url)
+        .unwrap_or_default()
 }
 
 fn subscription_error(sub: &Subscription) -> String {
@@ -216,6 +343,14 @@ fn subscription_error(sub: &Subscription) -> String {
         return "Достигнут лимит устройств".to_string();
     }
     sub.last_error.clone().unwrap_or_default()
+}
+
+/// Slint colour for a custom banner tone (transparent otherwise).
+pub fn banner_color(banner: Option<&BannerView>) -> slint::Color {
+    match banner.and_then(|b| b.color) {
+        Some([r, g, b, a]) => slint::Color::from_argb_u8(a, r, g, b),
+        None => slint::Color::from_argb_u8(0, 0, 0, 0),
+    }
 }
 
 /// Build the subscription cards for the server list.
@@ -252,6 +387,8 @@ pub fn build_subscriptions(
                 })
                 .collect();
             let traffic = sub.traffic;
+            let banner = banner_view(sub);
+            let (support_url, support_kind) = support_link(sub);
             SubscriptionItem {
                 id: sub.id.clone().into(),
                 name: sub.name.clone().into(),
@@ -266,6 +403,22 @@ pub fn build_subscriptions(
                     .into(),
                 expire_text: traffic.map(|t| expire_text(&t)).unwrap_or_default().into(),
                 announce: subscription_announce(sub).into(),
+                support_url: support_url.into(),
+                support_kind,
+                web_url: web_link(sub).into(),
+                banner_text: banner
+                    .as_ref()
+                    .map(|b| b.text.clone())
+                    .unwrap_or_default()
+                    .into(),
+                banner_tone: banner.as_ref().map(|b| b.tone).unwrap_or(TONE_INFO),
+                banner_color: banner_color(banner.as_ref()),
+                banner_button_text: banner
+                    .as_ref()
+                    .map(|b| b.button_text.clone())
+                    .unwrap_or_default()
+                    .into(),
+                banner_link: banner.map(|b| b.link).unwrap_or_default().into(),
                 error: subscription_error(sub).into(),
                 servers: model(servers),
             }
@@ -549,7 +702,10 @@ mod tests {
             text: "banner text".to_string(),
             ..InfoBanner::default()
         });
-        assert_eq!(subscription_announce(&sub), "banner text");
+        // The banner shows its own text; the plain announce line stays.
+        assert_eq!(subscription_announce(&sub), "plain announce");
+        sub.announce = Some("banner text".to_string());
+        assert_eq!(subscription_announce(&sub), "");
         assert_eq!(subscription_error(&sub), "");
         sub.provider.hwid = Some(HwidStatus {
             max_devices_reached: true,
@@ -672,5 +828,105 @@ mod tests {
         state.selected_server = Some("a".to_string());
         assert_eq!(selected_name(&state), "Chosen");
         assert_eq!(selected_iso(&state), "DE");
+    }
+
+    #[test]
+    fn banner_colors_map_to_tones() {
+        assert_eq!(banner_tone(None), (TONE_INFO, None));
+        assert_eq!(banner_tone(Some("red")), (TONE_RED, None));
+        assert_eq!(banner_tone(Some(" Green ")), (TONE_GREEN, None));
+        assert_eq!(banner_tone(Some("blue")), (TONE_INFO, None));
+        assert_eq!(banner_tone(Some("purple")), (TONE_INFO, None));
+        assert_eq!(
+            banner_tone(Some("#FF8800")),
+            (TONE_CUSTOM, Some([255, 136, 0, 255]))
+        );
+        assert_eq!(
+            banner_tone(Some("#f80")),
+            (TONE_CUSTOM, Some([255, 136, 0, 255]))
+        );
+        assert_eq!(
+            banner_tone(Some("#11223344")),
+            (TONE_CUSTOM, Some([0x11, 0x22, 0x33, 0x44]))
+        );
+        // Hex without `#`, wrong length or non-hex digits is not a colour.
+        assert_eq!(banner_tone(Some("ff8800")), (TONE_INFO, None));
+        assert_eq!(banner_tone(Some("#ff88")), (TONE_INFO, None));
+        assert_eq!(banner_tone(Some("#gg0000")), (TONE_INFO, None));
+        assert_eq!(banner_tone(Some("#éé00")), (TONE_INFO, None));
+    }
+
+    #[test]
+    fn expire_notice_has_priority_over_info_banner() {
+        use flamix_core::model::InfoBanner;
+        let mut sub = subscription("s1", "S", vec![]);
+        assert_eq!(banner_view(&sub), None);
+        sub.provider.info_banner = Some(InfoBanner {
+            text: "Новости".to_string(),
+            color: Some("green".to_string()),
+            button_text: Some("Читать".to_string()),
+            button_link: Some("https://example.com/news".to_string()),
+        });
+        let info = banner_view(&sub).expect("banner");
+        assert_eq!(info.tone, TONE_GREEN);
+        assert_eq!(info.button_text, "Читать");
+        assert_eq!(info.link, "https://example.com/news");
+
+        sub.provider.expire_notice = Some("Подписка истекла".to_string());
+        sub.provider.expire_button_link = Some("https://example.com/pay".to_string());
+        let expire = banner_view(&sub).expect("banner");
+        assert_eq!(expire.text, "Подписка истекла");
+        assert_eq!(expire.tone, TONE_WARNING);
+        assert_eq!(expire.button_text, "Продлить");
+        assert_eq!(expire.link, "https://example.com/pay");
+
+        // No link (or an unsafe one) means no button.
+        sub.provider.expire_button_link = Some("javascript:alert(1)".to_string());
+        let expire = banner_view(&sub).expect("banner");
+        assert_eq!(
+            (expire.button_text.as_str(), expire.link.as_str()),
+            ("", "")
+        );
+    }
+
+    #[test]
+    fn banner_button_needs_a_safe_link() {
+        use flamix_core::model::InfoBanner;
+        let mut sub = subscription("s1", "S", vec![]);
+        sub.provider.info_banner = Some(InfoBanner {
+            text: "Hi".to_string(),
+            color: None,
+            button_text: Some("Go".to_string()),
+            button_link: Some("file:///etc/passwd".to_string()),
+        });
+        let b = banner_view(&sub).expect("banner");
+        assert_eq!((b.button_text.as_str(), b.link.as_str()), ("", ""));
+        // Link without a label gets the default label.
+        sub.provider.info_banner = Some(InfoBanner {
+            text: "Hi".to_string(),
+            color: None,
+            button_text: None,
+            button_link: Some("tg://resolve?domain=x".to_string()),
+        });
+        assert_eq!(banner_view(&sub).expect("banner").button_text, "Открыть");
+    }
+
+    #[test]
+    fn support_and_site_buttons_only_when_set() {
+        let mut sub = subscription("s1", "S", vec![]);
+        assert_eq!(support_link(&sub), (String::new(), 0));
+        assert_eq!(web_link(&sub), "");
+        sub.support_url = Some("https://t.me/bot".to_string());
+        sub.web_page_url = Some("https://example.com".to_string());
+        assert_eq!(support_link(&sub), ("https://t.me/bot".to_string(), 1));
+        assert_eq!(web_link(&sub), "https://example.com");
+        sub.support_url = Some("mailto:a@b.c".to_string());
+        assert_eq!(support_link(&sub).1, 2);
+        sub.support_url = Some("https://example.com/chat".to_string());
+        assert_eq!(support_link(&sub).1, 3);
+        sub.support_url = Some("javascript:x".to_string());
+        sub.web_page_url = Some("ftp://x".to_string());
+        assert_eq!(support_link(&sub), (String::new(), 0));
+        assert_eq!(web_link(&sub), "");
     }
 }

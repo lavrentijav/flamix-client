@@ -3,6 +3,7 @@
 import { ScrollView, LineEdit, ComboBox, Switch } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { Icon } from "../components/icon.slint";
+import { Segmented } from "../components/segmented.slint";
 
 // One custom routing rule as shown/edited in the list. `action` is an index into the fixed
 // proxy/direct/block chip set; the label text lives in the UI. The three value lists hold the
@@ -32,6 +33,8 @@ export global RoutingBridge {
     // 0 = AsIs, 1 = IPIfNonMatch, 2 = IPOnDemand.
     in-out property <int> domain-strategy: 1;
     in-out property <bool> block-quic: false;
+    // Anixart mirror in the RF preset: 0 = Напрямую, 1 = Через прокси.
+    in-out property <int> anixart-mirror: 0;
     in property <[RoutingRuleItem]> rules;
     in property <[ProviderRoutingItem]> providers;
     in property <bool> has-providers: false;
@@ -64,6 +67,7 @@ export global RoutingBridge {
     callback rule-item-remove(int, int, int);
     callback domain-strategy-changed(string);
     callback block-quic-changed(bool);
+    callback anixart-mirror-changed(int);
     callback provider-enabled-changed(string, bool);
     callback provider-ignored-changed(string, bool);
 }
@@ -76,14 +80,14 @@ component Chip inherits Rectangle {
     callback clicked();
 
     height: 28px;
-    width: label.preferred-width + 22px;
+    width: label.preferred-width + 16px;
     border-radius: 14px;
     background: root.selected ? root.tint : Theme.track;
     border-width: 1px;
     border-color: root.selected ? root.tint : Theme.stroke;
 
     label := Text {
-        x: 11px;
+        x: 8px;
         y: (parent.height - self.height) / 2;
         text: root.text;
         color: root.selected ? Theme.on-accent : Theme.muted;
@@ -97,9 +101,10 @@ component PresetCard inherits Rectangle {
     in property <string> title;
     in property <string> description;
     in property <bool> selected: false;
+    in property <bool> compact: false;
     callback clicked();
 
-    height: 100px;
+    height: compact ? 74px : 100px;
     border-radius: 12px;
     background: root.selected ? Theme.control-bg : Theme.card-body;
     border-width: root.selected ? 2px : 1px;
@@ -165,7 +170,7 @@ component SectionHeader inherits Rectangle {
 
     HorizontalLayout {
         spacing: 8px;
-        alignment: center;
+        cross-axis-alignment: center;
         Icon {
             width: 14px;
             height: 14px;
@@ -334,7 +339,7 @@ component RuleRow inherits Rectangle {
 
         HorizontalLayout {
             spacing: 6px;
-            alignment: center;
+            cross-axis-alignment: center;
             CollapseChevron {
                 collapsed: root.collapsed;
                 toggled => { root.collapsed = !root.collapsed; root.collapsed-changed(root.collapsed); }
@@ -343,13 +348,13 @@ component RuleRow inherits Rectangle {
             Chip { text: "Напрямую"; selected: root.action == 1; tint: Theme.success; clicked => { root.action = 1; root.action-changed(1); } }
             Chip { text: "Блок"; selected: root.action == 2; tint: Theme.danger; clicked => { root.action = 2; root.action-changed(2); } }
             Rectangle { horizontal-stretch: 1; background: transparent; }
-            Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
         }
 
-        // Action controls stay available while the rule is collapsed.
+        // Enable switch and order/delete controls stay available while the rule is collapsed.
         HorizontalLayout {
             spacing: 6px;
-            alignment: center;
+            cross-axis-alignment: center;
+            Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
             Rectangle { horizontal-stretch: 1; background: transparent; }
             IconButton { icon: @image-url("../../assets/icons/chevron-up.svg"); clicked => { root.move-up(); } }
             IconButton { icon: @image-url("../../assets/icons/chevron-down.svg"); clicked => { root.move-down(); } }
@@ -429,7 +434,7 @@ component ProviderRow inherits Rectangle {
         }
         HorizontalLayout {
             spacing: 8px;
-            alignment: center;
+            cross-axis-alignment: center;
             Text { text: "Маршрутизация"; color: Theme.muted; font-size: 12px; vertical-alignment: center; }
             Switch { checked: root.enabled; toggled => { root.enabled-changed(self.checked); } }
             Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -442,6 +447,14 @@ component ProviderRow inherits Rectangle {
 export component RoutingPage inherits Rectangle {
     background: Theme.panel-bg;
     border-radius: 16px;
+
+    // Narrow window: presets stack vertically and the add button shrinks to a plus.
+    property <bool> narrow: root.width < 520px;
+    property <[{title: string, description: string}]> presets: [
+        { title: "Global", description: "Весь трафик через прокси" },
+        { title: "Обход РФ", description: "РФ-сайты напрямую, реклама блокируется" },
+        { title: "Свои правила", description: "Только ваши правила, остальное через прокси" },
+    ];
 
     // Russian plural helpers for the section summaries.
     property <int> rule-count: RoutingBridge.rules.length;
@@ -470,6 +483,7 @@ export component RoutingPage inherits Rectangle {
 
         ScrollView {
             vertical-stretch: 1;
+            content-width: self.visible-width;
             VerticalLayout {
                 spacing: 14px;
 
@@ -483,29 +497,54 @@ export component RoutingPage inherits Rectangle {
                             collapsed: RoutingBridge.presets-collapsed;
                             toggled => { RoutingBridge.presets-collapsed = !RoutingBridge.presets-collapsed; }
                         }
-                        if !RoutingBridge.presets-collapsed : HorizontalLayout {
+                        if !RoutingBridge.presets-collapsed && !root.narrow : HorizontalLayout {
                             spacing: 10px;
-                            PresetCard {
+                            for p[i] in root.presets : PresetCard {
                                 horizontal-stretch: 1;
-                                title: "Global";
-                                description: "Весь трафик через прокси";
-                                selected: RoutingBridge.preset == 0;
-                                clicked => { RoutingBridge.preset-selected(0); }
+                                title: p.title;
+                                description: p.description;
+                                selected: RoutingBridge.preset == i;
+                                clicked => { RoutingBridge.preset-selected(i); }
                             }
-                            PresetCard {
-                                horizontal-stretch: 1;
-                                title: "Обход РФ";
-                                description: "РФ-сайты напрямую, реклама блокируется";
-                                selected: RoutingBridge.preset == 1;
-                                clicked => { RoutingBridge.preset-selected(1); }
+                        }
+                        if !RoutingBridge.presets-collapsed && root.narrow : VerticalLayout {
+                            spacing: 8px;
+                            for p[i] in root.presets : PresetCard {
+                                compact: true;
+                                title: p.title;
+                                description: p.description;
+                                selected: RoutingBridge.preset == i;
+                                clicked => { RoutingBridge.preset-selected(i); }
                             }
-                            PresetCard {
-                                horizontal-stretch: 1;
-                                title: "Свои правила";
-                                description: "Только ваши правила, остальное через прокси";
-                                selected: RoutingBridge.preset == 2;
-                                clicked => { RoutingBridge.preset-selected(2); }
-                            }
+                        }
+                    }
+                }
+
+                // --- Зеркало Anixart (только пресет «Обход РФ») ---------------------------
+                if RoutingBridge.preset == 1 : Rectangle {
+                    background: Theme.card-body;
+                    border-radius: 12px;
+                    border-width: 1px;
+                    border-color: Theme.stroke;
+                    VerticalLayout {
+                        padding: 12px;
+                        spacing: 8px;
+                        Text {
+                            text: "Зеркало Anixart";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 600;
+                        }
+                        Segmented {
+                            options: ["Напрямую", "Через прокси"];
+                            current: RoutingBridge.anixart-mirror;
+                            selected(i) => { RoutingBridge.anixart-mirror-changed(i); }
+                        }
+                        Text {
+                            text: "Куда идут anixart.tv и anixstatic.com: напрямую (по умолчанию в РФ) или через прокси, если зеркало недоступно.";
+                            color: Theme.muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
                         }
                     }
                 }
@@ -521,21 +560,21 @@ export component RoutingPage inherits Rectangle {
                         spacing: 10px;
                         HorizontalLayout {
                             spacing: 8px;
-                            alignment: center;
+                            cross-axis-alignment: center;
                             SectionHeader {
                                 horizontal-stretch: 1;
                                 title: "Свои правила";
-                                summary: rules-summary;
+                                summary: root.narrow ? "" : rules-summary;
                                 collapsed: RoutingBridge.rules-collapsed;
                                 toggled => { RoutingBridge.rules-collapsed = !RoutingBridge.rules-collapsed; }
                             }
                             if !RoutingBridge.rules-collapsed : Rectangle {
-                                width: 170px;
+                                width: root.narrow ? 36px : 170px;
                                 height: 32px;
                                 border-radius: 8px;
                                 background: add-ta.has-hover ? Theme.accent-strong : Theme.accent;
                                 Text {
-                                    text: "+ Добавить правило";
+                                    text: root.narrow ? "+" : "+ Добавить правило";
                                     color: Theme.on-accent;
                                     font-size: 12px;
                                     horizontal-alignment: center;
@@ -600,7 +639,7 @@ export component RoutingPage inherits Rectangle {
                         }
                         if !RoutingBridge.extra-collapsed : HorizontalLayout {
                             spacing: 12px;
-                            alignment: center;
+                            cross-axis-alignment: center;
                             Text {
                                 text: "Стратегия доменов";
                                 color: Theme.text;

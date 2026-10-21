@@ -1,0 +1,123 @@
+import { LineEdit } from "std-widgets.slint";
+import { Theme } from "../theme.slint";
+
+component DialogButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked();
+
+    height: 34px;
+    width: label.preferred-width + 28px;
+    border-radius: 8px;
+    background: primary ? (ta.has-hover ? Theme.accent-strong : Theme.accent) : (ta.has-hover ? Theme.hover : Theme.control-bg);
+    border-width: primary ? 0px : 1px;
+    border-color: Theme.stroke;
+    label := Text {
+        x: 14px;
+        y: (parent.height - self.height) / 2;
+        text: root.text;
+        color: primary ? Theme.on-accent : Theme.text;
+        font-size: 13px;
+        vertical-alignment: center;
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+// Modal "HWID устройства" dialog. Rust validates on save (`flamix_core::model::valid_hwid`)
+// and reports problems through `error`.
+export component HwidDialog inherits Rectangle {
+    in property <string> device-id;
+    in-out property <string> value;
+    in-out property <string> error;
+    callback save(string);
+    callback reset();
+    callback cancel();
+
+    background: #000000A0;
+
+    // Swallow clicks outside the card (and close on Escape).
+    scope := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.cancel();
+                return accept;
+            }
+            reject
+        }
+        TouchArea { }
+
+        Rectangle {
+            width: min(460px, parent.width - 32px);
+            height: card.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: max(8px, (parent.height - self.height) / 2);
+            border-radius: 14px;
+            background: Theme.panel-bg;
+            border-width: 1px;
+            border-color: Theme.stroke;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+
+            card := VerticalLayout {
+                padding: 20px;
+                spacing: 12px;
+
+                Text {
+                    text: "HWID устройства";
+                    color: Theme.text;
+                    font-size: 18px;
+                    font-weight: 600;
+                }
+                Text {
+                    text: "Этот HWID отправляется провайдеру в заголовке x-hwid при обновлении подписок.";
+                    color: Theme.muted;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Автоматический ID устройства"; color: Theme.text; font-size: 12px; }
+                    Rectangle {
+                        height: 34px;
+                        border-radius: 8px;
+                        background: Theme.track;
+                        Text {
+                            x: 10px;
+                            width: parent.width - 20px;
+                            height: parent.height;
+                            text: root.device-id == "" ? "—" : root.device-id;
+                            color: Theme.muted;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    Text { text: "Свой HWID (пусто — использовать автоматический)"; color: Theme.text; font-size: 12px; }
+                    input := LineEdit {
+                        text <=> root.value;
+                        placeholder-text: "например, my-device-01";
+                        edited(t) => { root.error = ""; }
+                        accepted(t) => { root.save(t); }
+                        init => { self.focus(); }
+                    }
+                    if root.error != "" : Text {
+                        text: root.error;
+                        color: Theme.danger;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    DialogButton { text: "Сбросить"; clicked => { root.reset(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    DialogButton { text: "Отмена"; clicked => { root.cancel(); } }
+                    DialogButton { text: "Сохранить"; primary: true; clicked => { root.save(input.text); } }
+                }
+            }
+        }
+    }
+}

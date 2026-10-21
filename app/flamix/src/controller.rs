@@ -9,7 +9,7 @@ use crate::view;
 use crate::{flags, AppWindow, ConnState};
 use flamix_core::config::{self, CoreKind};
 use flamix_core::model::ExitIp;
-use flamix_core::model::{AppState, ConnectionMode, Server, Subscription};
+use flamix_core::model::{AppState, ConnectionMode, MirrorMode, Server, Subscription};
 use flamix_core::subscription::{self, FetchOptions};
 use flamix_core::{deeplink, geo, link, ping, provider_routing};
 use flamix_sys::sysproxy::ProxySpec;
@@ -427,6 +427,21 @@ pub(crate) fn random_hex(bytes: usize) -> String {
     out
 }
 
+/// Error text of the HWID dialog.
+pub const HWID_ERROR: &str = "от 8 до 64 символов: латиница, цифры, - и _";
+
+/// Parse the HWID dialog input: empty clears the override, otherwise it must be a valid HWID.
+pub(crate) fn hwid_from_input(input: &str) -> Result<Option<String>, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else if flamix_core::model::valid_hwid(value) {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(HWID_ERROR.to_string())
+    }
+}
+
 /// Bridges the Slint UI and the Flamix core.
 pub struct Controller {
     pub(crate) state: Arc<Mutex<AppState>>,
@@ -508,7 +523,7 @@ impl Controller {
 
     /// Snapshot the state and paint the whole window. Must run on the UI thread.
     pub(crate) fn apply_to(&self, ui: &AppWindow) {
-        let (subs, locals, name, iso, tun) = {
+        let (subs, locals, name, iso, tun, device_id) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let updating = self.updating.lock().unwrap_or_else(|e| e.into_inner());
             let query = ui.get_search_text().to_string();
@@ -519,8 +534,10 @@ impl Controller {
                 view::selected_name(&state),
                 view::selected_iso(&state),
                 state.settings.mode == ConnectionMode::Tun,
+                state.device_id.clone().unwrap_or_default(),
             )
         };
+        ui.set_device_id(device_id.into());
         ui.set_subscriptions(view::model(subs));
         ui.set_local_servers(view::model(locals));
         ui.set_selected_name(name.into());
@@ -1610,9 +1627,85 @@ impl Controller {
                 }
             });
         }
+        {
+            let this = Arc::clone(self);
+            ui.on_open_url(move |url| this.open_url(&url));
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_hwid_opened(move || {
+                let current = this.with_state(|s| s.hwid_override.clone().unwrap_or_default());
+                if let Some(ui) = this.ui.upgrade() {
+                    ui.set_hwid_input(current.into());
+                }
+            });
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_hwid_save(move |value| match this.save_hwid(&value) {
+                Ok(message) => {
+                    if let Some(ui) = this.ui.upgrade() {
+                        ui.set_hwid_open(false);
+                    }
+                    this.set_status(message);
+                }
+                Err(error) => {
+                    if let Some(ui) = this.ui.upgrade() {
+                        ui.set_hwid_error(error.into());
+                    }
+                }
+            });
+        }
+        {
+            let this = Arc::clone(self);
+            ui.on_hwid_reset(move || {
+                this.reset_hwid();
+                if let Some(ui) = this.ui.upgrade() {
+                    ui.set_hwid_input("".into());
+                    ui.set_hwid_open(false);
+                }
+                this.set_status("HWID сброшен: используется автоматический");
+            });
+        }
         ui.set_state(ConnState::Disconnected);
         ui.set_status_text("Не подключено".into());
         ui.set_speed_text("↑ 0 KB/s   ↓ 0 KB/s".into());
+    }
+
+    /// Open a provider link in the OS browser/handler. Only `http`, `https`, `tg` and `mailto`
+    /// are accepted; anything else is refused with a status message.
+    pub fn open_url(&self, url: &str) {
+        let Some(url) = crate::links::safe_url(url) else {
+            self.set_status("Ссылка отклонена: разрешены только http, https, tg и mailto");
+            return;
+        };
+        if let Err(error) = crate::links::open_in_os(&url) {
+            tracing::warn!(%error, "cannot open link");
+            self.set_status(format!("Не удалось открыть ссылку: {error}"));
+        }
+    }
+
+    /// Validate and store the user's HWID (`x-hwid` override). Empty input clears the override.
+    /// Returns the status message, or the inline error for the dialog.
+    pub fn save_hwid(self: &Arc<Self>, input: &str) -> Result<String, String> {
+        let value = hwid_from_input(input)?;
+        let message = match &value {
+            Some(_) => "HWID сохранён: он будет отправлен при обновлении подписок",
+            None => "HWID сброшен: используется автоматический",
+        };
+        self.mutate(|s| s.hwid_override = value);
+        Ok(message.to_string())
+    }
+
+    /// Clear the HWID override (the automatic device id is used again).
+    pub fn reset_hwid(self: &Arc<Self>) {
+        self.mutate(|s| s.hwid_override = None);
+    }
+
+    /// Set where the Anixart mirror domains go (RF preset) and persist. The caller reconnects
+    /// if a core is running (the routing page does it through its debounce).
+    pub fn set_anixart_mirror(self: &Arc<Self>, mode: MirrorMode) {
+        self.mutate(|s| s.settings.routing.anixart_mirror = mode);
     }
 
     fn select_server(self: &Arc<Self>, id: &str) {
@@ -1975,6 +2068,30 @@ mod tests {
                 .unwrap()
                 .enabled
         );
+    }
+
+    #[test]
+    fn hwid_input_is_validated() {
+        assert_eq!(hwid_from_input(""), Ok(None));
+        assert_eq!(hwid_from_input("   "), Ok(None));
+        assert_eq!(
+            hwid_from_input(" my-device_01 "),
+            Ok(Some("my-device_01".to_string()))
+        );
+        assert_eq!(hwid_from_input("short"), Err(HWID_ERROR.to_string()));
+        assert_eq!(
+            hwid_from_input("has space in it"),
+            Err(HWID_ERROR.to_string())
+        );
+        assert_eq!(
+            hwid_from_input("кириллица-123"),
+            Err(HWID_ERROR.to_string())
+        );
+        assert_eq!(
+            hwid_from_input(&"a".repeat(65)),
+            Err(HWID_ERROR.to_string())
+        );
+        assert!(hwid_from_input(&"a".repeat(64)).is_ok());
     }
 
     #[test]
