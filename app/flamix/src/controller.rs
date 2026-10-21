@@ -1290,7 +1290,8 @@ impl Controller {
                 };
                 stats::xray_traffic(&binary, api_port, pattern).await.ok()
             }
-            CoreKind::SingBox => match stats::singbox_traffic(api_port).await {
+            // mihomo serves the same Clash-API `/connections` totals as sing-box.
+            CoreKind::SingBox | CoreKind::Mihomo => match stats::singbox_traffic(api_port).await {
                 Ok((up_total, down_total)) => {
                     {
                         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
