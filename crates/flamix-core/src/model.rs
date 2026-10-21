@@ -573,7 +573,10 @@ fn yes() -> bool {
 pub enum RoutingPreset {
     /// Everything through the proxy (private ranges direct).
     Global,
-    /// Russian sites/IPs and private ranges direct, the rest proxied; ads blocked.
+    /// The "RF" preset (data: `data/ru-routing.yaml`, 391 ordered rules): Russian services
+    /// and IPs direct, blocked/foreign services (AI, Telegram, Discord, YouTube, ...) proxied,
+    /// the Anixart mirror per `Routing.anixart_mirror`; everything else goes DIRECT
+    /// (the `final` rule). Other presets send unmatched traffic through the proxy.
     #[default]
     BypassRu,
     /// Only `custom_rules`; unmatched traffic goes through the proxy.

@@ -422,7 +422,11 @@ fn routing_config(
     }
     // `global_proxy == false`: unmatched traffic goes direct via a catch-all rule
     // (Xray drops rules with no matcher fields, so match every transport).
-    let direct_final = matches!(provider, Some(p) if !p.global_proxy);
+    // The RF preset (no provider profile) falls back to DIRECT the same way.
+    let direct_final = match provider {
+        Some(p) => !p.global_proxy,
+        None => routing::final_direct(&settings.routing),
+    };
     match provider {
         Some(_) if direct_final => {
             rules.push(json!({
@@ -433,8 +437,15 @@ fn routing_config(
         }
         Some(_) => {}
         None => {
-            for rule in routing::preset_rules(settings.routing.preset) {
+            for rule in routing::preset_rules(&settings.routing) {
                 rules.push(rule_json(&rule, balancer));
+            }
+            if direct_final {
+                rules.push(json!({
+                    "type": "field",
+                    "network": "tcp,udp",
+                    "outboundTag": "direct",
+                }));
             }
         }
     }
@@ -474,7 +485,9 @@ fn rule_json(rule: &Rule, balancer: bool) -> Value {
     if let Some(ports) = non_empty(&rule.ports) {
         m.insert("port".into(), json!(ports));
     }
-    // Process-based rules are ignored by Xray.
+    if !rule.processes.is_empty() {
+        m.insert("process".into(), json!(rule.processes));
+    }
     match rule.action {
         RuleAction::Proxy if balancer => {
             m.insert("balancerTag".into(), json!("proxy"));
@@ -978,16 +991,24 @@ mod tests {
         );
 
         let rules = cfg["routing"]["rules"].as_array().unwrap();
-        // api rule, block-quic rule, ads block, direct domains, direct ips.
+        // api rule, block-quic rule, then the RF rules (data order), then a direct catch-all.
         assert!(rules.iter().any(|r| r["network"] == json!("udp")
             && r["port"] == json!("443")
             && r["outboundTag"] == json!("block")));
+        assert_eq!(rules[2]["port"], json!("53"));
         assert!(rules
             .iter()
-            .any(|r| r["domain"] == json!(["geosite:category-ads-all"])
-                && r["outboundTag"] == json!("block")));
-        assert!(rules.iter().any(|r| r["outboundTag"] == json!("direct")
-            && r["ip"] == json!(["geoip:private", "geoip:ru"])));
+            .any(|r| r["outboundTag"] == json!("direct") && r["ip"] == json!(["geoip:ru"])));
+        assert!(rules.iter().any(|r| r["outboundTag"] == json!("proxy")
+            && r["domain"]
+                .as_array()
+                .is_some_and(|d| d.contains(&json!("geosite:ru-blocked")))));
+        assert!(rules.iter().any(|r| r["process"].is_array()));
+        // Remote text rule lists are skipped: no rule mentions them.
+        assert!(!rules.iter().any(|r| r.to_string().contains("itdog")));
+        let last = rules.last().unwrap();
+        assert_eq!(last["outboundTag"], json!("direct"));
+        assert_eq!(last["network"], json!("tcp,udp"));
     }
 
     #[test]
@@ -1290,13 +1311,13 @@ mod tests {
     #[test]
     fn failover_preset_direct_and_block_rules_unchanged() {
         let nodes = [vless_server(), vless_server()];
-        let settings = failover_settings(); // BypassRu preset: block + direct rules only.
+        let mut settings = failover_settings();
+        settings.routing.preset = RoutingPreset::Global;
         let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ConnectContext::default());
         let rules = cfg["routing"]["rules"].as_array().unwrap();
-        assert!(rules.iter().any(|r| r["outboundTag"] == json!("block")
-            && r["domain"] == json!(["geosite:category-ads-all"])));
-        assert!(rules.iter().any(|r| r["outboundTag"] == json!("direct")
-            && r["ip"] == json!(["geoip:private", "geoip:ru"])));
+        assert!(rules
+            .iter()
+            .any(|r| r["outboundTag"] == json!("direct") && r["ip"] == json!(["geoip:private"])));
         // Only the final catch-all uses the balancer.
         let last = rules.last().unwrap();
         assert_eq!(last["balancerTag"], json!("proxy"));
@@ -1307,6 +1328,17 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn failover_rf_preset_proxy_rules_use_balancer_and_final_is_direct() {
+        let nodes = [vless_server(), vless_server()];
+        let settings = failover_settings(); // RF (BypassRu) preset
+        let cfg = full_config_cluster_with(&nodes, &settings, 10818, &ConnectContext::default());
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["balancerTag"] == json!("proxy")));
+        assert!(!rules.iter().any(|r| r["outboundTag"] == json!("proxy")));
+        assert_eq!(rules.last().unwrap()["outboundTag"], json!("direct"));
     }
 
     #[test]

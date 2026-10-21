@@ -484,7 +484,7 @@ fn build_config(
         route_rules.push(route_rule(&rule, &mut rule_sets, &geo));
     }
     if provider.is_none() {
-        for rule in routing::preset_rules(settings.routing.preset) {
+        for rule in routing::preset_rules(&settings.routing) {
             route_rules.push(route_rule(&rule, &mut rule_sets, &geo));
         }
     }
@@ -633,6 +633,8 @@ fn build_config(
     // `global_proxy == false`: unmatched traffic goes direct instead of through the proxy.
     let final_outbound = match provider {
         Some(provider) if !provider.global_proxy => "direct",
+        // The RF preset falls back to DIRECT; DNS keeps its own detour.
+        None if routing::final_direct(&settings.routing) => "direct",
         _ => "proxy",
     };
     route.insert("final".into(), json!(final_outbound));
@@ -860,6 +862,7 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>, geo: &GeoUrls) -
     let mut domain = Vec::new();
     let mut domain_suffix = Vec::new();
     let mut domain_regex = Vec::new();
+    let mut domain_keyword = Vec::new();
     for value in &rule.domains {
         if let Some(name) = value.strip_prefix("geosite:") {
             let tag = format!("geosite-{name}");
@@ -867,6 +870,8 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>, geo: &GeoUrls) -
             rule_sets.push(tag);
         } else if let Some(value) = value.strip_prefix("domain:") {
             domain_suffix.push(value.to_string());
+        } else if let Some(value) = value.strip_prefix("keyword:") {
+            domain_keyword.push(value.to_string());
         } else if let Some(value) = value.strip_prefix("full:") {
             domain.push(value.to_string());
         } else if let Some(value) = value.strip_prefix("regexp:") {
@@ -897,6 +902,9 @@ fn route_rule(rule: &Rule, sets: &mut BTreeMap<String, String>, geo: &GeoUrls) -
     }
     if !domain_regex.is_empty() {
         m.insert("domain_regex".into(), json!(domain_regex));
+    }
+    if !domain_keyword.is_empty() {
+        m.insert("domain_keyword".into(), json!(domain_keyword));
     }
     if !rule_sets.is_empty() {
         m.insert("rule_set".into(), json!(rule_sets));
@@ -1227,11 +1235,15 @@ mod tests {
         assert!(rules
             .iter()
             .any(|r| r["ip_is_private"] == json!(true) && r["outbound"] == json!("direct")));
+        // RF preset: blocked services via a geosite rule set to the proxy, fallback DIRECT.
+        assert!(rules.iter().any(|r| r["rule_set"]
+            == json!(["geosite-ru-blocked", "geosite-ru-blocked-all"])
+            && r["outbound"] == json!("proxy")));
+        assert!(rules.iter().any(|r| r["domain_keyword"].is_array()));
         assert!(rules
             .iter()
-            .any(|r| r["rule_set"] == json!(["geosite-category-ads-all"])
-                && r["action"] == json!("reject")));
-        assert_eq!(cfg["route"]["final"], json!("proxy"));
+            .any(|r| r["process_name"].is_array() && r["outbound"] == json!("proxy")));
+        assert_eq!(cfg["route"]["final"], json!("direct"));
         assert_eq!(cfg["route"]["auto_detect_interface"], json!(true));
 
         assert_eq!(
