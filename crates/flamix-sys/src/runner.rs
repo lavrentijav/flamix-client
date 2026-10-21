@@ -1,4 +1,4 @@
-//! External core processes (xray / sing-box). OWNER: task T05.
+//! External core processes (xray / sing-box / mihomo). OWNER: task T05.
 //!
 //! A normal core is a direct child process. An **elevated** core (TUN) is different: it runs as
 //! root, so the app cannot signal it. It is therefore launched through a tiny root-owned POSIX
@@ -182,6 +182,7 @@ pub async fn start(
     ordered.sort_by_key(|p| match p.core {
         CoreKind::Xray => 0u8,
         CoreKind::SingBox => 1,
+        CoreKind::Mihomo => 2,
     });
 
     let mut procs: Vec<Proc> = Vec::new();
@@ -231,11 +232,35 @@ async fn spawn_one(
     log: &LogBuffer,
     tasks: &mut Vec<tokio::task::JoinHandle<()>>,
 ) -> crate::Result<Proc> {
-    let config_path = work_dir.join(format!("{}.json", plan.core.binary_name()));
-    let json = serde_json::to_string_pretty(&plan.config).map_err(|e| {
-        crate::Error::Command(format!("serialize {} config: {e}", plan.core.binary_name()))
-    })?;
-    tokio::fs::write(&config_path, json).await?;
+    let extension = if plan.core == CoreKind::Mihomo {
+        "yaml"
+    } else {
+        "json"
+    };
+    let config_path = work_dir.join(format!("{}.{extension}", plan.core.binary_name()));
+    let text = if plan.core == CoreKind::Mihomo {
+        flamix_core::config::mihomo::render_yaml(&plan.config)
+            .map_err(|e| crate::Error::Command(format!("serialize mihomo config: {e}")))?
+    } else {
+        serde_json::to_string_pretty(&plan.config).map_err(|e| {
+            crate::Error::Command(format!("serialize {} config: {e}", plan.core.binary_name()))
+        })?
+    };
+    tokio::fs::write(&config_path, text).await?;
+    // mihomo reads `geosite.dat` / `geoip.dat` from its home dir (`-d`): reuse the databases
+    // the app already downloaded for Xray so the first start needs no download.
+    if plan.core == CoreKind::Mihomo {
+        if let Some(geo) = geo_dir {
+            for name in ["geosite.dat", "geoip.dat"] {
+                let (src, dst) = (geo.join(name), work_dir.join(name));
+                if tokio::fs::metadata(&src).await.is_ok() {
+                    if let Err(e) = tokio::fs::copy(&src, &dst).await {
+                        tracing::warn!("copy {name} for mihomo: {e}");
+                    }
+                }
+            }
+        }
+    }
 
     let binary = find_core(plan.core)?;
     if plan.elevated {
@@ -264,6 +289,15 @@ fn xray_geo(core: CoreKind, geo_dir: Option<&Path>) -> Option<&Path> {
 }
 
 fn core_args(core: CoreKind, config_path: &Path, work_dir: &Path) -> Vec<OsString> {
+    // mihomo: `mihomo -d <work_dir> -f <config>`.
+    if core == CoreKind::Mihomo {
+        return vec![
+            "-d".into(),
+            work_dir.as_os_str().to_os_string(),
+            "-f".into(),
+            config_path.as_os_str().to_os_string(),
+        ];
+    }
     let mut args: Vec<OsString> = vec![
         "run".into(),
         "-c".into(),
