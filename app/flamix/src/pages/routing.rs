@@ -11,7 +11,9 @@
 
 use crate::controller::Controller;
 use crate::{AppWindow, ProviderRoutingItem, RoutingBridge, RoutingRuleItem};
-use flamix_core::model::{AppState, Routing, RoutingPreset, RoutingRule, RuleAction, Subscription};
+use flamix_core::model::{
+    AppState, MirrorMode, Routing, RoutingPreset, RoutingRule, RuleAction, Subscription,
+};
 use slint::{ComponentHandle, SharedString};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -49,6 +51,21 @@ fn preset_from_index(index: i32) -> RoutingPreset {
         0 => RoutingPreset::Global,
         2 => RoutingPreset::Custom,
         _ => RoutingPreset::BypassRu,
+    }
+}
+
+fn mirror_index(mode: MirrorMode) -> i32 {
+    match mode {
+        MirrorMode::Direct => 0,
+        MirrorMode::Proxy => 1,
+    }
+}
+
+fn mirror_from_index(index: i32) -> MirrorMode {
+    if index == 1 {
+        MirrorMode::Proxy
+    } else {
+        MirrorMode::Direct
     }
 }
 
@@ -438,6 +455,7 @@ fn publish(
     bridge.set_preset(preset_index(routing.preset));
     bridge.set_domain_strategy(strategy_index(&routing.domain_strategy));
     bridge.set_block_quic(routing.block_quic);
+    bridge.set_anixart_mirror(mirror_index(routing.anixart_mirror));
     bridge.set_error_text(error.into());
     // Always publish a definite focus target so a token the UI did not consume can never point
     // at stale coordinates on a later repaint.
@@ -723,6 +741,18 @@ fn wire(ui: &AppWindow, ctrl: Arc<Controller>) {
         let cache = Rc::clone(&cache);
         let defer = defer.clone();
         ui.global::<RoutingBridge>()
+            .on_anixart_mirror_changed(move |index| {
+                ctrl.set_anixart_mirror(mirror_from_index(index));
+                repaint(&weak, &ctrl, &cache);
+                defer.schedule();
+            });
+    }
+    {
+        let weak = ui.as_weak();
+        let ctrl = Arc::clone(&ctrl);
+        let cache = Rc::clone(&cache);
+        let defer = defer.clone();
+        ui.global::<RoutingBridge>()
             .on_block_quic_changed(move |enabled| {
                 ctrl.mutate(|s| s.settings.routing.block_quic = enabled);
                 repaint(&weak, &ctrl, &cache);
@@ -790,7 +820,7 @@ fn demo_rule(
 
 fn demo_routing() -> Routing {
     Routing {
-        preset: RoutingPreset::Custom,
+        preset: RoutingPreset::BypassRu,
         custom_rules: vec![
             demo_rule(
                 RuleAction::Proxy,
@@ -814,6 +844,7 @@ fn demo_routing() -> Routing {
         ],
         domain_strategy: "IPIfNonMatch".into(),
         block_quic: true,
+        anixart_mirror: MirrorMode::Direct,
     }
 }
 
@@ -879,6 +910,14 @@ mod tests {
         (0..model.row_count())
             .filter_map(|i| model.row_data(i).map(|s| s.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn mirror_mapping_roundtrips() {
+        for mode in [MirrorMode::Direct, MirrorMode::Proxy] {
+            assert_eq!(mirror_from_index(mirror_index(mode)), mode);
+        }
+        assert_eq!(mirror_from_index(-1), MirrorMode::Direct);
     }
 
     #[test]

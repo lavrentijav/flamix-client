@@ -1,0 +1,50 @@
+import { Theme } from "../theme.slint";
+
+// Provider announcement strip: tone-coloured accent bar, text and an optional action button.
+// tone: 0 info (blue), 1 red, 2 green, 3 custom colour, 4 warning (expiry notice).
+export component Banner inherits Rectangle {
+    in property <string> text;
+    in property <int> tone: 0;
+    in property <color> custom: Theme.info;
+    in property <string> button-text: "";
+    callback button-clicked();
+
+    property <color> tint: tone == 1 ? Theme.danger : tone == 2 ? Theme.success : tone == 3 ? custom : tone == 4 ? Theme.warning : Theme.info;
+
+    height: row.preferred-height;
+    border-radius: 8px;
+    background: tint.with-alpha(0.16);
+    clip: true;
+
+    row := HorizontalLayout {
+        spacing: 10px;
+        padding-right: 8px;
+        padding-top: 8px;
+        padding-bottom: 8px;
+        cross-axis-alignment: center;
+        Rectangle { width: 3px; background: root.tint; }
+        Text {
+            horizontal-stretch: 1;
+            text: root.text;
+            color: Theme.text;
+            font-size: 12px;
+            wrap: word-wrap;
+        }
+        if root.button-text != "" : Rectangle {
+            width: btn-label.preferred-width + 22px;
+            height: 26px;
+            border-radius: 6px;
+            background: btn-ta.has-hover ? root.tint.darker(0.15) : root.tint;
+            btn-label := Text {
+                x: 11px;
+                y: (parent.height - self.height) / 2;
+                text: root.button-text;
+                color: (root.tone == 2 || root.tone == 4) ? #2B2621 : #FFFFFF;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            btn-ta := TouchArea { mouse-cursor: pointer; clicked => { root.button-clicked(); } }
+        }
+    }
+}

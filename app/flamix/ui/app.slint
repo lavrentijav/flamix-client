@@ -12,6 +12,7 @@ export { Palette } from "std-widgets.slint";
 import { Rail } from "components/rail.slint";
 import { ServersPanel } from "components/servers-panel.slint";
 import { ConnectionPanel } from "components/connection-panel.slint";
+import { HwidDialog } from "components/hwid-dialog.slint";
 import { AddPage, AddBridge } from "pages/add-page.slint";
 import { RoutingPage, RoutingBridge } from "pages/routing-page.slint";
 import { SettingsPage, SettingsBridge } from "pages/settings-page.slint";
@@ -47,6 +48,8 @@ export component AppWindow inherits Window {
     in-out property <int> page: 0; // 0 servers, 1 add, 2 routing, 3 settings, 4 stats, 5 about
     in-out property <bool> edit-mode: false;
     in-out property <bool> rail-expanded: false;
+    // "⋯" menu of the servers panel (exposed for screenshots).
+    in-out property <bool> menu-open: false;
 
     callback toggle-connect();
     callback select-server(string);
@@ -68,6 +71,35 @@ export component AppWindow inherits Window {
     callback toggle-edit();
     callback add-subscription();
     callback restart-as-admin();
+    // Opens a provider/support/site link (the controller allows http, https, tg and mailto only).
+    callback open-url(string);
+
+    // HWID dialog (opened by a hidden key shortcut, see `keys` below; intentionally not in any menu).
+    in-out property <bool> hwid-open: false;
+    in property <string> device-id;
+    in-out property <string> hwid-input;
+    in-out property <string> hwid-error;
+    callback hwid-opened();
+    callback hwid-save(string);
+    callback hwid-reset();
+
+    public function show-hwid() {
+        root.hwid-error = "";
+        root.hwid-open = true;
+        root.hwid-opened();
+    }
+
+    init => { keys.focus(); }
+
+    keys := FocusScope {
+      key-pressed(event) => {
+        // `control` is Cmd on macOS in Slint.
+        if (event.modifiers.control && event.modifiers.shift && (event.text == "h" || event.text == "H" || event.text == "\u{8}")) {
+            root.show-hwid();
+            return accept;
+        }
+        reject
+      }
 
     VerticalLayout {
         padding: 8px;
@@ -95,6 +127,8 @@ export component AppWindow inherits Window {
                 update-all => { root.update-all(); }
                 ping-all => { root.ping-all(); }
                 check-exit-ips => { root.check-exit-ips(); }
+                menu-open <=> root.menu-open;
+                open-url(url) => { root.open-url(url); }
                 sort-by-ping => { root.sort-by-ping(); }
                 add-subscription => { root.add-subscription(); }
                 toggle-collapse(id) => { root.toggle-collapse(id); }
@@ -127,5 +161,19 @@ export component AppWindow inherits Window {
                 restart-as-admin => { root.restart-as-admin(); }
             }
         }
+    }
+    }
+
+    if root.hwid-open : HwidDialog {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        device-id: root.device-id;
+        value <=> root.hwid-input;
+        error <=> root.hwid-error;
+        save(v) => { root.hwid-save(v); }
+        reset => { root.hwid-reset(); }
+        cancel => { root.hwid-open = false; }
     }
 }

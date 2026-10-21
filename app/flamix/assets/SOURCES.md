@@ -58,3 +58,8 @@ Abkhazia, Arctic, AzoresIslands, BalearicIslands, BasqueCountry, BritishColumbia
 `assets/flags/UN.svg` is a neutral grey globe used for unknown regions.
 
 App icon PNGs: rendered with rsvg-convert.
+
+## Hand-drawn glyphs (not from the Alfa set)
+
+`assets/icons/telegram.svg` (monochrome paper-plane, drawn for Flamix) and `assets/icons/mail.svg`
+(envelope, drawn for Flamix) are used by the subscription support button.

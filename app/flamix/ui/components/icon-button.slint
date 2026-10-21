@@ -1,0 +1,27 @@
+import { Theme } from "../theme.slint";
+import { Icon } from "icon.slint";
+
+// Square icon button used for every header action: 28px slot, 16px glyph, hover pill.
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint: Theme.muted;
+    in property <bool> active: false;
+    // Endless rotation (refresh while an update runs).
+    in property <bool> spinning: false;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    background: (ta.has-hover || root.active) ? Theme.hover : transparent;
+    Icon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        size: 16px;
+        source: root.icon;
+        tint: root.tint;
+        transform-rotation: root.spinning ? 360deg : 0deg;
+        animate transform-rotation { duration: 900ms; iteration-count: -1; easing: linear; }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}

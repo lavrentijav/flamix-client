@@ -36,6 +36,18 @@ export struct SubscriptionItem {
     traffic-text: string,
     expire-text: string,
     announce: string,
+    // Support link: kind 0 = none, 1 = Telegram, 2 = e-mail, 3 = website/chat.
+    support-url: string,
+    support-kind: int,
+    // Provider site (`profile-web-page-url`), empty when unset.
+    web-url: string,
+    // Announcement banner above the server list (empty text = none). `banner-tone`:
+    // 0 info/blue, 1 red, 2 green, 3 custom (`banner-color`), 4 warning (expiry notice).
+    banner-text: string,
+    banner-tone: int,
+    banner-color: color,
+    banner-button-text: string,
+    banner-link: string,
     error: string,
     servers: [ServerItem],
 }

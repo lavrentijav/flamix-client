@@ -4,6 +4,7 @@
 import { ScrollView, LineEdit, TextEdit, Switch, CheckBox, ComboBox, SpinBox, Button } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { SettingsCard, SettingsRow, SettingsField } from "settings-card.slint";
+import { Segmented } from "../components/segmented.slint";
 
 export global SettingsBridge {
     // --- Основные · Подключение ------------------------------------------
@@ -128,7 +129,7 @@ export component SettingsPage inherits Rectangle {
                 padding-left: 12px;
                 padding-right: 12px;
                 spacing: 10px;
-                alignment: center;
+                cross-axis-alignment: center;
                 Text {
                     text: "Сбросить все настройки к значениям по умолчанию?";
                     color: Theme.text;
@@ -149,6 +150,7 @@ export component SettingsPage inherits Rectangle {
 
         ScrollView {
             vertical-stretch: 1;
+            content-width: self.visible-width;
             VerticalLayout {
                 spacing: 12px;
 
@@ -160,7 +162,7 @@ export component SettingsPage inherits Rectangle {
 
                     HorizontalLayout {
                         spacing: 12px;
-                        alignment: center;
+                        cross-axis-alignment: center;
                         Text {
                             text: "Режим";
                             color: Theme.text;
@@ -222,6 +224,20 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
 
+                    SettingsField {
+                        label: "Ядро";
+                        hint: "Авто выбирает ядро по протоколу сервера";
+                        Segmented {
+                            options: ["Авто", "Xray", "sing-box", "mihomo"];
+                            current: SettingsBridge.core-override == "xray" ? 1
+                                : SettingsBridge.core-override == "sing-box" ? 2
+                                : SettingsBridge.core-override == "mihomo" ? 3 : 0;
+                            selected(i) => {
+                                SettingsBridge.core-override = ["auto", "xray", "sing-box", "mihomo"][i];
+                                SettingsBridge.changed();
+                            }
+                        }
+                    }
                     SettingsRow {
                         label: "SOCKS-порт";
                         hint: "локальный mixed-вход";
@@ -405,7 +421,7 @@ export component SettingsPage inherits Rectangle {
                     }
                     HorizontalLayout {
                         spacing: 10px;
-                        alignment: center;
+                        cross-axis-alignment: center;
                         Button {
                             text: "Обновить геоданные";
                             clicked => { SettingsBridge.update-geo(); }
@@ -510,7 +526,7 @@ export component SettingsPage inherits Rectangle {
 
                     HorizontalLayout {
                         spacing: 12px;
-                        alignment: center;
+                        cross-axis-alignment: center;
                         Text {
                             text: "Показать дополнительные настройки";
                             color: Theme.text;
@@ -681,16 +697,6 @@ export component SettingsPage inherits Rectangle {
                                 height: 72px;
                                 text <=> SettingsBridge.bypass;
                                 edited => { SettingsBridge.changed(); }
-                            }
-                        }
-                        SettingsRow {
-                            label: "Ядро";
-                            hint: "auto | xray | sing-box";
-                            ComboBox {
-                                width: 160px;
-                                model: ["auto", "xray", "sing-box"];
-                                current-value <=> SettingsBridge.core-override;
-                                selected => { SettingsBridge.changed(); }
                             }
                         }
                     }

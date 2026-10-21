@@ -40,7 +40,7 @@ export component SettingsRow inherits HorizontalLayout {
     in property <string> label: "";
     in property <string> hint: "";
     spacing: 12px;
-    alignment: center;
+    cross-axis-alignment: center;
 
     VerticalLayout {
         spacing: 1px;
@@ -48,11 +48,13 @@ export component SettingsRow inherits HorizontalLayout {
             text: root.label;
             color: Theme.text;
             font-size: 13px;
+            wrap: word-wrap;
         }
         if root.hint != "" : Text {
             text: root.hint;
             color: Theme.muted;
             font-size: 11px;
+            wrap: word-wrap;
         }
     }
     Rectangle { horizontal-stretch: 1; background: transparent; }
@@ -73,12 +75,15 @@ export component SettingsField inherits VerticalLayout {
             color: Theme.text;
             font-size: 12px;
             vertical-alignment: center;
+            horizontal-stretch: 0;
         }
         if root.hint != "" : Text {
             text: root.hint;
             color: Theme.muted;
             font-size: 11px;
             vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
         }
     }
     @children

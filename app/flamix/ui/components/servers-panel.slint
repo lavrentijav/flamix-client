@@ -1,9 +1,47 @@
 import { ScrollView } from "std-widgets.slint";
 import { Theme } from "../theme.slint";
 import { Icon } from "icon.slint";
+import { IconButton } from "icon-button.slint";
 import { SubscriptionItem, ServerItem } from "../model.slint";
 import { SubscriptionCard } from "subscription-card.slint";
 import { ServerRow } from "server-row.slint";
+
+component MenuItem inherits Rectangle {
+    in property <string> label;
+    in property <string> hint: "";
+    in property <image> icon;
+    callback clicked();
+
+    height: 34px;
+    border-radius: 6px;
+    background: ta.has-hover ? Theme.hover : transparent;
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 10px;
+        Icon {
+            y: (parent.height - self.height) / 2;
+            size: 16px;
+            source: root.icon;
+            tint: Theme.muted;
+        }
+        Text {
+            horizontal-stretch: 1;
+            text: root.label;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        if root.hint != "" : Text {
+            text: root.hint;
+            color: Theme.muted;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
 
 export component ServersPanel inherits Rectangle {
     in property <[SubscriptionItem]> subscriptions;
@@ -27,17 +65,26 @@ export component ServersPanel inherits Rectangle {
     callback select-server(string);
     callback open-server(string);
     callback delete-server(string);
+    callback open-url(string);
+
+    in-out property <bool> menu-open: false;
 
     background: Theme.panel-bg;
     border-radius: 16px;
 
+    // The right padding is 6px smaller than the left one: the scroll bar of the list lives in it,
+    // the title row and the search box add it back so every edge lines up.
     VerticalLayout {
         padding: 16px;
+        padding-right: 6px;
         spacing: 12px;
 
-        // Title row.
+        // Title row: title on the left, two icon actions on the right.
         HorizontalLayout {
-            height: 34px;
+            height: 32px;
+            spacing: 4px;
+            padding-right: 10px;
+            cross-axis-alignment: center;
             Text {
                 text: "Серверы";
                 color: Theme.text;
@@ -46,58 +93,24 @@ export component ServersPanel inherits Rectangle {
                 vertical-alignment: center;
             }
             Rectangle { horizontal-stretch: 1; background: transparent; }
-
-            Rectangle {
-                width: 152px;
-                height: 34px;
-                border-radius: 8px;
-                background: exit-ip-ta.has-hover ? Theme.hover : Theme.control-bg;
-                border-width: 1px;
-                border-color: Theme.stroke;
-                Text {
-                    text: "Проверить выходные IP";
-                    color: Theme.text;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                }
-                exit-ip-ta := TouchArea { mouse-cursor: pointer; clicked => { root.check-exit-ips(); } }
+            IconButton {
+                icon: @image-url("../../assets/icons/edit.svg");
+                tint: root.edit-mode ? Theme.accent : Theme.muted;
+                active: root.edit-mode;
+                clicked => { root.toggle-edit(); }
             }
-
-            Rectangle {
-                width: 34px;
-                height: 34px;
-                border-radius: 8px;
-                background: (edit-ta.has-hover || root.edit-mode) ? Theme.hover : transparent;
-                Icon {
-                    x: (parent.width - 18px) / 2;
-                    y: (parent.height - 18px) / 2;
-                    width: 18px;
-                    height: 18px;
-                    source: @image-url("../../assets/icons/edit.svg");
-                    tint: root.edit-mode ? Theme.accent : Theme.muted;
-                }
-                edit-ta := TouchArea { mouse-cursor: pointer; clicked => { root.toggle-edit(); } }
-            }
-            Rectangle {
-                width: 34px;
-                height: 34px;
-                border-radius: 8px;
-                background: more-ta.has-hover ? Theme.hover : transparent;
-                Icon {
-                    x: (parent.width - 18px) / 2;
-                    y: (parent.height - 18px) / 2;
-                    width: 18px;
-                    height: 18px;
-                    source: @image-url("../../assets/icons/more.svg");
-                    tint: Theme.muted;
-                }
-                more-ta := TouchArea { mouse-cursor: pointer; clicked => { root.import-clipboard(); } }
+            IconButton {
+                icon: @image-url("../../assets/icons/more.svg");
+                active: root.menu-open;
+                clicked => { root.menu-open = !root.menu-open; }
             }
         }
 
         // Search.
-        Rectangle {
+        HorizontalLayout {
+          padding-right: 10px;
+          height: 36px;
+          Rectangle {
             height: 36px;
             border-radius: 8px;
             background: Theme.track;
@@ -130,6 +143,7 @@ export component ServersPanel inherits Rectangle {
                 vertical-alignment: center;
                 edited => { root.search-changed(self.text); }
             }
+          }
         }
 
         if root.subscriptions.length == 0 && root.local-servers.length == 0 : VerticalLayout {
@@ -161,6 +175,7 @@ export component ServersPanel inherits Rectangle {
             vertical-stretch: 1;
             VerticalLayout {
                 spacing: 12px;
+                padding-right: 10px;
                 for sub in root.subscriptions : SubscriptionCard {
                     sub: sub;
                     edit-mode: root.edit-mode;
@@ -172,6 +187,7 @@ export component ServersPanel inherits Rectangle {
                     select-server(id) => { root.select-server(id); }
                     open-server(id) => { root.open-server(id); }
                     delete-server(id) => { root.delete-server(id); }
+                    open-url(url) => { root.open-url(url); }
                 }
 
                 if root.local-servers.length > 0 : Rectangle {
@@ -183,10 +199,10 @@ export component ServersPanel inherits Rectangle {
                         padding: 0px;
                         spacing: 0px;
                         Rectangle {
-                            height: 46px;
+                            height: 44px;
                             background: Theme.card-header;
                             Text {
-                                x: 16px;
+                                x: 14px;
                                 y: (parent.height - self.height) / 2;
                                 text: "Локальные серверы";
                                 color: Theme.text;
@@ -195,16 +211,66 @@ export component ServersPanel inherits Rectangle {
                                 vertical-alignment: center;
                             }
                         }
-                        for s in root.local-servers : ServerRow {
-                            item: s;
-                            edit-mode: root.edit-mode;
-                            clicked => { root.select-server(s.id); }
-                            open => { root.open-server(s.id); }
-                            delete-clicked => { root.delete-server(s.id); }
+                        VerticalLayout {
+                            padding: 4px;
+                            for s in root.local-servers : ServerRow {
+                                item: s;
+                                edit-mode: root.edit-mode;
+                                clicked => { root.select-server(s.id); }
+                                open => { root.open-server(s.id); }
+                                delete-clicked => { root.delete-server(s.id); }
+                            }
                         }
-                        Rectangle { height: 4px; background: transparent; }
                     }
                 }
+            }
+        }
+    }
+
+    // "⋯" menu: in-tree overlay (a click anywhere else closes it).
+    if root.menu-open : TouchArea {
+        clicked => { root.menu-open = false; }
+    }
+    if root.menu-open : Rectangle {
+        x: parent.width - self.width - 16px;
+        y: 16px + 32px + 4px;
+        width: 248px;
+        height: menu-items.preferred-height + 8px;
+        border-radius: 10px;
+        background: Theme.card-header;
+        border-width: 1px;
+        border-color: Theme.stroke;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: #00000066;
+        drop-shadow-offset-y: 4px;
+
+        menu-items := VerticalLayout {
+            padding: 4px;
+            spacing: 0px;
+            MenuItem {
+                label: "Вставить из буфера";
+                icon: @image-url("../../assets/icons/paste.svg");
+                clicked => { root.menu-open = false; root.import-clipboard(); }
+            }
+            MenuItem {
+                label: "Обновить все подписки";
+                icon: @image-url("../../assets/icons/refresh.svg");
+                clicked => { root.menu-open = false; root.update-all(); }
+            }
+            MenuItem {
+                label: "Проверить пинг всех";
+                icon: @image-url("../../assets/icons/ping.svg");
+                clicked => { root.menu-open = false; root.ping-all(); }
+            }
+            MenuItem {
+                label: "Сортировать по пингу";
+                icon: @image-url("../../assets/icons/sort.svg");
+                clicked => { root.menu-open = false; root.sort-by-ping(); }
+            }
+            MenuItem {
+                label: "Проверить выходные IP";
+                icon: @image-url("../../assets/icons/globe.svg");
+                clicked => { root.menu-open = false; root.check-exit-ips(); }
             }
         }
     }
