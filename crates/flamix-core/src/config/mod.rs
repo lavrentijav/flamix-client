@@ -1,13 +1,16 @@
 //! Proxy core configuration generators. OWNER: task T03.
 //!
-//! Flamix drives two external cores, like v2rayN:
+//! Flamix drives external cores, like v2rayN (Xray-core and sing-box by default; mihomo when
+//! `settings.core_override == "mihomo"`):
 //! - **Xray-core** for Proxy mode and for every protocol it supports (vless incl. reality/xhttp,
 //!   vmess, trojan, shadowsocks, socks, http, wireguard);
 //! - **sing-box** for hysteria2 / tuic (Proxy mode) and for TUN mode: its `tun` inbound
 //!   captures traffic and forwards it to the selected protocol's outbound directly (sing-box
 //!   protocols) or to Xray's local SOCKS inbound (Xray-only features like xhttp).
 
+pub mod mihomo;
 mod routing;
+pub(crate) mod ru_routing;
 pub mod singbox;
 pub mod xray;
 
@@ -169,6 +172,7 @@ fn node_supports(kind: CoreKind, server: &Server, settings: &Settings) -> bool {
             supported_by(server).contains(&CoreKind::SingBox)
                 && singbox::clusterable(server, settings)
         }
+        CoreKind::Mihomo => mihomo::supports(server, settings),
     }
 }
 
@@ -177,6 +181,8 @@ fn node_supports(kind: CoreKind, server: &Server, settings: &Settings) -> bool {
 pub enum CoreKind {
     Xray,
     SingBox,
+    /// mihomo (Clash.Meta); selected explicitly with `core_override = "mihomo"`.
+    Mihomo,
 }
 
 impl CoreKind {
@@ -185,11 +191,13 @@ impl CoreKind {
         match self {
             Self::Xray => "xray",
             Self::SingBox => "sing-box",
+            Self::Mihomo => "mihomo",
         }
     }
 }
 
-/// One process to start: which core and the JSON config to feed it.
+/// One process to start: which core and the config to feed it (JSON for Xray/sing-box; for
+/// mihomo the same value is written as YAML, see [`mihomo::render_yaml`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CorePlan {
     pub core: CoreKind,
@@ -200,11 +208,13 @@ pub struct CorePlan {
     pub api_port: u16,
 }
 
-/// Port of the stats API for a core: Xray = `socks_port + 10`, sing-box = `socks_port + 11`.
+/// Port of the stats API for a core: Xray = `socks_port + 10`, sing-box = `socks_port + 11`,
+/// mihomo (external-controller) = `socks_port + 12`.
 pub fn api_port(kind: CoreKind, settings: &Settings) -> u16 {
     let off = match kind {
         CoreKind::Xray => 10,
         CoreKind::SingBox => 11,
+        CoreKind::Mihomo => 12,
     };
     settings.socks_port.saturating_add(off)
 }
@@ -259,6 +269,27 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
     let Some(primary) = nodes.first() else {
         return Vec::new();
     };
+
+    // `core_override = "mihomo"`: one mihomo process (Proxy and TUN alike). A server mihomo
+    // cannot express falls back to the automatic choice with a warning (never a leak).
+    if settings.core_override == "mihomo" {
+        let api_port = api_port(CoreKind::Mihomo, settings);
+        if let Some(config) = mihomo::full_config_with(primary, settings, api_port, ctx) {
+            if nodes.len() > 1 && settings.failover.enabled {
+                tracing::warn!("core_override=mihomo: failover clusters are not supported; using the primary only");
+            }
+            return vec![CorePlan {
+                core: CoreKind::Mihomo,
+                config,
+                elevated: settings.mode == ConnectionMode::Tun,
+                api_port,
+            }];
+        }
+        tracing::warn!(
+            "core_override=mihomo: server '{}' is not mihomo-capable (transport/protocol); using auto",
+            primary.name
+        );
+    }
 
     match settings.mode {
         ConnectionMode::Proxy => {
@@ -327,7 +358,8 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
                         api_port,
                     }]
                 }
-                CoreKind::SingBox => {
+                // `kind` is only ever Xray or SingBox here (mihomo returned above).
+                CoreKind::SingBox | CoreKind::Mihomo => {
                     let api_port = api_port(CoreKind::SingBox, settings);
                     let config = if failover {
                         singbox::full_config_cluster_with(
@@ -458,6 +490,101 @@ mod tests {
                 ..Transport::default()
             },
         )
+    }
+
+    #[test]
+    fn core_override_mihomo_plans_one_process() {
+        let ws = server(
+            Credentials::Trojan {
+                password: "p".into(),
+            },
+            Transport::default(),
+        );
+        let mut settings = Settings {
+            core_override: "mihomo".into(),
+            ..Settings::default()
+        };
+        let plans = plan(&ws, &settings);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::Mihomo);
+        assert!(!plans[0].elevated);
+        assert_eq!(plans[0].api_port, 10820);
+        assert_eq!(plans[0].config["mixed-port"], json!(10808));
+        settings.mode = ConnectionMode::Tun;
+        let plans = plan(&ws, &settings);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::Mihomo);
+        assert!(plans[0].elevated);
+        assert_eq!(plans[0].config["tun"]["enable"], json!(true));
+        assert_eq!(CoreKind::Mihomo.binary_name(), "mihomo");
+    }
+
+    #[test]
+    fn core_override_mihomo_falls_back_to_auto() {
+        // xhttp is not expressible in mihomo: auto picks Xray in Proxy mode.
+        let settings = Settings {
+            core_override: "mihomo".into(),
+            ..Settings::default()
+        };
+        let plans = plan(&vless_xhttp(), &settings);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].core, CoreKind::Xray);
+        // Auto keeps today's behaviour for a mihomo-capable server.
+        let plans = plan(
+            &server(
+                Credentials::Trojan {
+                    password: "p".into(),
+                },
+                Transport::default(),
+            ),
+            &Settings::default(),
+        );
+        assert_eq!(plans[0].core, CoreKind::Xray);
+    }
+
+    #[test]
+    fn rf_preset_falls_back_to_direct_per_core() {
+        let s = server(
+            Credentials::Trojan {
+                password: "p".into(),
+            },
+            Transport::default(),
+        );
+        // Xray: an explicit catch-all to `direct` closes the rules.
+        let xr = xray::full_config(&s, &Settings::default(), 1);
+        let last = xr["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last["outboundTag"], json!("direct"));
+        assert_eq!(last["network"], json!("tcp,udp"));
+        // sing-box: route.final = direct, DNS detour stays the proxy.
+        let sb = singbox::full_config(&s, &Settings::default(), false, None, 1);
+        assert_eq!(sb["route"]["final"], json!("direct"));
+        assert_eq!(
+            sb["dns"]["servers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|d| d["tag"] == "remote")
+                .unwrap()["detour"],
+            json!("proxy")
+        );
+        // Other presets keep "unmatched goes to proxy".
+        let mut g = Settings::default();
+        g.routing.preset = crate::model::RoutingPreset::Global;
+        let sb = singbox::full_config(&s, &g, false, None, 1);
+        assert_eq!(sb["route"]["final"], json!("proxy"));
+        let xr = xray::full_config(&s, &g, 1);
+        assert!(xr["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()
+            .get("network")
+            .is_none());
     }
 
     #[test]
@@ -836,10 +963,12 @@ mod tests {
             provider: Some(&provider),
             overrides: Some(&ov),
         };
-        let settings = Settings {
+        let mut settings = Settings {
             mode: ConnectionMode::Tun,
             ..Settings::default()
         };
+        // Global: the RF preset closes with its own conditionless direct catch-all.
+        settings.routing.preset = crate::model::RoutingPreset::Global;
         let plans = plan_with(&vless_xhttp(), &settings, &ctx);
         assert_eq!(plans.len(), 2);
         // Chained Xray must be built with the default context: no provider routing, no auth.
@@ -1004,6 +1133,8 @@ mod tests {
             ),
         ];
         let mut settings = failover_settings();
+        // The RF preset falls back to DIRECT; this test is about the `proxy` urltest.
+        settings.routing.preset = crate::model::RoutingPreset::Global;
         settings.failover.tolerance_ms = 80;
         let plans = plan_cluster(&nodes, &settings, &ConnectContext::default());
         assert_eq!(plans.len(), 1);
@@ -1117,7 +1248,8 @@ mod tests {
 
 /// Exhaustive validation of generated configs against the real core binaries.
 ///
-/// The binaries are the oracle: `FLAMIX_XRAY_BIN` / `FLAMIX_SINGBOX_BIN`. When unset
+/// The binaries are the oracle: `FLAMIX_XRAY_BIN` / `FLAMIX_SINGBOX_BIN` / `FLAMIX_MIHOMO_BIN`
+/// (mihomo also reads geo databases from `FLAMIX_GEO_DIR`, default its own directory). When unset
 /// the tests return early (so normal `cargo test` stays hermetic). Every protocol
 /// sample x {Proxy, TUN} x {Global, BypassRu, Custom(each rule kind)} is validated,
 /// plus the TUN xhttp chain. Any non-zero exit *or* deprecation warning fails with
@@ -1472,24 +1604,42 @@ mod validation {
         }
     }
 
+    /// Every preset x Anixart mirror Direct/Proxy.
     fn presets() -> Vec<(&'static str, Routing)> {
-        vec![
-            (
-                "global",
-                Routing {
-                    preset: RoutingPreset::Global,
-                    ..Routing::default()
-                },
-            ),
-            (
-                "bypass-ru",
-                Routing {
-                    preset: RoutingPreset::BypassRu,
-                    ..Routing::default()
-                },
-            ),
-            ("custom", custom_routing()),
-        ]
+        let mut out = Vec::new();
+        for (mname, mirror) in [
+            ("mirror-direct", MirrorMode::Direct),
+            ("mirror-proxy", MirrorMode::Proxy),
+        ] {
+            let named: [(&str, Routing); 3] = [
+                (
+                    "global",
+                    Routing {
+                        preset: RoutingPreset::Global,
+                        ..Routing::default()
+                    },
+                ),
+                (
+                    "bypass-ru",
+                    Routing {
+                        preset: RoutingPreset::BypassRu,
+                        ..Routing::default()
+                    },
+                ),
+                ("custom", custom_routing()),
+            ];
+            for (pname, routing) in named {
+                let name: &'static str = Box::leak(format!("{pname}/{mname}").into_boxed_str());
+                out.push((
+                    name,
+                    Routing {
+                        anixart_mirror: mirror,
+                        ..routing
+                    },
+                ));
+            }
+        }
+        out
     }
 
     fn settings(mode: ConnectionMode, routing: Routing) -> Settings {
@@ -1515,18 +1665,29 @@ mod validation {
         let bin = match core {
             CoreKind::Xray => std::env::var("FLAMIX_XRAY_BIN"),
             CoreKind::SingBox => std::env::var("FLAMIX_SINGBOX_BIN"),
+            CoreKind::Mihomo => std::env::var("FLAMIX_MIHOMO_BIN"),
         };
         let bin = bin.ok()?;
-        let file = write_temp(name, &serde_json::to_string(cfg).unwrap());
-        let args: &[&str] = match core {
-            CoreKind::Xray => &["run", "-test", "-c"],
-            CoreKind::SingBox => &["check", "-c"],
+        let mut command = std::process::Command::new(&bin);
+        let file = if core == CoreKind::Mihomo {
+            // mihomo reads YAML; give it a private home dir that already has the geo
+            // databases, so `-t` never has to download them.
+            let home = mihomo_home(std::path::Path::new(&bin));
+            command.arg("-t").arg("-d").arg(home).arg("-f");
+            let yaml = mihomo::render_yaml(cfg).unwrap();
+            let file = write_temp(name, &yaml);
+            let yaml_path = file.with_extension("yaml");
+            std::fs::rename(&file, &yaml_path).unwrap();
+            yaml_path
+        } else {
+            let file = write_temp(name, &serde_json::to_string(cfg).unwrap());
+            match core {
+                CoreKind::Xray => command.args(["run", "-test", "-c"]),
+                _ => command.args(["check", "-c"]),
+            };
+            file
         };
-        let out = std::process::Command::new(bin)
-            .args(args)
-            .arg(&file)
-            .output()
-            .unwrap();
+        let out = command.arg(&file).output().unwrap();
         let message = format!(
             "{}\n{}",
             String::from_utf8_lossy(&out.stdout),
@@ -1539,7 +1700,7 @@ mod validation {
                 core.binary_name()
             ));
         }
-        if is_deprecation(&message) {
+        if is_deprecation(&message) || (core == CoreKind::Mihomo && mihomo_warns(&message)) {
             return Some(format!(
                 "{} deprecation warning in '{name}':\n{message}",
                 core.binary_name()
@@ -1560,6 +1721,33 @@ mod validation {
         let lower = message.to_lowercase();
         lower.contains("deprecat")
             && !lower.contains("not recommended for using and might be removed")
+    }
+
+    /// mihomo logs `level=warning` / `level=error` lines for anything it dislikes.
+    fn mihomo_warns(message: &str) -> bool {
+        message.lines().any(|l| {
+            l.contains("level=warning") || l.contains("level=error") || l.contains("level=fatal")
+        })
+    }
+
+    /// A per-process mihomo home dir with `geosite.dat` / `geoip.dat` linked from
+    /// `FLAMIX_GEO_DIR` (default: the directory of the mihomo binary).
+    fn mihomo_home(bin: &std::path::Path) -> std::path::PathBuf {
+        static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        HOME.get_or_init(|| {
+            let home = std::env::temp_dir().join(format!("flamix-mihomo-{}", std::process::id()));
+            std::fs::create_dir_all(&home).unwrap();
+            let geo = std::env::var_os("FLAMIX_GEO_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| bin.parent().map(std::path::Path::to_path_buf))
+                .unwrap();
+            for name in ["geosite.dat", "geoip.dat"] {
+                let _ = std::fs::remove_file(home.join(name));
+                std::fs::copy(geo.join(name), home.join(name)).unwrap();
+            }
+            home
+        })
+        .clone()
     }
 
     fn report(problems: Vec<String>) {
@@ -1593,6 +1781,15 @@ mod validation {
                             CoreKind::Xray,
                             &cfg,
                             &format!("{sname}/{pname}/{mode_name}/xray"),
+                        ));
+                        validated += 1;
+                    }
+                    let api = api_port(CoreKind::Mihomo, &settings);
+                    if let Some(cfg) = mihomo::full_config(&srv, &settings, api) {
+                        problems.extend(check_core(
+                            CoreKind::Mihomo,
+                            &cfg,
+                            &format!("{sname}/{pname}/{mode_name}/mihomo"),
                         ));
                         validated += 1;
                     }
@@ -1698,7 +1895,10 @@ mod validation {
                 // Ordering assertions: proxy rules use the balancer; the final catch-all
                 // is the balancer unless the provider goes direct.
                 let rules = cfg["routing"]["rules"].as_array().unwrap();
-                let direct_final = provider.is_some_and(|p| !p.global_proxy);
+                // No provider: the default RF preset closes with a direct catch-all.
+                let direct_final = provider.map_or(routing::final_direct(&settings.routing), |p| {
+                    !p.global_proxy
+                });
                 if direct_final {
                     let last = rules.last().unwrap();
                     assert_eq!(last["outboundTag"], json!("direct"), "{pname}/{label}");
