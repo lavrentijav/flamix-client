@@ -1,0 +1,239 @@
+// Phone layout of Flamix (M4). The window is shown by the Android entry point (src/lib.rs).
+// Dark colours are copied from app/flamix/ui/theme.slint (keep in sync).
+import { LineEdit, ListView } from "std-widgets.slint";
+
+global Theme {
+    out property <color> window-bg: #2B2621;
+    out property <color> panel-bg: #3D3328;
+    out property <color> card-header: #5A4632;
+    out property <color> accent: #C07A2C;
+    out property <color> text: #F2E9DF;
+    out property <color> muted: #B9A894;
+    out property <color> success: #6CCB5F;
+    out property <color> on-accent: #FFFFFF;
+    out property <color> stroke: #FFFFFF14;
+    out property <length> radius: 10px;
+}
+
+export struct ServerItem {
+    name: string,
+    subtitle: string,
+    selected: bool,
+}
+
+component BottomTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active;
+    callback clicked();
+    background: transparent;
+    touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.label;
+        color: root.active ? Theme.accent : Theme.muted;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+export component AndroidWindow inherits Window {
+    title: "Flamix";
+    background: Theme.window-bg;
+    preferred-width: 360px;
+    preferred-height: 720px;
+
+    in property <[ServerItem]> servers;
+    in property <string> selected-name: "Сервер не выбран";
+    in property <string> status-text: "";
+    in property <string> connect-label: "Подключить";
+    in property <bool> connected: false;
+    in property <string> add-status: "";
+    in-out property <int> tab: 0;   // 0 = Серверы, 1 = Добавить, 2 = Настройки
+
+    callback select-server(int);
+    callback connect-pressed();
+    callback add-subscription(string);
+
+    VerticalLayout {
+        // top bar
+        Rectangle {
+            height: 56px;
+            background: Theme.panel-bg;
+            Text {
+                x: 16px;
+                text: "Flamix";
+                color: Theme.text;
+                font-size: 20px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+        }
+
+        // pages (only one visible)
+        Rectangle {
+            vertical-stretch: 1;
+
+            // Серверы: connect button, selected server, server list
+            VerticalLayout {
+                visible: root.tab == 0;
+                padding: 16px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 152px;
+                        height: 152px;
+                        border-radius: 76px;
+                        background: root.connected ? Theme.success : Theme.accent;
+                        TouchArea {
+                            clicked => { root.connect-pressed(); }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 4px;
+                            HorizontalLayout {
+                                alignment: center;
+                                Image {
+                                    width: 48px;
+                                    height: 48px;
+                                    source: @image-url("../../flamix/assets/icons/power.svg");
+                                    colorize: Theme.on-accent;
+                                }
+                            }
+                            Text {
+                                text: root.connect-label;
+                                color: Theme.on-accent;
+                                font-size: 15px;
+                                horizontal-alignment: center;
+                            }
+                        }
+                    }
+                }
+
+                Text {
+                    text: root.selected-name;
+                    color: Theme.text;
+                    font-size: 18px;
+                    horizontal-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.status-text;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    horizontal-alignment: center;
+                    wrap: word-wrap;
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for server[i] in root.servers : Rectangle {
+                        height: 64px;
+                        border-radius: Theme.radius;
+                        background: server.selected ? Theme.card-header : Theme.panel-bg;
+                        TouchArea {
+                            clicked => { root.select-server(i); }
+                        }
+                        VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            alignment: center;
+                            Text {
+                                text: server.name;
+                                color: Theme.text;
+                                font-size: 16px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: server.subtitle;
+                                color: Theme.muted;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Добавить: subscription URL
+            VerticalLayout {
+                visible: root.tab == 1;
+                padding: 16px;
+                spacing: 12px;
+
+                Text {
+                    text: "Ссылка на подписку";
+                    color: Theme.muted;
+                    font-size: 14px;
+                }
+                url := LineEdit {
+                    height: 48px;
+                    font-size: 16px;
+                    placeholder-text: "https://";
+                    accepted => { root.add-subscription(self.text); }
+                }
+                Rectangle {
+                    height: 48px;
+                    border-radius: Theme.radius;
+                    background: Theme.accent;
+                    TouchArea {
+                        clicked => { root.add-subscription(url.text); }
+                    }
+                    Text {
+                        text: "Добавить";
+                        color: Theme.on-accent;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
+                }
+                Text {
+                    text: root.add-status;
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                }
+            }
+
+            // Настройки: placeholder
+            VerticalLayout {
+                visible: root.tab == 2;
+                padding: 16px;
+                Text {
+                    text: "Настройки появятся в следующей версии.";
+                    color: Theme.muted;
+                    font-size: 14px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        // bottom tabs (each at least 48 dp high)
+        Rectangle {
+            height: 56px;
+            background: Theme.panel-bg;
+            HorizontalLayout {
+                BottomTab {
+                    label: "Серверы";
+                    active: root.tab == 0;
+                    clicked => { root.tab = 0; }
+                }
+                BottomTab {
+                    label: "Добавить";
+                    active: root.tab == 1;
+                    clicked => { root.tab = 1; }
+                }
+                BottomTab {
+                    label: "Настройки";
+                    active: root.tab == 2;
+                    clicked => { root.tab = 2; }
+                }
+            }
+        }
+    }
+}
