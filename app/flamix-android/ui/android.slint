@@ -1,29 +1,69 @@
 // Phone layout of Flamix (M4). The window is shown by the Android entry point (src/lib.rs).
 // Dark colours are copied from app/flamix/ui/theme.slint (keep in sync).
-import { LineEdit, ListView, ScrollView } from "std-widgets.slint";
+import { LineEdit, ScrollView, Switch } from "std-widgets.slint";
 
 global Theme {
     out property <color> window-bg: #2B2621;
     out property <color> panel-bg: #3D3328;
     out property <color> card-header: #5A4632;
+    out property <color> card-body: #4A3B2C;
     out property <color> accent: #C07A2C;
     out property <color> text: #F2E9DF;
     out property <color> muted: #B9A894;
     out property <color> success: #6CCB5F;
+    out property <color> warning: #E3B341;
+    out property <color> danger: #E5534B;
+    out property <color> info: #5AA7FF;
     out property <color> on-accent: #FFFFFF;
     out property <color> stroke: #FFFFFF14;
+    out property <color> hover: #FFFFFF12;
+    out property <color> track: #FFFFFF1A;
     out property <length> radius: 10px;
 }
 
-export struct ServerItem {
+/// One server row of the servers tab (see phone.rs `ServerRow`).
+export struct PhoneServer {
+    id: string,
     name: string,
     subtitle: string,
     address: string,
-    /// true = measured exit IP, false = entry address (shown with a small "вход" label)
+    /// true = measured exit IP, false = entry address (shown with a "вход" label)
     is-exit: bool,
     /// servers sharing this exit IP (0 = unique/unknown)
     group: int,
     selected: bool,
+    /// -2 untested, -1 failed, otherwise ms
+    ping: int,
+    has-quota: bool,
+    quota-fraction: float,
+    quota-text: string,
+}
+
+/// One subscription card of the servers tab (see phone.rs `SubCard`).
+export struct PhoneSub {
+    id: string,
+    name: string,
+    local: bool,
+    collapsed: bool,
+    pinned: bool,
+    updating: bool,
+    has-traffic: bool,
+    traffic-text: string,
+    traffic-fraction: float,
+    expire-text: string,
+    banner-text: string,
+    /// 0 info, 1 red, 2 green, 3 custom colour, 4 expiry notice
+    banner-tone: int,
+    banner-color: color,
+    banner-button: string,
+    banner-link: string,
+    announce: string,
+    error: string,
+    /// 0 none, 1 Telegram, 2 e-mail, 3 website
+    support-kind: int,
+    support-url: string,
+    web-url: string,
+    servers: [PhoneServer],
 }
 
 component BottomTab inherits Rectangle {
@@ -56,13 +96,338 @@ component BottomTab inherits Rectangle {
     }
 }
 
+// Square touch target (48 dp) with a centred 22 px icon, recoloured to `tint`.
+component IconBtn inherits Rectangle {
+    in property <image> icon;
+    in property <color> tint: Theme.muted;
+    in property <bool> active: false;
+    callback clicked();
+    width: 48px;
+    height: 48px;
+    border-radius: 24px;
+    background: (ta.has-hover || root.active) ? Theme.hover : transparent;
+    Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 22px;
+        height: 22px;
+        source: root.icon;
+        colorize: root.tint;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// One server row: name, address (exit IP or entry with "вход"), quota bar, ×N, ping colour.
+component ServerRowView inherits Rectangle {
+    in property <PhoneServer> server;
+    callback clicked();
+    height: server.has-quota ? 72px : 56px;
+    background: server.selected ? Theme.accent.with-alpha(0.18) : transparent;
+    property <color> ping-color: server.ping == -1 ? Theme.danger
+        : server.ping < 0 ? Theme.muted
+        : server.ping < 150 ? Theme.success
+        : server.ping < 400 ? Theme.warning
+        : Theme.danger;
+    property <string> ping-text: server.ping < -1 ? "" : server.ping == -1 ? "—" : "\{server.ping} ms";
+    ta := TouchArea { clicked => { root.clicked(); } }
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 12px;
+        spacing: 8px;
+        VerticalLayout {
+            horizontal-stretch: 1;
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: root.server.name;
+                color: Theme.text;
+                font-size: 15px;
+                overflow: elide;
+            }
+            HorizontalLayout {
+                spacing: 6px;
+                Text {
+                    text: root.server.address;
+                    color: Theme.muted;
+                    font-size: 12px;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+                if !root.server.is-exit : Text {
+                    text: "вход";
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+                if root.server.group > 1 : Text {
+                    text: "×\{root.server.group}";
+                    color: Theme.accent;
+                    font-size: 12px;
+                    font-weight: 600;
+                }
+            }
+            Text {
+                text: root.server.subtitle;
+                color: Theme.muted;
+                font-size: 11px;
+                overflow: elide;
+            }
+            if root.server.has-quota : HorizontalLayout {
+                spacing: 8px;
+                height: 16px;
+                Rectangle {
+                    width: 96px;
+                    height: 4px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 2px;
+                    background: Theme.track;
+                    Rectangle {
+                        x: 0;
+                        width: min(parent.width * root.server.quota-fraction, parent.width);
+                        height: parent.height;
+                        border-radius: 2px;
+                        background: Theme.accent;
+                    }
+                }
+                Text {
+                    text: root.server.quota-text;
+                    color: Theme.muted;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+            }
+        }
+        Text {
+            width: 60px;
+            text: root.ping-text;
+            color: root.ping-color;
+            font-size: 12px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Subscription card: header (tap = collapse), traffic, banner, announce, servers, action row.
+component SubCardView inherits Rectangle {
+    in property <PhoneSub> sub;
+    callback toggle();
+    callback pin();
+    callback refresh();
+    callback settings();
+    callback open-url(string);
+    callback select-server(string);
+
+    background: Theme.card-body;
+    border-radius: Theme.radius;
+    clip: true;
+    height: content.preferred-height;
+
+    content := VerticalLayout {
+        // header
+        Rectangle {
+            height: 48px;
+            background: Theme.card-header;
+            TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.toggle(); }
+            }
+            HorizontalLayout {
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+                alignment: start;
+                Image {
+                    width: 16px;
+                    height: 16px;
+                    y: (parent.height - self.height) / 2;
+                    source: @image-url("../../flamix/assets/icons/chevron-down.svg");
+                    colorize: Theme.text;
+                    transform-rotation: root.sub.collapsed ? -90deg : 0deg;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.sub.name;
+                    color: Theme.text;
+                    font-size: 15px;
+                    font-weight: 600;
+                    overflow: elide;
+                    vertical-alignment: center;
+                }
+            }
+        }
+
+        if root.sub.has-traffic : VerticalLayout {
+            padding-left: 14px;
+            padding-right: 14px;
+            padding-top: 10px;
+            padding-bottom: 6px;
+            spacing: 6px;
+            HorizontalLayout {
+                spacing: 8px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.sub.traffic-text;
+                    color: Theme.text;
+                    font-size: 13px;
+                    overflow: elide;
+                }
+                if root.sub.expire-text != "" : Text {
+                    text: root.sub.expire-text;
+                    color: Theme.muted;
+                    font-size: 13px;
+                    horizontal-alignment: right;
+                }
+            }
+            Rectangle {
+                height: 4px;
+                border-radius: 2px;
+                background: Theme.track;
+                Rectangle {
+                    x: 0;
+                    width: min(parent.width * root.sub.traffic-fraction, parent.width);
+                    height: parent.height;
+                    border-radius: 2px;
+                    background: Theme.accent;
+                }
+            }
+        }
+
+        // Provider banner (expiry notice replaces the info banner, see phone.rs).
+        if root.sub.banner-text != "" : Rectangle {
+            property <color> tint: root.sub.banner-tone == 1 ? Theme.danger
+                : root.sub.banner-tone == 2 ? Theme.success
+                : root.sub.banner-tone == 3 ? root.sub.banner-color
+                : root.sub.banner-tone == 4 ? Theme.warning
+                : Theme.info;
+            height: banner-col.preferred-height;
+            background: tint.with-alpha(0.16);
+            border-radius: 8px;
+            clip: true;
+            banner-col := VerticalLayout {
+                padding-top: 6px;
+                padding-bottom: 6px;
+                padding-right: 8px;
+                HorizontalLayout {
+                    spacing: 10px;
+                    cross-axis-alignment: center;
+                    Rectangle { width: 3px; background: tint; }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.sub.banner-text;
+                        color: Theme.text;
+                        font-size: 13px;
+                        wrap: word-wrap;
+                    }
+                    if root.sub.banner-button != "" : Rectangle {
+                        width: btn-label.preferred-width + 24px;
+                        height: 36px;
+                        border-radius: 8px;
+                        background: tint;
+                        btn-label := Text {
+                            text: root.sub.banner-button;
+                            color: #2B2621;
+                            font-size: 13px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                            horizontal-alignment: center;
+                            width: parent.width;
+                            height: parent.height;
+                        }
+                        TouchArea { clicked => { root.open-url(root.sub.banner-link); } }
+                    }
+                }
+            }
+        }
+
+        if root.sub.announce != "" : HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 6px;
+                Text {
+                text: root.sub.announce;
+                color: Theme.muted;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            }
+        if root.sub.error != "" : HorizontalLayout {
+                        padding-left: 14px;
+                        padding-right: 14px;
+                        padding-top: 6px;
+                Text {
+                text: root.sub.error;
+                color: Theme.danger;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+            }
+
+        if !root.sub.collapsed : VerticalLayout {
+            padding-top: 4px;
+            padding-bottom: 2px;
+            for s in root.sub.servers : ServerRowView {
+                server: s;
+                clicked => { root.select-server(s.id); }
+            }
+            if root.sub.servers.length == 0 : HorizontalLayout {
+                                padding-left: 14px;
+                                padding-top: 8px;
+                                padding-bottom: 8px;
+                    Text {
+                    text: "Серверов нет";
+                    color: Theme.muted;
+                    font-size: 13px;
+                }
+                }
+        }
+
+        // Action row: support and site on the left, pin / refresh / settings on the right.
+        if !root.sub.local : HorizontalLayout {
+            height: 48px;
+            padding-left: 4px;
+            padding-right: 4px;
+            spacing: 2px;
+            if root.sub.support-kind != 0 : IconBtn {
+                icon: root.sub.support-kind == 1 ? @image-url("../../flamix/assets/icons/telegram.svg")
+                    : root.sub.support-kind == 2 ? @image-url("../../flamix/assets/icons/mail.svg")
+                    : @image-url("../../flamix/assets/icons/support.svg");
+                tint: Theme.accent;
+                clicked => { root.open-url(root.sub.support-url); }
+            }
+            if root.sub.web-url != "" : IconBtn {
+                icon: @image-url("../../flamix/assets/icons/globe.svg");
+                tint: Theme.accent;
+                clicked => { root.open-url(root.sub.web-url); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            IconBtn {
+                icon: @image-url("../../flamix/assets/icons/pin.svg");
+                tint: root.sub.pinned ? Theme.accent : Theme.muted;
+                clicked => { root.pin(); }
+            }
+            IconBtn {
+                icon: @image-url("../../flamix/assets/icons/refresh.svg");
+                tint: root.sub.updating ? Theme.accent : Theme.muted;
+                clicked => { root.refresh(); }
+            }
+            IconBtn {
+                icon: @image-url("../../flamix/assets/icons/settings.svg");
+                clicked => { root.settings(); }
+            }
+        }
+    }
+}
+
 export component AndroidWindow inherits Window {
     title: "Flamix";
     background: Theme.window-bg;
     preferred-width: 360px;
     preferred-height: 720px;
 
-    in property <[ServerItem]> servers;
+    in property <[PhoneSub]> subs;
     in property <string> selected-name: "Сервер не выбран";
     in property <string> status-text: "";
     in property <string> connect-label: "Подключить";
@@ -70,8 +435,22 @@ export component AndroidWindow inherits Window {
     in property <string> add-status: "";
     in-out property <int> tab: 0;   // 0 = Серверы, 1 = Добавить, 2 = Настройки
 
-    callback select-server(int);
+    callback select-server(string);
     callback connect-pressed();
+    callback search-changed(string);
+    callback sub-toggle(string);
+    callback sub-pin(string);
+    callback sub-refresh(string);
+    callback sub-open-settings(string);
+    callback sub-save(string, bool);
+    callback sub-delete();
+    callback open-url(string);
+
+    // Subscription settings sheet (opened by a card's settings button).
+    in-out property <bool> sheet-open: false;
+    in-out property <string> sheet-name;
+    in-out property <bool> sheet-ignore: false;
+    in-out property <bool> sheet-delete-armed: false;
     in property <string> version-text: "";
     in property <string> log-text: "";
     callback add-subscription(string);
@@ -109,31 +488,31 @@ export component AndroidWindow inherits Window {
             vertical-stretch: 1;
             min-height: 100px;
 
-            // Серверы: connect button, selected server, server list
+            // Серверы: connect button, selected server, search, subscription cards
             if root.tab == 0 : VerticalLayout {
                 width: parent.width;
                 height: parent.height;
-                padding: 16px;
+                padding: 12px;
                 spacing: 8px;
 
                 HorizontalLayout {
                     alignment: center;
                     Rectangle {
-                        width: 152px;
-                        height: 152px;
-                        border-radius: 76px;
+                        width: 104px;
+                        height: 104px;
+                        border-radius: 52px;
                         background: root.connected ? Theme.success : Theme.accent;
                         TouchArea {
                             clicked => { root.connect-pressed(); }
                         }
                         VerticalLayout {
                             alignment: center;
-                            spacing: 4px;
+                            spacing: 2px;
                             HorizontalLayout {
                                 alignment: center;
                                 Image {
-                                    width: 48px;
-                                    height: 48px;
+                                    width: 40px;
+                                    height: 40px;
                                     source: @image-url("../../flamix/assets/icons/power.svg");
                                     colorize: Theme.on-accent;
                                 }
@@ -141,75 +520,56 @@ export component AndroidWindow inherits Window {
                             Text {
                                 text: root.connect-label;
                                 color: Theme.on-accent;
-                                font-size: 15px;
+                                font-size: 14px;
                                 horizontal-alignment: center;
                             }
                         }
                     }
                 }
-
                 Text {
                     text: root.selected-name;
                     color: Theme.text;
-                    font-size: 18px;
+                    font-size: 16px;
                     horizontal-alignment: center;
                     overflow: elide;
                 }
-                Text {
+                if root.status-text != "" : Text {
                     text: root.status-text;
                     color: Theme.muted;
-                    font-size: 14px;
+                    font-size: 13px;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
-                ListView {
+                search := LineEdit {
+                    height: 48px;
+                    font-size: 15px;
+                    placeholder-text: "Поиск серверов";
+                    edited => { root.search-changed(self.text); }
+                }
+                ScrollView {
                     vertical-stretch: 1;
-                    for server[i] in root.servers : Rectangle {
-                        height: 64px;
-                        border-radius: Theme.radius;
-                        background: server.selected ? Theme.card-header : Theme.panel-bg;
-                        TouchArea {
-                            clicked => { root.select-server(i); }
+                    VerticalLayout {
+                        padding-bottom: 8px;
+                        spacing: 10px;
+                        for sub in root.subs : SubCardView {
+                            sub: sub;
+                            toggle => { root.sub-toggle(sub.id); }
+                            pin => { root.sub-pin(sub.id); }
+                            refresh => { root.sub-refresh(sub.id); }
+                            settings => { root.sub-open-settings(sub.id); }
+                            open-url(url) => { root.open-url(url); }
+                            select-server(id) => { root.select-server(id); }
                         }
-                        VerticalLayout {
-                            padding-left: 16px;
-                            padding-right: 16px;
-                            alignment: center;
-                            Text {
-                                text: server.name;
-                                color: Theme.text;
-                                font-size: 16px;
-                                overflow: elide;
-                            }
-                            HorizontalLayout {
-                                spacing: 6px;
-                                alignment: start;
+                        if root.subs.length == 0 : HorizontalLayout {
+                                                        padding-top: 24px;
                                 Text {
-                                    text: server.address;
-                                    color: Theme.muted;
-                                    font-size: 13px;
-                                    overflow: elide;
-                                }
-                                if !server.is-exit : Text {
-                                    text: "вход";
-                                    color: Theme.muted;
-                                    font-size: 10px;
-                                    vertical-alignment: center;
-                                }
-                                if server.group > 1 : Text {
-                                    text: "×" + server.group;
-                                    color: Theme.accent;
-                                    font-size: 13px;
-                                    font-weight: 600;
-                                }
-                                Text {
-                                    text: server.subtitle;
-                                    color: Theme.muted;
-                                    font-size: 13px;
-                                    overflow: elide;
-                                }
+                                text: "Подписок пока нет. Добавьте ссылку на вкладке «Добавить».";
+                                color: Theme.muted;
+                                font-size: 14px;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
                             }
-                        }
+                            }
                     }
                 }
             }
@@ -350,6 +710,108 @@ export component AndroidWindow inherits Window {
                     icon: @image-url("../../flamix/assets/icons/settings.svg");
                     active: root.tab == 2;
                     clicked => { root.tab = 2; }
+                }
+            }
+        }
+    }
+
+    // Subscription settings sheet.
+    if root.sheet-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: #000000B3;
+        TouchArea { clicked => { root.sheet-open = false; root.sheet-delete-armed = false; } }
+        Rectangle {
+            x: 0px;
+            y: parent.height - self.height;
+            width: parent.width;
+            height: sheet-col.preferred-height + 32px;
+            background: Theme.panel-bg;
+            border-radius: 16px;
+            TouchArea { }
+            sheet-col := VerticalLayout {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                spacing: 10px;
+                Text {
+                    text: "Настройки подписки";
+                    color: Theme.text;
+                    font-size: 18px;
+                    font-weight: 600;
+                }
+                Text { text: "Название"; color: Theme.muted; font-size: 13px; }
+                LineEdit {
+                    height: 48px;
+                    font-size: 15px;
+                    text <=> root.sheet-name;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: space-between;
+                    Text {
+                        text: "Игнорировать маршрутизацию провайдера";
+                        color: Theme.text;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Switch {
+                        checked <=> root.sheet-ignore;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle {
+                        height: 48px;
+                        horizontal-stretch: 1;
+                        border-radius: Theme.radius;
+                        background: Theme.accent;
+                        TouchArea {
+                            clicked => {
+                                root.sub-save(root.sheet-name, root.sheet-ignore);
+                                root.sheet-open = false;
+                                root.sheet-delete-armed = false;
+                            }
+                        }
+                        Text { text: "Сохранить"; color: Theme.on-accent; font-size: 15px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        height: 48px;
+                        horizontal-stretch: 1;
+                        border-radius: Theme.radius;
+                        background: Theme.card-header;
+                        TouchArea { clicked => { root.sheet-open = false; root.sheet-delete-armed = false; } }
+                        Text { text: "Отмена"; color: Theme.text; font-size: 15px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Rectangle {
+                    height: 48px;
+                    border-radius: Theme.radius;
+                    background: root.sheet-delete-armed ? Theme.danger : transparent;
+                    TouchArea {
+                        clicked => {
+                            if root.sheet-delete-armed {
+                                root.sub-delete();
+                                root.sheet-open = false;
+                                root.sheet-delete-armed = false;
+                            } else {
+                                root.sheet-delete-armed = true;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.sheet-delete-armed ? "Точно удалить подписку?" : "Удалить подписку";
+                        color: root.sheet-delete-armed ? #FFFFFF : Theme.danger;
+                        font-size: 15px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
         }
