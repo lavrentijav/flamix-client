@@ -70,8 +70,8 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
             // The connection panel owns the same setting: mirror the live mode back so the two
             // controls cannot drift apart.
             if let Some(ctrl) = ctrl.as_ref() {
-                let tun = ctrl.with_state(|state| state.settings.mode) == ConnectionMode::Tun;
-                bridge.set_tun_mode(tun);
+                let mode = ctrl.with_state(|state| state.settings.mode);
+                bridge.set_mode_index(mode_to_index(mode));
             }
             let settings = read_bridge(&bridge, &current.borrow());
             publish_errors(&bridge, &validate(&settings));
@@ -107,21 +107,25 @@ pub fn init(ui: &AppWindow, ctrl: Option<&Arc<Controller>>) {
         }
     });
 
-    // The Proxy/TUN control writes the mode immediately (and reconnects): it is shared with the
-    // connection panel, so it must not go through the debounced snapshot save.
+    // The mode control writes the mode immediately (and reconnects): it is shared with the
+    // connection panel, so it must not go through the debounced snapshot save. The bridge is
+    // re-read from the live state afterwards.
     bridge.on_mode_changed({
+        let ui_weak = ui.as_weak();
         let current = current.clone();
         let ctrl = ctrl.cloned();
-        move |tun| {
-            let mode = if tun {
-                ConnectionMode::Tun
-            } else {
-                ConnectionMode::Proxy
+        move |index| {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            let bridge = ui.global::<SettingsBridge>();
+            let Some(ctrl) = ctrl.as_ref() else {
+                // Demo: no controller, just reflect the choice.
+                bridge.set_mode_index(index);
+                return;
             };
+            ctrl.set_mode_index_public(index);
+            let mode = ctrl.with_state(|state| state.settings.mode);
             current.borrow_mut().mode = mode;
-            let Some(ctrl) = ctrl.as_ref() else { return };
-            ctrl.mutate(move |state| state.settings.mode = mode);
-            ctrl.reconnect_if_connected();
+            bridge.set_mode_index(mode_to_index(mode));
         }
     });
 
@@ -276,6 +280,8 @@ fn apply_owned_in_place(live: &mut Settings, src: &Settings) {
     live.theme = src.theme;
     live.language = src.language.clone();
     live.log_level = src.log_level.clone();
+    live.ap_tether_enabled = src.ap_tether_enabled;
+    live.ap_interfaces = src.ap_interfaces.clone();
 }
 
 /// `live` with this page's fields taken from `src` (used for the change comparison).
@@ -307,7 +313,9 @@ fn demo_settings() -> Settings {
 }
 
 fn write_bridge(bridge: &SettingsBridge, s: &Settings) {
-    bridge.set_tun_mode(s.mode == ConnectionMode::Tun);
+    bridge.set_mode_index(mode_to_index(s.mode));
+    bridge.set_ap_tether_enabled(s.ap_tether_enabled);
+    bridge.set_ap_interfaces(s.ap_interfaces.join(", ").into());
     bridge.set_socks_port(i32::from(s.socks_port));
     bridge.set_http_port(i32::from(s.http_port));
     bridge.set_allow_lan(s.allow_lan);
@@ -359,11 +367,7 @@ fn write_bridge(bridge: &SettingsBridge, s: &Settings) {
 
 fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
     Settings {
-        mode: if bridge.get_tun_mode() {
-            ConnectionMode::Tun
-        } else {
-            ConnectionMode::Proxy
-        },
+        mode: mode_from_index(bridge.get_mode_index()),
         socks_port: bridge.get_socks_port().clamp(1, 65_535) as u16,
         http_port: bridge.get_http_port().clamp(1, 65_535) as u16,
         allow_lan: bridge.get_allow_lan(),
@@ -409,15 +413,13 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         tun_strict_route: bridge.get_tun_strict_route(),
         tun_icmp: bridge.get_tun_icmp().to_string(),
         tun_route_exclude: list_from_text(&bridge.get_route_exclude()),
-        // TProxy / AP tether fields are not yet exposed in the Slint settings bridge
-        // (M3 of transparent-proxy); carry through whatever is in the base snapshot so
-        // state round-trips untouched.
+        // The TProxy tuning fields have no UI yet: carry them through from the base snapshot.
         tproxy_port: base.tproxy_port,
         tproxy_mark: base.tproxy_mark,
         tproxy_table: base.tproxy_table,
         tproxy_route_exclude: base.tproxy_route_exclude.clone(),
-        ap_tether_enabled: base.ap_tether_enabled,
-        ap_interfaces: base.ap_interfaces.clone(),
+        ap_tether_enabled: bridge.get_ap_tether_enabled(),
+        ap_interfaces: interfaces_from_text(&bridge.get_ap_interfaces()),
         mux: bridge.get_mux(),
         mux_concurrency: bridge.get_mux_concurrency().max(1) as u32,
         core_override: {
@@ -589,6 +591,34 @@ fn is_valid_dns(value: &str) -> bool {
 }
 
 /// One item per line (proxy bypass, route-exclude CIDRs, ...).
+/// Connection mode <-> segmented-control index (0 Proxy, 1 TUN, 2 TProxy).
+fn mode_to_index(mode: ConnectionMode) -> i32 {
+    match mode {
+        ConnectionMode::Proxy => 0,
+        ConnectionMode::Tun => 1,
+        ConnectionMode::Tproxy => 2,
+    }
+}
+
+fn mode_from_index(index: i32) -> ConnectionMode {
+    match index {
+        1 => ConnectionMode::Tun,
+        2 => ConnectionMode::Tproxy,
+        _ => ConnectionMode::Proxy,
+    }
+}
+
+/// Comma/space separated interface names, e.g. `wlan0, usb0`; duplicates are dropped.
+fn interfaces_from_text(text: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in text.split([',', ' ', ';', '\n']).map(str::trim) {
+        if !name.is_empty() && !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
 fn list_to_text(list: &[String]) -> String {
     list.join("\n")
 }
@@ -745,6 +775,23 @@ fn language_from_index(index: i32) -> &'static str {
 mod tests {
     use super::*;
     use flamix_core::model::{RoutingRule, RuleAction};
+
+    #[test]
+    fn mode_index_roundtrip_and_interfaces() {
+        for mode in [
+            ConnectionMode::Proxy,
+            ConnectionMode::Tun,
+            ConnectionMode::Tproxy,
+        ] {
+            assert_eq!(mode_from_index(mode_to_index(mode)), mode);
+        }
+        assert_eq!(mode_from_index(99), ConnectionMode::Proxy);
+        assert_eq!(
+            interfaces_from_text("wlan0, usb0,,wlan0 ; eth1\n"),
+            vec!["wlan0", "usb0", "eth1"]
+        );
+        assert!(interfaces_from_text("  ").is_empty());
+    }
 
     fn settings() -> Settings {
         Settings::default()

@@ -11,10 +11,11 @@ export component ConnectionPanel inherits Rectangle {
     in property <string> status-text;
     in property <string> speed-text;
     in property <bool> needs-admin: false;
-    in-out property <bool> tun-mode: false;
+    // 0 Proxy, 1 TUN, 2 TProxy.
+    in-out property <int> mode-index: 0;
     callback toggle-connect();
     callback ping-selected();
-    callback mode-changed(bool);
+    callback mode-changed(int);
     callback restart-as-admin();
 
     width: 300px;
@@ -88,7 +89,7 @@ export component ConnectionPanel inherits Rectangle {
             }
         }
 
-        // Proxy / TUN segmented control.
+        // Proxy / TUN / TProxy segmented control.
         Rectangle {
             height: 34px;
             border-radius: 8px;
@@ -96,31 +97,18 @@ export component ConnectionPanel inherits Rectangle {
             HorizontalLayout {
                 padding: 4px;
                 spacing: 4px;
-                Rectangle {
+                for option[i] in ["Proxy", "TUN", "TProxy"] : Rectangle {
                     horizontal-stretch: 1;
                     border-radius: 6px;
-                    background: !root.tun-mode ? Theme.accent : transparent;
+                    background: i == root.mode-index ? Theme.accent : (mode-ta.has-hover ? Theme.hover : transparent);
                     Text {
-                        text: "Proxy";
-                        color: !root.tun-mode ? Theme.on-accent : Theme.muted;
+                        text: option;
+                        color: i == root.mode-index ? Theme.on-accent : Theme.muted;
                         font-size: 12px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                     }
-                    TouchArea { mouse-cursor: pointer; clicked => { root.mode-changed(false); } }
-                }
-                Rectangle {
-                    horizontal-stretch: 1;
-                    border-radius: 6px;
-                    background: root.tun-mode ? Theme.accent : transparent;
-                    Text {
-                        text: "TUN";
-                        color: root.tun-mode ? Theme.on-accent : Theme.muted;
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                    TouchArea { mouse-cursor: pointer; clicked => { root.mode-changed(true); } }
+                    mode-ta := TouchArea { mouse-cursor: pointer; clicked => { root.mode-changed(i); } }
                 }
             }
         }
