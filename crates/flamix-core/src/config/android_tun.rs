@@ -47,8 +47,8 @@ pub fn android_config(
         route.remove("auto_detect_interface");
     }
     strip_remote_rule_sets(&mut cfg);
-    // Core output lands in flamix.log on failure; info level shows why the core is slow/dead.
-    cfg["log"] = serde_json::json!({"level": "info", "timestamp": false});
+    // Core output is copied into flamix.log (Settings -> Логи); warn keeps it readable.
+    cfg["log"] = serde_json::json!({"level": "warn", "timestamp": false});
     for inbound in cfg.get_mut("inbounds")?.as_array_mut()? {
         if inbound["type"] == "mixed" {
             let ib = inbound.as_object_mut()?;

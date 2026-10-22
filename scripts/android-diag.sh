@@ -75,6 +75,11 @@ done
 sleep 30
 shot 4-after-consent
 
+step "Settings tab screenshot"
+adb shell input tap $((W * 5 / 6)) $((H - 28 * DENS / 160))
+sleep 2
+shot 5-settings-tab
+
 step "VPN state"
 adb shell dumpsys connectivity | grep -iE "VPN|tun" | head -20
 adb shell "ps -A" | grep -E "libsingbox|flamix" || echo "no libsingbox/flamix process"
