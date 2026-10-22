@@ -18,7 +18,9 @@ class MainActivity : NativeActivity() {
     private val core by lazy { CoreService(this) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        FileLog.init(this)
         super.onCreate(savedInstanceState)
+        FileLog.i(TAG, "MainActivity created")
         FlamixBridge.attach(this)
         handleDebugIntent(intent)
     }
@@ -53,6 +55,7 @@ class MainActivity : NativeActivity() {
 
     /** Starts the system VPN with a sing-box config; asks for VPN consent first when needed. */
     fun startVpn(configJson: String) {
+        FileLog.i(TAG, "startVpn requested")
         if (FlamixVpn.prepare(this)) FlamixVpn.start(this, configJson) else pendingVpnConfig = configJson
     }
 
@@ -64,7 +67,7 @@ class MainActivity : NativeActivity() {
         if (requestCode != FlamixVpn.REQUEST_VPN) return
         val cfg = pendingVpnConfig.also { pendingVpnConfig = null }
         if (resultCode == RESULT_OK && cfg != null) FlamixVpn.start(this, cfg)
-        else Log.w(TAG, "VPN consent denied")
+        else FileLog.w(TAG, "VPN consent denied/cancelled (result=$resultCode)")
     }
 
     override fun onDestroy() {

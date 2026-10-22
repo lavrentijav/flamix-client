@@ -18,41 +18,118 @@ pub const UNSUPPORTED_MESSAGE: &str = "Этот сервер не поддерж
 pub struct ServerRow {
     pub id: String,
     pub name: String,
+    /// Protocol / transport summary.
     pub subtitle: String,
+    /// Address shown on the row: the measured exit IP when known, else the entry address.
+    pub address: String,
+    /// True when `address` is the measured exit IP (false = entry address, shown as "вход").
+    pub is_exit: bool,
+    /// Number of servers (>1) sharing this exit IP; 0 = unique or unknown exit.
+    pub group: usize,
 }
 
-/// Every server the phone list shows, in order: subscriptions first, then local servers.
-/// The list index used by the UI is the index into this iterator.
-pub fn all_servers(state: &AppState) -> impl Iterator<Item = &Server> {
+/// Servers in storage order: subscriptions first, then local servers (unordered by exit).
+fn stored_servers(state: &AppState) -> Vec<&Server> {
     state
         .subscriptions
         .iter()
         .flat_map(|sub| sub.servers.iter())
         .chain(state.local_servers.iter())
+        .collect()
+}
+
+/// Measured exit IP of `id`, `None` when never probed (an entry address is never a substitute).
+fn exit_ip<'a>(state: &'a AppState, id: &str) -> Option<&'a str> {
+    state
+        .exit_ips
+        .get(id)
+        .map(|e| e.ip.as_str())
+        .filter(|ip| !ip.is_empty())
+}
+
+/// THE grouping function. Groups server ids by their measured exit IP (`exit_ips`), never by the
+/// entry address/domain. Servers with an unknown exit IP are not in any group: each one stands
+/// alone. Groups are in order of their first member's position; ids inside keep list order.
+pub fn exit_groups(state: &AppState) -> Vec<Vec<String>> {
+    let mut groups: Vec<(Option<&str>, Vec<String>)> = Vec::new();
+    for server in stored_servers(state) {
+        let ip = exit_ip(state, &server.id);
+        match ip.and_then(|ip| groups.iter_mut().find(|(g, _)| *g == Some(ip))) {
+            Some((_, ids)) => ids.push(server.id.clone()),
+            None => groups.push((ip, vec![server.id.clone()])),
+        }
+    }
+    groups.into_iter().map(|(_, ids)| ids).collect()
+}
+
+/// Every server the phone list shows, in list order: members of one exit group are adjacent.
+/// The list index used by the UI is the index into this vector.
+pub fn all_servers(state: &AppState) -> Vec<&Server> {
+    let all = stored_servers(state);
+    exit_groups(state)
+        .into_iter()
+        .flatten()
+        .filter_map(|id| all.iter().copied().find(|s| s.id == id))
+        .collect()
 }
 
 pub fn server_rows(state: &AppState) -> Vec<ServerRow> {
+    let groups = exit_groups(state);
     all_servers(state)
-        .map(|s| ServerRow {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            subtitle: format!(
-                "{} · {}",
-                s.protocol().as_str(),
-                s.transport.network.as_str()
-            ),
+        .into_iter()
+        .map(|s| {
+            let exit = exit_ip(state, &s.id);
+            let group = exit
+                .and_then(|_| groups.iter().find(|g| g.contains(&s.id)))
+                .map_or(0, |g| g.len())
+                .max(1);
+            ServerRow {
+                id: s.id.clone(),
+                name: s.name.clone(),
+                subtitle: format!(
+                    "{} · {}",
+                    s.protocol().as_str(),
+                    s.transport.network.as_str()
+                ),
+                address: exit.map_or_else(|| s.address.clone(), str::to_string),
+                is_exit: exit.is_some(),
+                group: if group > 1 { group } else { 0 },
+            }
         })
         .collect()
 }
 
+/// Backups of `id`: the explicit `settings.failover.backups` when set, otherwise the other
+/// servers with the same measured exit IP. Never chosen by address; a server with an unknown
+/// exit IP has no implicit backups and is nobody's backup.
+pub fn backup_ids(state: &AppState, id: &str) -> Vec<String> {
+    let explicit: Vec<String> = state
+        .settings
+        .failover
+        .backups
+        .iter()
+        .filter(|b| b.as_str() != id)
+        .cloned()
+        .collect();
+    if !explicit.is_empty() {
+        return explicit;
+    }
+    exit_groups(state)
+        .into_iter()
+        .find(|g| g.iter().any(|x| x == id))
+        .filter(|_| exit_ip(state, id).is_some())
+        .map(|g| g.into_iter().filter(|x| x != id).collect())
+        .unwrap_or_default()
+}
+
 /// Id of the server at list position `index`.
 pub fn server_id_at(state: &AppState, index: usize) -> Option<String> {
-    all_servers(state).nth(index).map(|s| s.id.clone())
+    all_servers(state).get(index).map(|s| s.id.clone())
 }
 
 pub fn selected_server(state: &AppState) -> Option<&Server> {
     let id = state.selected_server.as_deref()?;
-    all_servers(state).find(|s| s.id == id)
+    all_servers(state).into_iter().find(|s| s.id == id)
 }
 
 /// Name shown under the connect button.
@@ -96,7 +173,12 @@ pub fn vpn_config_json(state: &AppState) -> Result<String, String> {
         overrides: None,
     };
     let api_port = config::api_port(CoreKind::SingBox, &state.settings);
-    let cfg = android_tun::android_config(server, &state.settings, api_port, &ctx)
+    let backups = backup_ids(state, id);
+    let backup_servers: Vec<&Server> = backups
+        .iter()
+        .filter_map(|b| all_servers(state).into_iter().find(|s| &s.id == b))
+        .collect();
+    let cfg = android_tun::android_config(server, &backup_servers, &state.settings, api_port, &ctx)
         .ok_or_else(|| UNSUPPORTED_MESSAGE.to_string())?;
     serde_json::to_string(&cfg).map_err(|e| e.to_string())
 }
@@ -217,5 +299,94 @@ mod tests {
         assert!(server_rows(&state).is_empty());
         assert_eq!(selected_name(&state), "Сервер не выбран");
         assert!(vpn_config_json(&state).is_err());
+    }
+
+    fn srv(id: &str, address: &str) -> Server {
+        Server {
+            id: id.into(),
+            name: id.into(),
+            country: None,
+            address: address.into(),
+            port: 443,
+            credentials: flamix_core::model::Credentials::Vless {
+                uuid: "11111111-1111-1111-1111-111111111111".into(),
+                flow: None,
+                encryption: None,
+            },
+            transport: Default::default(),
+            security: Default::default(),
+            raw_link: None,
+            traffic: None,
+            local_traffic: Default::default(),
+            last_ping_ms: None,
+        }
+    }
+
+    fn exit(state: &mut AppState, id: &str, ip: &str) {
+        state.exit_ips.insert(
+            id.into(),
+            flamix_core::model::ExitIp {
+                ip: ip.into(),
+                checked: 1,
+            },
+        );
+    }
+
+    /// a, c share an exit; b has the same ENTRY address as a but a different exit; d unknown.
+    fn grouped_state() -> AppState {
+        let mut st = AppState {
+            local_servers: vec![
+                srv("a", "same.example"),
+                srv("b", "same.example"),
+                srv("c", "other.example"),
+                srv("d", "same.example"),
+            ],
+            ..Default::default()
+        };
+        exit(&mut st, "a", "9.9.9.9");
+        exit(&mut st, "b", "8.8.8.8");
+        exit(&mut st, "c", "9.9.9.9");
+        st
+    }
+
+    #[test]
+    fn groups_follow_exit_ip_not_entry_address() {
+        let st = grouped_state();
+        let groups = exit_groups(&st);
+        assert_eq!(
+            groups,
+            vec![vec!["a", "c"], vec!["b"], vec!["d"]]
+                .into_iter()
+                .map(|g| g.into_iter().map(String::from).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
+        let rows = server_rows(&st);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["a", "c", "b", "d"]);
+        assert_eq!(rows[0].group, 2);
+        assert_eq!(rows[0].address, "9.9.9.9");
+        assert!(rows[0].is_exit);
+        assert_eq!(rows[2].group, 0);
+        // unknown exit: entry address, flagged as such
+        assert_eq!(rows[3].address, "same.example");
+        assert!(!rows[3].is_exit);
+        assert_eq!(server_id_at(&st, 1).as_deref(), Some("c"));
+    }
+
+    #[test]
+    fn backups_are_same_exit_only() {
+        let mut st = grouped_state();
+        assert_eq!(backup_ids(&st, "a"), ["c"]);
+        assert_eq!(backup_ids(&st, "c"), ["a"]);
+        assert!(
+            backup_ids(&st, "b").is_empty(),
+            "same entry address is not a backup"
+        );
+        assert!(
+            backup_ids(&st, "d").is_empty(),
+            "unknown exit has no backups"
+        );
+        st.settings.failover.backups = vec!["b".into()];
+        assert_eq!(backup_ids(&st, "a"), ["b"], "explicit list wins");
     }
 }

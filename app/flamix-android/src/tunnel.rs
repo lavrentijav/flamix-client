@@ -25,6 +25,7 @@ static RUNNING: Mutex<Option<Running>> = Mutex::new(None);
 static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 
 fn set_error(msg: String) {
+    crate::applog::log("E", "tunnel", &msg);
     *LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()) = msg;
 }
 
@@ -64,9 +65,11 @@ pub fn start(fd: i32, socks_port: u16, mtu: u16) -> Result<(), String> {
                 Ok(rt) => rt,
                 Err(e) => return set_error(format!("runtime: {e}")),
             };
+            crate::applog::log("I", "tunnel", "tun2proxy started");
             let res = rt.block_on(tun2proxy::general_run_async(args, mtu, false, child_token));
-            if let Err(e) = res {
-                set_error(format!("tun2proxy: {e}"));
+            match res {
+                Ok(_) => crate::applog::log("I", "tunnel", "tun2proxy exited normally"),
+                Err(e) => set_error(format!("tun2proxy: {e}")),
             }
         })
         .map_err(|e| format!("thread: {e}"))?;
@@ -78,6 +81,7 @@ pub fn start(fd: i32, socks_port: u16, mtu: u16) -> Result<(), String> {
 pub fn stop() {
     let running = RUNNING.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(r) = running {
+        crate::applog::log("I", "tunnel", "stop requested");
         r.token.cancel();
         let _ = r.thread.join();
     }
