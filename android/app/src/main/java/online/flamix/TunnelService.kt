@@ -23,7 +23,8 @@ import java.net.Socket
  * runs with the app's uid, so its outbound sockets use the underlying network, no protect() needed.
  */
 class TunnelService : VpnService() {
-    private var tun: ParcelFileDescriptor? = null
+    @Volatile private var tun: ParcelFileDescriptor? = null
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val core by lazy { CoreService(this) }
 
     override fun onCreate() {
@@ -37,17 +38,23 @@ class TunnelService : VpnService() {
         when (intent?.action) {
             ACTION_STOP -> {
                 FileLog.i(TAG, "stop requested by app")
-                shutdown()
-                stopSelf()
+                core.stop() // unblocks a start that is still waiting for the core port
+                worker.execute {
+                    shutdown()
+                    stopSelf()
+                }
             }
             ACTION_START -> {
                 // startForegroundService() requires startForeground() within a few seconds.
                 startForegroundCompat()
                 val config = intent.getStringExtra(EXTRA_CONFIG)
-                if (config == null || !startTunnel(config)) {
-                    FileLog.e(TAG, "tunnel start failed (config=${config != null}); stopping service")
-                    shutdown()
-                    stopSelf()
+                // Must not run on the main thread: waitForPort opens sockets (NetworkOnMainThreadException).
+                worker.execute {
+                    if (config == null || !startTunnel(config)) {
+                        FileLog.e(TAG, "tunnel start failed (config=${config != null}); stopping service")
+                        shutdown()
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -81,7 +88,7 @@ class TunnelService : VpnService() {
                 return false
             }
             if (!waitForPort(port)) {
-                FileLog.e(TAG, "core did not open 127.0.0.1:$port (alive=${core.isRunning}); core output:\n${core.logTail().takeLast(30).joinToString("\n")}")
+                FileLog.e(TAG, "core did not open 127.0.0.1:$port (alive=${core.isRunning}, probe=$lastProbeError); core output:\n${core.logTail().takeLast(30).joinToString("\n")}")
                 return false
             }
             val ok = NativeTunnel.start(fd, port, MTU)
@@ -103,6 +110,8 @@ class TunnelService : VpnService() {
         throw IllegalArgumentException("config has no mixed/socks inbound")
     }
 
+    @Volatile private var lastProbeError = ""
+
     private fun waitForPort(port: Int): Boolean {
         val deadline = System.currentTimeMillis() + 20000
         while (System.currentTimeMillis() < deadline) {
@@ -110,7 +119,8 @@ class TunnelService : VpnService() {
             try {
                 Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 200) }
                 return true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                lastProbeError = e.toString()
                 Thread.sleep(100)
             }
         }
