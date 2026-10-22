@@ -409,6 +409,15 @@ fn read_bridge(bridge: &SettingsBridge, base: &Settings) -> Settings {
         tun_strict_route: bridge.get_tun_strict_route(),
         tun_icmp: bridge.get_tun_icmp().to_string(),
         tun_route_exclude: list_from_text(&bridge.get_route_exclude()),
+        // TProxy / AP tether fields are not yet exposed in the Slint settings bridge
+        // (M3 of transparent-proxy); carry through whatever is in the base snapshot so
+        // state round-trips untouched.
+        tproxy_port: base.tproxy_port,
+        tproxy_mark: base.tproxy_mark,
+        tproxy_table: base.tproxy_table,
+        tproxy_route_exclude: base.tproxy_route_exclude.clone(),
+        ap_tether_enabled: base.ap_tether_enabled,
+        ap_interfaces: base.ap_interfaces.clone(),
         mux: bridge.get_mux(),
         mux_concurrency: bridge.get_mux_concurrency().max(1) as u32,
         core_override: {
