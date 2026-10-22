@@ -20,7 +20,7 @@ export component Rail inherits Rectangle {
             border-radius: 8px;
             background: home-ta.has-hover ? Theme.hover : transparent;
             Image {
-                x: 12px;
+                x: root.expanded ? 15px : (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 width: 26px;
                 height: 26px;

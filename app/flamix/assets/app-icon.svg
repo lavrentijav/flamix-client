@@ -2,12 +2,15 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0" stop-color="#C8862E"/>
-      <stop offset="1" stop-color="#7A4A12"/>
+      <stop offset="0" stop-color="#4A4640"/>
+      <stop offset="1" stop-color="#1F1C19"/>
+    </linearGradient>
+    <linearGradient id="flame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#E4E1DC"/>
+      <stop offset="1" stop-color="#9C978F"/>
     </linearGradient>
   </defs>
   <rect width="1024" height="1024" rx="225" fill="url(#bg)"/>
-  <g transform="translate(256 256) scale(21.3333333)" fill="#FFFFFF">
-    <path d="M13 1h-2v11h2V1z"/><path d="M3 12a9 9 0 015-8.064v2.319a7 7 0 108 0v-2.32A9 9 0 113 12z"/>
-  </g>
+  <path fill="url(#flame)" d="M512 176C590 318 716 416 716 590C716 728 624 840 512 840C400 840 308 728 308 590C308 488 360 414 414 362C420 440 446 482 486 504C476 384 486 272 512 176Z"/>
+  <path fill="#1F1C19" fill-opacity="0.35" d="M512 470C548 540 618 594 618 672C618 740 572 790 512 790C452 790 406 740 406 672C406 630 428 596 452 572C456 614 470 636 492 648C486 580 492 520 512 470Z"/>
 </svg>
