@@ -49,6 +49,10 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
           ls "$ANDROID_HOME/platforms"
+          test -f "$ANDROID_HOME/platforms/android-34/android.jar"
+          echo "ANDROID_PLATFORM=android-34" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-34/android.jar" >> "$GITHUB_ENV"
+          echo "ANDROID_BUILD_TOOLS_VERSION=34.0.0" >> "$GITHUB_ENV"
 
       - name: Build native library (cargo-ndk)
         run: |
