@@ -53,11 +53,26 @@ app/flamix/src/android_main.rs     android-activity entry point (slint android b
 
 ## M2: core in the app (proxy-only)
 
-- CI job `singbox` builds sing-box (`SINGBOX_TAG` in `.github/workflows/android.yml`) for `GOOS=android`
-  (arm64 -> `arm64-v8a`, amd64 -> `x86_64`) as `libsingbox.so`; the `apk` job drops it into `jniLibs/`.
+- CI job `singbox` downloads the official prebuilt sing-box (`SINGBOX_TAG` in `.github/workflows/android.yml`,
+  android arm64 -> `arm64-v8a`, amd64 -> `x86_64`), checks the pinned SHA256 and installs it as `libsingbox.so`; the `apk` job drops it into `jniLibs/`.
 - `CoreService.kt` runs it from `nativeLibraryDir` with the sample config `assets/singbox-sample.json`
   (mixed inbound `127.0.0.1:10808`, direct outbound), copied to `filesDir` on start.
 - Debug trigger (debuggable builds only):
   `adb shell am start -n online.flamix.client/online.flamix.MainActivity --es core start` (or `--es core stop`).
   Log tag `FlamixCore`.
 - `scripts/android-m2-check.sh <apk>` does this on an emulator; CI job `emulator` runs it (optional, `continue-on-error`).
+
+## Release
+
+- Signing: `android/app/build.gradle.kts` signs `release` only when `ANDROID_KEYSTORE_PATH` is set
+  (PKCS12; also `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD`). Without it the release APK is
+  unsigned and debug builds are unchanged.
+- **The signing key must never change.** Android only installs an update if it is signed with the same key as the
+  installed app; a new key means users must uninstall first. Keep a backup of the keystore outside GitHub.
+- Secrets (repository secrets): `ANDROID_KEYSTORE_BASE64` (base64 of the PKCS12, alias `flamix`),
+  `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_PASSWORD`, `ANDROID_KEY_ALIAS`. The `release` job decodes the keystore into
+  `$RUNNER_TEMP`, deletes it at the end, and never commits it.
+- Cut a release: `git tag vX.Y.Z && git push origin vX.Y.Z`. CI builds `Flamix-X.Y.Z-arm64-v8a.apk` and
+  `Flamix-X.Y.Z-x86_64.apk`, verifies them with `apksigner`, and attaches them with `SHA256SUMS.txt` to the GitHub release.
+  versionName = tag, versionCode = major*1000000 + minor*1000 + patch. `workflow_dispatch` builds the APKs as an artifact only.
+- Bumping sing-box: change `SINGBOX_TAG`, `SINGBOX_VERSION` and both `SINGBOX_SHA256_*` (digests from the release assets API).
