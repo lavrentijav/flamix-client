@@ -250,8 +250,8 @@ jobs:
           target: google_apis
           disable-animations: true
           script: |
-            scripts/android-m2-check.sh apk/app-debug.apk || true
             scripts/android-diag.sh apk/app-debug.apk diag
+            scripts/android-m2-check.sh apk/app-debug.apk || true
 
       - name: Upload emulator diagnostics
         if: always()

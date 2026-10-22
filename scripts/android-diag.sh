@@ -20,6 +20,9 @@ SEED='{"version":1,"selected_server":"diag1","local_servers":[{"id":"diag1","nam
 adb shell "run-as $PKG sh -c 'mkdir -p files; cat > files/state.json'" <<<"$SEED" || echo "run-as seed failed"
 adb shell "run-as $PKG ls -l files"
 
+adb shell settings put global hide_error_dialogs 1 || true   # a launcher ANR dialog once swallowed the tap
+adb shell am force-stop "$PKG"
+adb shell "run-as $PKG rm -f files/flamix.log files/flamix.log.1" || true
 adb logcat -c
 step "launch normally (launcher intent)"
 adb shell monkey -p "$PKG" -c android.intent.category.LAUNCHER 1
