@@ -28,7 +28,12 @@ adb shell "cat /proc/net/tcp /proc/net/tcp6 | grep -i ':2A38'" && echo "listenin
 
 step "forwarded curl via proxy (informational)"
 adb forward tcp:10808 tcp:10808
-curl -sS -m 15 -x socks5h://127.0.0.1:10808 -o /dev/null -w 'http=%{http_code}\n' http://example.com || echo "curl via proxy failed (not fatal)"
+echo "-- direct internet check from the host (no proxy)"
+curl -sS -m 15 -o /dev/null -w 'host http=%{http_code}\n' http://example.com || echo "host curl failed"
+echo "-- IP literal via proxy (no DNS)"
+curl -sS -m 20 -x socks5h://127.0.0.1:10808 -o /dev/null -w 'proxy ip-literal http=%{http_code}\n' http://1.1.1.1/ || echo "proxy ip-literal failed (not fatal)"
+echo "-- domain via proxy"
+curl -sS -m 20 -x socks5h://127.0.0.1:10808 -o /dev/null -w 'proxy domain http=%{http_code}\n' http://example.com || echo "proxy domain failed (not fatal)"
 
 step "stop core"; adb shell am start -n "$PKG/online.flamix.MainActivity" --es core stop; sleep 5
 adb shell "ps -A" | grep libsingbox && echo "WARN: still running after stop" || echo "OK: stopped"
