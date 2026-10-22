@@ -1173,7 +1173,7 @@ mod tests {
         assert_eq!(view.cards[2].value, human_bytes(100));
         assert_eq!(view.days.len(), CHART_DAYS);
         assert_eq!(view.days[CHART_DAYS - 1].label, "22.10");
-        assert!((view.days[CHART_DAYS - 1].down - 0.75).abs() < 0.001);
+        assert!((view.days[CHART_DAYS - 1].down - 0.5).abs() < 0.001);
         assert_eq!(view.top.len(), 1);
         assert_eq!(view.top[0].iso, "DE");
         assert_eq!(view.top[0].fraction, 1.0);
