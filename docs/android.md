@@ -62,6 +62,19 @@ app/flamix/src/android_main.rs     android-activity entry point (slint android b
   Log tag `FlamixCore`.
 - `scripts/android-m2-check.sh <apk>` does this on an emulator; CI job `emulator` runs it (optional, `continue-on-error`).
 
+## M4: phone screen (first slice)
+
+- Window: `app/flamix-android/ui/android.slint` (`AndroidWindow`), built by `build.rs`. Top bar "Flamix", round connect
+  button (power icon), selected server, server list (tap to select), bottom tabs Серверы / Добавить / Настройки.
+  Settings is a placeholder.
+- State: `<files dir>/state.json` via `flamix_core::store::load/save`, files dir from `AndroidApp::internal_data_path()`.
+  Logic and unit tests: `app/flamix-android/src/phone.rs`.
+- Add: `subscription::update` on a plain thread; the result is applied on the UI thread through `invoke_from_event_loop`.
+  The clipboard button is not done yet.
+- Connect: `phone::vpn_config_json` -> `android_tun::android_config` -> `bridge.rs` JNI call to
+  `online.flamix.FlamixBridge.connect` (Kotlin) -> `MainActivity.startVpn` (consent) -> `FlamixVpn.start`.
+  The button state is polled from `FlamixBridge.isRunning` once per second.
+
 ## Release
 
 - Signing: `android/app/build.gradle.kts` signs `release` only when `ANDROID_KEYSTORE_PATH` is set

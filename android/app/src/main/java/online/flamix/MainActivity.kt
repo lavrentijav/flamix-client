@@ -19,6 +19,7 @@ class MainActivity : NativeActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        FlamixBridge.attach(this)
         handleDebugIntent(intent)
     }
 
@@ -67,6 +68,7 @@ class MainActivity : NativeActivity() {
     }
 
     override fun onDestroy() {
+        FlamixBridge.detach(this)
         core.stop()
         super.onDestroy()
     }
