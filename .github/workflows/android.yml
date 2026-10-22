@@ -41,11 +41,14 @@ jobs:
         with:
           tool: cargo-ndk
 
-      - name: Show Android SDK / NDK
+      - name: Install Android platform 34 (Slint build script needs android.jar)
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
-          ls "$ANDROID_HOME/ndk" || true
+          ls "$ANDROID_HOME" "$ANDROID_HOME/platforms" 2>&1 || true
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+          ls "$ANDROID_HOME/platforms"
 
       - name: Build native library (cargo-ndk)
         run: |
