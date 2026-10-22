@@ -1,0 +1,147 @@
+//! sing-box config for the Android `VpnService` mode (milestone M3).
+//!
+//! Data path: the TUN fd from `VpnService.Builder.establish()` is read by tun2proxy inside the app
+//! (`app/flamix-android/src/tunnel.rs`) and forwarded to a local SOCKS5 inbound of sing-box. The
+//! stock sing-box binary cannot take a TUN fd (`file_descriptor` is not a config option; it is
+//! only injected by libbox), so the core runs in the plain proxy shape: the regular
+//! [`crate::config::singbox`] config with a `mixed` inbound on `127.0.0.1`, same proxy outbound,
+//! DNS and routing. Per-app exclusion (the app itself is not tunnelled) is done by the VPN builder.
+
+use crate::config::singbox;
+use crate::config::ConnectContext;
+use crate::model::{Server, Settings};
+use serde_json::Value;
+
+/// MTU of the `VpnService` interface (must equal `Builder.setMtu`).
+pub const ANDROID_TUN_MTU: u32 = 1500;
+/// Interface address (must equal `Builder.addAddress("172.19.0.1", 30)`).
+pub const ANDROID_TUN_ADDRESS: &str = "172.19.0.1/30";
+
+/// Builds the sing-box config the Android VPN service runs.
+///
+/// Compared to the desktop proxy config: the `mixed` inbound is forced to `127.0.0.1` (never LAN)
+/// and has no `users` (tun2proxy connects without credentials; the port is loopback-only).
+/// Returns `None` when the server has no sing-box outbound (e.g. xhttp, which needs Xray).
+pub fn android_config(
+    server: &Server,
+    settings: &Settings,
+    api_port: u16,
+    ctx: &ConnectContext,
+) -> Option<Value> {
+    singbox::outbound(server, settings)?;
+    let mut cfg = singbox::full_config_with(server, settings, false, None, api_port, ctx);
+    for inbound in cfg.get_mut("inbounds")?.as_array_mut()? {
+        if inbound["type"] == "mixed" {
+            let ib = inbound.as_object_mut()?;
+            ib.insert("listen".into(), "127.0.0.1".into());
+            ib.remove("users");
+        }
+    }
+    Some(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Credentials, Network, Security, Transport};
+    use serde_json::json;
+
+    fn vless() -> Server {
+        Server {
+            id: "t".into(),
+            name: "t".into(),
+            country: None,
+            address: "example.com".into(),
+            port: 443,
+            credentials: Credentials::Vless {
+                uuid: "11111111-1111-1111-1111-111111111111".into(),
+                flow: None,
+                encryption: None,
+            },
+            transport: Transport::default(),
+            security: Security::default(),
+            raw_link: None,
+            traffic: None,
+            local_traffic: Default::default(),
+            last_ping_ms: None,
+        }
+    }
+
+    fn cfg(settings: &Settings) -> Value {
+        android_config(&vless(), settings, 9090, &ConnectContext::default()).unwrap()
+    }
+
+    #[test]
+    fn android_inbound_is_loopback_mixed_without_auth() {
+        let s = Settings {
+            allow_lan: true,
+            local_auth_user: "u".into(),
+            local_auth_pass: "p".into(),
+            ..Settings::default()
+        };
+        let c = cfg(&s);
+        let inbounds = c["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0]["type"], json!("mixed"));
+        assert_eq!(inbounds[0]["listen"], json!("127.0.0.1"));
+        assert_eq!(inbounds[0]["listen_port"], json!(s.socks_port));
+        assert!(inbounds[0].get("users").is_none());
+    }
+
+    #[test]
+    fn android_config_reuses_proxy_outbound_and_dns() {
+        let c = cfg(&Settings::default());
+        let proxy = c["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == json!("proxy"))
+            .unwrap();
+        assert_eq!(
+            *proxy,
+            singbox::outbound(&vless(), &Settings::default()).unwrap()
+        );
+        assert!(c["dns"]["servers"]
+            .as_array()
+            .is_some_and(|s| !s.is_empty()));
+        let rules = c["route"]["rules"].as_array().unwrap();
+        assert!(rules.iter().any(|r| r["action"] == json!("hijack-dns")));
+    }
+
+    #[test]
+    fn android_config_none_for_non_singbox_server() {
+        let mut s = vless();
+        s.transport.network = Network::Xhttp;
+        assert!(
+            android_config(&s, &Settings::default(), 9090, &ConnectContext::default()).is_none()
+        );
+    }
+
+    /// `sing-box check` on the generated config (real binary via FLAMIX_SINGBOX_BIN).
+    #[test]
+    #[ignore = "needs FLAMIX_SINGBOX_BIN"]
+    fn android_config_passes_singbox_check() {
+        let Ok(bin) = std::env::var("FLAMIX_SINGBOX_BIN") else {
+            return;
+        };
+        let path = std::env::temp_dir().join(format!("flamix-android-{}.json", std::process::id()));
+        std::fs::write(
+            &path,
+            serde_json::to_string(&cfg(&Settings::default())).unwrap(),
+        )
+        .unwrap();
+        let out = std::process::Command::new(bin)
+            .args(["check", "-c"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+        let msg = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "sing-box check failed:\n{msg}");
+        assert!(!msg.to_lowercase().contains("deprecat"), "{msg}");
+    }
+}
