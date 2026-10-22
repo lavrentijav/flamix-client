@@ -15,56 +15,40 @@ Cross-platform VPN/proxy client written in Rust, with a Slint UI (WinUI 3 / Flue
 Flamix is an open client that runs the external **Xray-core** and **sing-box** cores (like v2rayN) and
 brings the features of Happ, v2RayTun and v2rayN into one application.
 
-<!-- A screenshot will be added in upcoming builds: ![Flamix main window](docs/design/screenshot-main.png) -->
+## Screenshots
 
-![Main window mockup](docs/design/main-window.png)
+Dark theme, all tabs (taken with demo data).
 
-*Main window mockup.*
+| Servers | Add |
+|---|---|
+| ![Servers](docs/screenshots/servers.png) | ![Add](docs/screenshots/add.png) |
+| **Routing** | **Settings** |
+| ![Routing](docs/screenshots/routing.png) | ![Settings](docs/screenshots/settings.png) |
+| **Statistics** | **About** |
+| ![Statistics](docs/screenshots/stats.png) | ![About](docs/screenshots/about.png) |
 
 ## Features
 
-**Protocols**
-- VLESS (Reality, XTLS Vision, XHTTP), VMess, Trojan, Shadowsocks (SIP002, plugins)
-- Hysteria2 (port hopping), TUIC, WireGuard, SOCKS, HTTP
-- Transports: TCP/RAW, WS, gRPC, HTTPUpgrade, XHTTP, H2, mKCP, QUIC
+The window has a tab rail on the left, the server list in the middle and the connection panel on the right.
 
-**Modes**
-- **Proxy** — system proxy, local SOCKS5 `10808` and HTTP `10809`
-- **TUN** — whole-system tunnel (requires administrator/root)
+- **Servers** — subscriptions that can be collapsed and pinned, traffic bars for the subscription and for single
+  servers, latency tests (TCP and through the core), search, sorting by ping, exit IP check, update all subscriptions.
+- **Add** — subscription by URL (with a name and backup addresses), a list of share links (`vless://`, `vmess://`,
+  `trojan://`, `ss://`, `hy2://` and others, one per line), import from the clipboard.
+- **Routing** — presets "Global", "RU bypass" and "Custom rules"; a switch for the Anixart mirror (direct or via the
+  proxy); your own rules by domains, IPs and processes with the actions "proxy", "direct", "block"; routing pushed
+  by the provider.
+- **Settings** — Proxy or TUN mode, core choice (Auto, Xray, sing-box, mihomo), ports, LAN access, system proxy, UDP,
+  sniffing, TUN parameters, DNS, the ping test address, geo data, autostart, theme.
+- **Statistics** — traffic for the last 30 days and the most used servers.
+- **About** — version, core versions, licenses, backup of settings and subscriptions.
 
-**Subscriptions**
-- Formats: base64, plain link list, Xray/sing-box JSON, Clash YAML
-- Headers `subscription-userinfo`, `profile-title`, `profile-update-interval`, `support-url`,
-  `profile-web-page-url`, `announce`
-- Remnawave-compatible HWID headers
-- **Backup subscription URLs** (`profile-backup-urls`) and **per-server traffic**
-  (`server-userinfo` / `userinfo=` parameter) — see the [specification](docs/subscription-headers.md)
+**Protocols:** VLESS (Reality, XTLS Vision, XHTTP), VMess, Trojan, Shadowsocks (SIP002, plugins),
+Hysteria2 (port hopping), TUIC, WireGuard, SOCKS, HTTP.
+**Transports:** TCP/RAW, WS, gRPC, HTTPUpgrade, XHTTP, H2, mKCP, QUIC.
 
-**Links and import**
-- Own scheme `flamix://import/<url>`
-- Understands other clients' links: `happ://add/…`, `v2raytun://import/…`, `v2rayng://install-sub?url=…`,
-  `clash://install-config?url=…`, `sing-box://import-remote-profile?url=…`
-- Import from clipboard
-
-**Routing and diagnostics**
-- Presets: Global, "Bypass RU" (RU sites and IPs direct, ads blocked), Custom (domains, IPs, processes in TUN)
-- Ping: TCP and a real URL test through the core
-- Per-subscription traffic bar and per-server traffic bar (core data)
-
-**Desktop UI (in progress)**
-- Slint app: server list, server selection and ping, tray, autostart, light/dark theme, RU/EN
-
-The client core (share-link and subscription parsing, core config generation, ping, system layer) is
-implemented; the graphical interface is under active development.
-
-**Backup servers and multi-traffic (planned)**
-- A primary server plus an ordered list of backups kept warm.
-- New connections switch instantly when the primary dies; during the switch the client "freezes" instead of
-  failing (apps see a slow connect, not an error).
-- Seamless UDP/QUIC when backups share the same exit IP (the flow survives the switch).
-- Load-balance mode and per-routing-rule server choice.
-- To be honest: existing TCP connections cannot be migrated to another server — the app reconnects by itself.
-- Design and details — in [docs/failover.md](docs/failover.md).
+Cores: **Xray-core** for most protocols, **sing-box** for Hysteria2 and TUIC, **mihomo** as an optional core.
+"Auto" picks the core for each server's protocol.
 
 ## Comparison
 
@@ -99,29 +83,51 @@ see **[docs/install.md](docs/install.md)**.
 
 ## Quick start
 
-1. **Add a subscription**: "Add" → paste the subscription URL (or a `flamix://…` / `vless://…` link from the clipboard).
-2. **Pick a server** in the list (the "Ping test" button shows latency).
-3. **Connect**: **Proxy** mode (system proxy + local SOCKS5/HTTP) or **TUN** (whole traffic,
-   requires administrator/root).
-4. Refresh the subscription with the "Refresh" button — if the primary URL is down, the client switches to a backup.
+1. **Add a subscription.** Open the "Add" tab and paste the subscription URL. You can also copy a link
+   (`flamix://…`, `happ://…`, `v2raytun://…`, `vless://…` and others) and press "From clipboard".
+2. **Pick a server** in the list. The "Ping test" button shows its latency.
+3. **Connect** with the power button on the right. **Proxy** mode sets the system proxy and opens local
+   SOCKS5 `10808` and HTTP `10809`. **TUN** mode routes all system traffic and needs administrator or root rights.
+4. **Choose routing** on the "Routing" tab. "RU bypass" is usually the right choice for Russian sites.
+5. **Update the subscription** with the button on its card. If the main address fails, the client tries the backups.
 
-Routing presets (Global, "Bypass RU", Custom) are configured on the **Routing** page.
+If a server does not connect, try another core on the "Settings" tab → "Core". TUN on Windows needs administrator
+rights; the client offers to restart with them.
 
 ## For providers
 
-Flamix reads the standard subscription headers (`subscription-userinfo`, `profile-title`,
-`profile-update-interval`, `support-url`, `profile-web-page-url`, `announce`), Remnawave-compatible
-HWID headers, and two optional extensions:
+Flamix reads subscription headers the same way Happ and v2RayTun do, and adds a few features of its own.
+The full list and formats are in **[docs/subscription-headers.md](docs/subscription-headers.md)**. In short:
 
-- **Backup subscription URLs** — `profile-backup-urls: https://a.example/sub, https://b.example/sub`
-- **Per-server traffic** — the `server-userinfo` header or the `userinfo=` parameter in a link:
+| Header | What the client does with it |
+|---|---|
+| `profile-title` | subscription name (`base64:` allowed) |
+| `subscription-userinfo` | subscription traffic and expiry |
+| `profile-update-interval` | auto-update interval in hours |
+| `support-url` | support button; `t.me` and `tg://` links get the Telegram icon, `mailto:` gets an envelope |
+| `profile-web-page-url` | website button; shown only when the header is set |
+| `announce` | announcement text above the servers |
+| `sub-info-text`, `sub-info-color`, `sub-info-button-text`, `sub-info-button-link` | banner: text, colour (`red`, `blue`, `green`), button |
+| `sub-expire`, `sub-expire-button-link` | expiry notice (replaces the banner) |
+| `profile-backup-urls` (aliases `fallback-url`, `fallback-urls`, `backup-urls`) | backup subscription addresses |
+| `server-userinfo` and the `userinfo=` link parameter | traffic and expiry per server |
+| `providerid` | provider id (header, `#providerid X` in the body, or URL fragment) |
+| `update-always` | update the subscription on every app start |
+| `network-filter` | keep only servers with the given transport or protocol |
+| `subscription-refill-date` | traffic reset date |
+| `routing`, `routing-enable` | provider routing (`happ://routing/…` link or base64 JSON) |
+| `new-url`, `new-domain` | replace the subscription address |
+| `x-hwid-limit`, `x-hwid-active`, `x-hwid-max-devices-reached`, `x-hwid-not-supported` | device limit from the panel's response |
+| `socks-auth-*`, `http-auth-*` | authentication on the client's local ports |
+
+When requesting a subscription the client sends an `x-hwid` header and a `User-Agent: Flamix/…` header.
+Keys the client does not use yet are stored and do not break subscription parsing.
+
+Example of per-server traffic in a link:
 
 ```
 vless://uuid@de1.example.com:443?type=ws&security=tls&userinfo=download%3D5368709120%3Btotal%3D53687091200#🇩🇪 Germany
 ```
-
-Full specification of formats, headers and body metadata — see
-**[docs/subscription-headers.md](docs/subscription-headers.md)**.
 
 ## Build from source
 
