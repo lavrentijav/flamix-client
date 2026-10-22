@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/flamix-core", "crates/flamix-sys", "app/flamix"]
+members = ["crates/flamix-core", "crates/flamix-sys", "app/flamix", "app/flamix-android"]
 
 [workspace.package]
 version = "0.3.0"

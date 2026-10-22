@@ -1,0 +1,20 @@
+[package]
+name = "flamix-android"
+description = "Flamix Android shell (cdylib loaded by NativeActivity)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "flamix_android"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Slint's android backend (android-activity 0.6). Safe to enable on every target; on the
+# host it is simply unused. Renderer: femtovg (same as the desktop app).
+slint = { version = "1", default-features = false, features = ["std", "compat-1-2", "backend-android-activity-06", "renderer-femtovg"] }
+
+[lints]
+workspace = true
