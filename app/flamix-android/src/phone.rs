@@ -6,7 +6,7 @@
 //! touches the file itself.
 
 use flamix_core::config::{self, android_tun, ConnectContext, CoreKind};
-use flamix_core::model::{AppState, Server, Subscription};
+use flamix_core::model::{AppState, RoutingPreset, RoutingRule, RuleAction, Server, Subscription};
 use flamix_core::provider_routing::RoutingLinkAction;
 use flamix_core::{deeplink, link, store, subscription};
 use std::path::Path;
@@ -726,6 +726,149 @@ fn apply_routing(state: &mut AppState, action: RoutingLinkAction) -> Imported {
     }
 }
 
+/// One custom routing rule as the routing tab shows it. `kind` is the value list shown first
+/// (0 domains, 1 IP/subnets, 2 processes): the first non-empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleCard {
+    pub index: usize,
+    /// 0 proxy, 1 direct, 2 block.
+    pub action: i32,
+    pub enabled: bool,
+    pub kind: i32,
+    pub domains: String,
+    pub ips: String,
+    pub processes: String,
+}
+
+/// One subscription row of the provider-routing section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCard {
+    pub id: String,
+    pub name: String,
+    pub rules_text: String,
+    /// The provider routing profile is switched on.
+    pub enabled: bool,
+    /// The user ignores the provider routing of this subscription.
+    pub ignored: bool,
+}
+
+/// Routing preset index used by the UI: 0 Global, 1 Обход РФ, 2 Свои правила.
+pub fn preset_index(preset: RoutingPreset) -> i32 {
+    match preset {
+        RoutingPreset::Global => 0,
+        RoutingPreset::BypassRu => 1,
+        RoutingPreset::Custom => 2,
+    }
+}
+
+pub fn preset_from_index(index: i32) -> RoutingPreset {
+    match index {
+        0 => RoutingPreset::Global,
+        1 => RoutingPreset::BypassRu,
+        _ => RoutingPreset::Custom,
+    }
+}
+
+/// Domain strategy names in the order of the UI chips.
+pub const DOMAIN_STRATEGIES: [&str; 3] = ["AsIs", "IPIfNonMatch", "IPOnDemand"];
+
+/// Rule value lists, in UI order: domains, IPs, processes.
+fn rule_lists(rule: &RoutingRule) -> [&Vec<String>; 3] {
+    [&rule.domains, &rule.ips, &rule.processes]
+}
+
+pub fn rule_cards(state: &AppState) -> Vec<RuleCard> {
+    state
+        .settings
+        .routing
+        .custom_rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let text = |list: &Vec<String>| list.join("\n");
+            let kind = rule_lists(rule)
+                .iter()
+                .position(|list| !list.is_empty())
+                .unwrap_or(0);
+            RuleCard {
+                index,
+                action: match rule.action {
+                    RuleAction::Proxy => 0,
+                    RuleAction::Direct => 1,
+                    RuleAction::Block => 2,
+                },
+                enabled: rule.enabled,
+                kind: i32::try_from(kind).unwrap_or(0),
+                domains: text(&rule.domains),
+                ips: text(&rule.ips),
+                processes: text(&rule.processes),
+            }
+        })
+        .collect()
+}
+
+/// Values typed into one rule field: one per line or comma, trimmed, empty ones dropped.
+pub fn rule_values(text: &str) -> Vec<String> {
+    text.split(['\n', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// First validation problem of the custom rules ("" when valid).
+pub fn routing_error(state: &AppState) -> String {
+    for (index, rule) in state.settings.routing.custom_rules.iter().enumerate() {
+        if rule.enabled && rule_lists(rule).iter().all(|list| list.is_empty()) {
+            return format!("Правило {}: хотя бы одно значение", index + 1);
+        }
+    }
+    String::new()
+}
+
+/// Russian plural for a rule count ("1 правило", "2 правила", "5 правил").
+pub fn rules_label(count: usize) -> String {
+    let (n10, n100) = (count % 10, count % 100);
+    let word = if n10 == 1 && n100 != 11 {
+        "правило"
+    } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+        "правила"
+    } else {
+        "правил"
+    };
+    format!("{count} {word}")
+}
+
+/// Subscriptions with provider routing (or with the ignore flag set).
+pub fn provider_cards(state: &AppState) -> Vec<ProviderCard> {
+    state
+        .subscriptions
+        .iter()
+        .filter_map(|sub| {
+            let routing = sub.provider.routing.as_ref();
+            if routing.is_none() && !sub.options.ignore_provider_routing {
+                return None;
+            }
+            let count = routing.map_or(0, |r| r.rules.len());
+            Some(ProviderCard {
+                id: sub.id.clone(),
+                name: if sub.name.is_empty() {
+                    sub.url.clone()
+                } else {
+                    sub.name.clone()
+                },
+                rules_text: if routing.is_some() {
+                    rules_label(count)
+                } else {
+                    String::new()
+                },
+                enabled: routing.is_some_and(|r| r.enabled),
+                ignored: sub.options.ignore_provider_routing,
+            })
+        })
+        .collect()
+}
+
 /// Random lowercase hex id (same scheme as the desktop controller).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -783,6 +926,45 @@ mod tests {
         assert_eq!(state.subscriptions.len(), 1);
         assert!(import_text(&dir, "hello world").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rule_values_and_plural() {
+        assert_eq!(
+            rule_values(" geosite:ru,\n domain:a.com \n\n"),
+            ["geosite:ru", "domain:a.com"]
+        );
+        assert_eq!(rules_label(1), "1 правило");
+        assert_eq!(rules_label(3), "3 правила");
+        assert_eq!(rules_label(11), "11 правил");
+        assert_eq!(rules_label(22), "22 правила");
+    }
+
+    #[test]
+    fn custom_rules_validation_and_kind() {
+        let mut st = AppState::default();
+        st.settings.routing.custom_rules.push(RoutingRule {
+            domains: Vec::new(),
+            ips: vec!["10.0.0.0/8".into()],
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Direct,
+            enabled: true,
+        });
+        assert_eq!(routing_error(&st), "");
+        let cards = rule_cards(&st);
+        assert_eq!((cards[0].kind, cards[0].action), (1, 1));
+        st.settings.routing.custom_rules.push(RoutingRule {
+            domains: Vec::new(),
+            ips: Vec::new(),
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Block,
+            enabled: true,
+        });
+        assert_eq!(routing_error(&st), "Правило 2: хотя бы одно значение");
     }
 
     #[test]

@@ -39,6 +39,27 @@ export struct PhoneServer {
     quota-text: string,
 }
 
+/// One custom routing rule (routing tab). `kind`: 0 domains, 1 IPs, 2 processes (first shown).
+export struct PhoneRule {
+    index: int,
+    /// 0 proxy, 1 direct, 2 block
+    action: int,
+    enabled: bool,
+    kind: int,
+    domains: string,
+    ips: string,
+    processes: string,
+}
+
+/// One subscription row of the provider-routing section.
+export struct PhoneProvider {
+    id: string,
+    name: string,
+    rules-text: string,
+    enabled: bool,
+    ignored: bool,
+}
+
 /// One subscription card of the servers tab (see phone.rs `SubCard`).
 export struct PhoneSub {
     id: string,
@@ -71,6 +92,8 @@ component BottomTab inherits Rectangle {
     in property <image> icon;
     in property <bool> active;
     callback clicked();
+    horizontal-stretch: 1;
+    min-width: lbl.preferred-width + 12px;
     background: transparent;
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -87,10 +110,10 @@ component BottomTab inherits Rectangle {
                 colorize: root.active ? Theme.accent : Theme.muted;
             }
         }
-        Text {
+        lbl := Text {
             text: root.label;
             color: root.active ? Theme.accent : Theme.muted;
-            font-size: 12px;
+            font-size: 11px;
             horizontal-alignment: center;
         }
     }
@@ -113,6 +136,28 @@ component IconBtn inherits Rectangle {
         height: 22px;
         source: root.icon;
         colorize: root.tint;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Selectable chip (48 dp high touch target).
+component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> selected: false;
+    in property <color> tint: Theme.accent;
+    callback clicked();
+    height: 48px;
+    border-radius: 10px;
+    background: root.selected ? root.tint : (ta.has-hover ? Theme.hover : Theme.card-header);
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: root.selected ? Theme.on-accent : Theme.text;
+        font-size: 13px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        overflow: elide;
     }
     ta := TouchArea { clicked => { root.clicked(); } }
 }
@@ -238,6 +283,7 @@ component SubCardView inherits Rectangle {
     callback refresh();
     callback settings();
     callback open-url(string);
+
     callback select-server(string);
 
     background: Theme.card-body;
@@ -442,6 +488,66 @@ component SubCardView inherits Rectangle {
     }
 }
 
+// One custom rule: action chips, enable switch, delete, value kind and the value text.
+component RuleView inherits Rectangle {
+    in property <PhoneRule> rule;
+    in-out property <int> current-kind: rule.kind;
+    callback action-changed(int);
+    callback enabled-changed(bool);
+    callback delete-rule();
+    callback values-edited(int, string);
+    background: Theme.card-header;
+    border-radius: Theme.radius;
+    height: rule-col.preferred-height + 24px;
+    rule-col := VerticalLayout {
+        x: 10px;
+        y: 12px;
+        width: parent.width - 20px;
+        spacing: 8px;
+        HorizontalLayout {
+            spacing: 6px;
+            Chip { horizontal-stretch: 1; text: "Прокси"; selected: root.rule.action == 0; clicked => { root.action-changed(0); } }
+            Chip { horizontal-stretch: 1; text: "Напрямую"; selected: root.rule.action == 1; tint: Theme.success; clicked => { root.action-changed(1); } }
+            Chip { horizontal-stretch: 1; text: "Блок"; selected: root.rule.action == 2; tint: Theme.danger; clicked => { root.action-changed(2); } }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Chip { horizontal-stretch: 1; text: "Домены"; selected: root.current-kind == 0; clicked => { root.current-kind = 0; } }
+            Chip { horizontal-stretch: 1; text: "IP / подсети"; selected: root.current-kind == 1; clicked => { root.current-kind = 1; } }
+            Chip { horizontal-stretch: 1; text: "Процессы"; selected: root.current-kind == 2; clicked => { root.current-kind = 2; } }
+        }
+        TextEdit {
+            height: 84px;
+            font-size: 14px;
+            placeholder-text: root.current-kind == 0 ? "geosite:category-ru, domain:example.com"
+                : root.current-kind == 1 ? "geoip:ru, 10.0.0.0/8"
+                : "telegram.exe, Discord.exe";
+            text: root.current-kind == 0 ? root.rule.domains : root.current-kind == 1 ? root.rule.ips : root.rule.processes;
+            edited => { root.values-edited(root.current-kind, self.text); }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: space-between;
+            cross-axis-alignment: center;
+            Switch {
+                text: root.rule.enabled ? "Включено" : "Выключено";
+                checked: root.rule.enabled;
+                toggled => { root.enabled-changed(self.checked); }
+            }
+            Rectangle {
+                width: 110px;
+                height: 48px;
+                border-radius: Theme.radius;
+                background: del-ta.has-hover ? Theme.hover : transparent;
+                Text { width: parent.width; height: parent.height; text: "Удалить"; color: Theme.danger; font-size: 14px;
+                    horizontal-alignment: center; vertical-alignment: center; }
+                del-ta := TouchArea { clicked => { root.delete-rule(); } }
+            }
+        }
+    }
+}
+
 export component AndroidWindow inherits Window {
     title: "Flamix";
     background: Theme.window-bg;
@@ -454,7 +560,7 @@ export component AndroidWindow inherits Window {
     in property <string> connect-label: "Подключить";
     in property <bool> connected: false;
     in property <string> add-status: "";
-    in-out property <int> tab: 0;   // 0 = Серверы, 1 = Добавить, 2 = Настройки
+    in-out property <int> tab: 0;   // 0 Серверы, 1 Добавить, 2 Маршрутизация, 3 Настройки, 4 Статистика
 
     callback select-server(string);
     callback connect-pressed();
@@ -466,6 +572,26 @@ export component AndroidWindow inherits Window {
     callback sub-save(string, bool);
     callback sub-delete();
     callback open-url(string);
+    // Routing tab
+    in property <int> routing-preset: 0;
+    in property <int> routing-mirror: 0;
+    in property <int> routing-strategy: 1;
+    in property <bool> routing-quic: false;
+    in property <[PhoneRule]> rules;
+    in property <string> routing-error: "";
+    in property <string> rules-summary: "";
+    in property <[PhoneProvider]> providers;
+    callback routing-preset-changed(int);
+    callback routing-mirror-changed(int);
+    callback routing-strategy-changed(int);
+    callback routing-quic-changed(bool);
+    callback rule-add();
+    callback rule-action-changed(int, int);
+    callback rule-enabled-changed(int, bool);
+    callback rule-delete(int);
+    callback rule-values-changed(int, int, string);
+    callback provider-enabled-changed(string, bool);
+    callback provider-ignored-changed(string, bool);
 
     // Subscription settings sheet (opened by a card's settings button).
     in-out property <bool> sheet-open: false;
@@ -686,8 +812,218 @@ export component AndroidWindow inherits Window {
                 }
             }
 
+            // Маршрутизация: presets, Anixart mirror, custom rules, extra, provider routing
+            if root.tab == 2 : ScrollView {
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 12px;
+
+                    Text { text: "Пресеты"; color: Theme.muted; font-size: 13px; }
+                    for preset[i] in [
+                        { title: "Global", description: "Весь трафик через прокси" },
+                        { title: "Обход РФ", description: "РФ-сайты напрямую, реклама блокируется" },
+                        { title: "Свои правила", description: "Только ваши правила, остальное через прокси" },
+                    ] : Rectangle {
+                        height: 64px;
+                        border-radius: Theme.radius;
+                        background: root.routing-preset == i ? Theme.accent.with-alpha(0.22)
+                            : (preset-ta.has-hover ? Theme.hover : Theme.card-body);
+                        border-width: root.routing-preset == i ? 1px : 0px;
+                        border-color: Theme.accent;
+                        VerticalLayout {
+                            x: 14px;
+                            y: 8px;
+                            width: parent.width - 28px;
+                            height: parent.height - 16px;
+                            alignment: center;
+                            spacing: 2px;
+                            Text { text: preset.title; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: preset.description; color: Theme.muted; font-size: 12px; overflow: elide; }
+                        }
+                        preset-ta := TouchArea { clicked => { root.routing-preset-changed(i); } }
+                    }
+
+                    if root.routing-preset == 1 : Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: mirror-col.preferred-height + 24px;
+                        mirror-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Зеркало Anixart"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Chip { horizontal-stretch: 1; text: "Напрямую"; selected: root.routing-mirror == 0; clicked => { root.routing-mirror-changed(0); } }
+                                Chip { horizontal-stretch: 1; text: "Через прокси"; selected: root.routing-mirror == 1; clicked => { root.routing-mirror-changed(1); } }
+                            }
+                            Text {
+                                text: "Куда идут anixart.tv и anixstatic.com: напрямую (по умолчанию в РФ) или через прокси, если зеркало недоступно.";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: rules-col.preferred-height + 24px;
+                        rules-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 10px;
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "Свои правила";
+                                    color: Theme.text;
+                                    font-size: 15px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: root.rules-summary;
+                                    color: Theme.muted;
+                                    font-size: 12px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            Chip { text: "+ Добавить правило"; tint: Theme.accent; selected: true; clicked => { root.rule-add(); } }
+                            for rule in root.rules : RuleView {
+                                rule: rule;
+                                action-changed(a) => { root.rule-action-changed(rule.index, a); }
+                                enabled-changed(v) => { root.rule-enabled-changed(rule.index, v); }
+                                delete-rule => { root.rule-delete(rule.index); }
+                                values-edited(kind, text) => { root.rule-values-changed(rule.index, kind, text); }
+                            }
+                            if root.rules.length == 0 : Text {
+                                text: "Нет правил — трафик пойдёт по выбранному пресету";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            if root.routing-error != "" : Text {
+                                text: root.routing-error;
+                                color: Theme.danger;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "Формат Xray: geosite:category-ru, domain:example.com, geoip:ru, 10.0.0.0/8, telegram.exe. Значения через запятую или с новой строки.";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: extra-col.preferred-height + 24px;
+                        extra-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 10px;
+                            Text { text: "Дополнительно"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: "Стратегия доменов"; color: Theme.muted; font-size: 13px; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Chip { horizontal-stretch: 1; text: "AsIs"; selected: root.routing-strategy == 0; clicked => { root.routing-strategy-changed(0); } }
+                                Chip { horizontal-stretch: 1; text: "IPIfNonMatch"; selected: root.routing-strategy == 1; clicked => { root.routing-strategy-changed(1); } }
+                                Chip { horizontal-stretch: 1; text: "IPOnDemand"; selected: root.routing-strategy == 2; clicked => { root.routing-strategy-changed(2); } }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: "Блокировать QUIC";
+                                    color: Theme.text;
+                                    font-size: 14px;
+                                    vertical-alignment: center;
+                                    wrap: word-wrap;
+                                }
+                                Switch {
+                                    checked: root.routing-quic;
+                                    toggled => { root.routing-quic-changed(self.checked); }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: provider-col.preferred-height + 24px;
+                        provider-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 10px;
+                            Text { text: "Маршрутизация провайдера"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            if root.providers.length == 0 : Text {
+                                text: "В ваших подписках нет маршрутизации провайдера";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                            for provider in root.providers : VerticalLayout {
+                                spacing: 4px;
+                                Text { text: provider.name; color: Theme.text; font-size: 14px; overflow: elide; }
+                                if provider.rules-text != "" : Text { text: provider.rules-text; color: Theme.muted; font-size: 12px; }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Включена";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+                                    Switch {
+                                        checked: provider.enabled;
+                                        enabled: provider.rules-text != "";
+                                        toggled => { root.provider-enabled-changed(provider.id, self.checked); }
+                                    }
+                                }
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: "Игнорировать маршрутизацию";
+                                        color: Theme.text;
+                                        font-size: 13px;
+                                        vertical-alignment: center;
+                                    }
+                                    Switch {
+                                        checked: provider.ignored;
+                                        toggled => { root.provider-ignored-changed(provider.id, self.checked); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Статистика: filled in step 5
+            if root.tab == 4 : Text {
+                text: "Статистика появится в следующей версии приложения.";
+                color: Theme.muted;
+                font-size: 14px;
+                wrap: word-wrap;
+                horizontal-alignment: center;
+            }
+
             // Настройки: connection mode, version, logs
-            if root.tab == 2 : VerticalLayout {
+            if root.tab == 3 : VerticalLayout {
                 width: parent.width;
                 height: parent.height;
                 padding: 16px;
@@ -756,9 +1092,9 @@ export component AndroidWindow inherits Window {
             }
         }
 
-        // bottom tabs (each at least 48 dp high)
+        // bottom tabs (each at least 48 dp high; widths follow the label text)
         Rectangle {
-            height: 56px;
+            height: 60px;
             background: Theme.panel-bg;
             HorizontalLayout {
                 BottomTab {
@@ -774,112 +1110,22 @@ export component AndroidWindow inherits Window {
                     clicked => { root.tab = 1; }
                 }
                 BottomTab {
-                    label: "Настройки";
-                    icon: @image-url("../../flamix/assets/icons/settings.svg");
+                    label: "Маршрутизация";
+                    icon: @image-url("../../flamix/assets/icons/routing.svg");
                     active: root.tab == 2;
                     clicked => { root.tab = 2; }
                 }
-            }
-        }
-    }
-
-    // Subscription settings sheet.
-    if root.sheet-open : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: root.width;
-        height: root.height;
-        background: #000000B3;
-        TouchArea { clicked => { root.sheet-open = false; root.sheet-delete-armed = false; } }
-        Rectangle {
-            x: 0px;
-            y: parent.height - self.height;
-            width: parent.width;
-            height: sheet-col.preferred-height + 32px;
-            background: Theme.panel-bg;
-            border-radius: 16px;
-            TouchArea { }
-            sheet-col := VerticalLayout {
-                x: 16px;
-                y: 16px;
-                width: parent.width - 32px;
-                spacing: 10px;
-                Text {
-                    text: "Настройки подписки";
-                    color: Theme.text;
-                    font-size: 18px;
-                    font-weight: 600;
+                BottomTab {
+                    label: "Настройки";
+                    icon: @image-url("../../flamix/assets/icons/settings.svg");
+                    active: root.tab == 3;
+                    clicked => { root.tab = 3; }
                 }
-                Text { text: "Название"; color: Theme.muted; font-size: 13px; }
-                LineEdit {
-                    height: 48px;
-                    font-size: 15px;
-                    text <=> root.sheet-name;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: space-between;
-                    Text {
-                        text: "Игнорировать маршрутизацию провайдера";
-                        color: Theme.text;
-                        font-size: 14px;
-                        wrap: word-wrap;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                    }
-                    Switch {
-                        checked <=> root.sheet-ignore;
-                    }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Rectangle {
-                        height: 48px;
-                        horizontal-stretch: 1;
-                        border-radius: Theme.radius;
-                        background: Theme.accent;
-                        TouchArea {
-                            clicked => {
-                                root.sub-save(root.sheet-name, root.sheet-ignore);
-                                root.sheet-open = false;
-                                root.sheet-delete-armed = false;
-                            }
-                        }
-                        Text { text: "Сохранить"; color: Theme.on-accent; font-size: 15px;
-                            horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                    Rectangle {
-                        height: 48px;
-                        horizontal-stretch: 1;
-                        border-radius: Theme.radius;
-                        background: Theme.card-header;
-                        TouchArea { clicked => { root.sheet-open = false; root.sheet-delete-armed = false; } }
-                        Text { text: "Отмена"; color: Theme.text; font-size: 15px;
-                            horizontal-alignment: center; vertical-alignment: center; }
-                    }
-                }
-                Rectangle {
-                    height: 48px;
-                    border-radius: Theme.radius;
-                    background: root.sheet-delete-armed ? Theme.danger : transparent;
-                    TouchArea {
-                        clicked => {
-                            if root.sheet-delete-armed {
-                                root.sub-delete();
-                                root.sheet-open = false;
-                                root.sheet-delete-armed = false;
-                            } else {
-                                root.sheet-delete-armed = true;
-                            }
-                        }
-                    }
-                    Text {
-                        text: root.sheet-delete-armed ? "Точно удалить подписку?" : "Удалить подписку";
-                        color: root.sheet-delete-armed ? #FFFFFF : Theme.danger;
-                        font-size: 15px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
+                BottomTab {
+                    label: "Статистика";
+                    icon: @image-url("../../flamix/assets/icons/stats.svg");
+                    active: root.tab == 4;
+                    clicked => { root.tab = 4; }
                 }
             }
         }

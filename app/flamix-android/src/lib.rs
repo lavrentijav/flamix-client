@@ -17,7 +17,7 @@ pub mod tunnel;
 
 slint::include_modules!();
 
-use flamix_core::model::AppState;
+use flamix_core::model::{AppState, MirrorMode, RoutingRule, RuleAction};
 use flamix_core::store;
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::path::{Path, PathBuf};
@@ -145,8 +145,59 @@ fn sub_item(card: phone::SubCard, selected: Option<&str>) -> PhoneSub {
     }
 }
 
+/// Custom rule at list position `index` (negative or out of range = none).
+fn rule_at(state: &mut AppState, index: i32) -> Option<&mut RoutingRule> {
+    let i = usize::try_from(index).ok()?;
+    state.settings.routing.custom_rules.get_mut(i)
+}
+
+/// Pushes the routing tab (presets, Anixart mirror, rules, provider routing) from `state`.
+fn refresh_routing(window: &AndroidWindow, state: &AppState) {
+    let routing = &state.settings.routing;
+    window.set_routing_preset(phone::preset_index(routing.preset));
+    window.set_routing_mirror(match routing.anixart_mirror {
+        MirrorMode::Direct => 0,
+        MirrorMode::Proxy => 1,
+    });
+    let strategy = phone::DOMAIN_STRATEGIES
+        .iter()
+        .position(|s| *s == routing.domain_strategy)
+        .unwrap_or(1);
+    window.set_routing_strategy(i32::try_from(strategy).unwrap_or(1));
+    window.set_routing_quic(routing.block_quic);
+    let cards = phone::rule_cards(state);
+    let count = cards.len();
+    let rules: Vec<PhoneRule> = cards
+        .into_iter()
+        .map(|c| PhoneRule {
+            index: i32::try_from(c.index).unwrap_or(0),
+            action: c.action,
+            enabled: c.enabled,
+            kind: c.kind,
+            domains: c.domains.into(),
+            ips: c.ips.into(),
+            processes: c.processes.into(),
+        })
+        .collect();
+    window.set_rules(ModelRc::new(VecModel::from(rules)));
+    window.set_rules_summary(phone::rules_label(count).into());
+    window.set_routing_error(phone::routing_error(state).into());
+    let providers: Vec<PhoneProvider> = phone::provider_cards(state)
+        .into_iter()
+        .map(|p| PhoneProvider {
+            id: p.id.into(),
+            name: p.name.into(),
+            rules_text: p.rules_text.into(),
+            enabled: p.enabled,
+            ignored: p.ignored,
+        })
+        .collect();
+    window.set_providers(ModelRc::new(VecModel::from(providers)));
+}
+
 /// Pushes the subscription cards and the selection from `state` into the window.
 fn refresh(window: &AndroidWindow, state: &AppState, shared: &Shared) {
+    refresh_routing(window, state);
     let (filter, updating) = {
         let ui = lock(shared);
         (ui.filter.clone(), ui.updating.clone())
@@ -395,6 +446,197 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
             let Some(w) = weak.upgrade() else { return };
             let id = lock(&shared).sheet_id.clone();
             let result = phone::remove_subscription(&dir, &id);
+            show(&w, &shared, result);
+        }
+    });
+
+    // Routing tab. Every change saves the state and refreshes the tab.
+    window.on_routing_preset_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let preset = phone::preset_from_index(index);
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.routing.preset = preset),
+            );
+        }
+    });
+    window.on_routing_mirror_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let mirror = if index == 1 {
+                MirrorMode::Proxy
+            } else {
+                MirrorMode::Direct
+            };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.routing.anixart_mirror = mirror),
+            );
+        }
+    });
+    window.on_routing_strategy_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let name = usize::try_from(index)
+                .ok()
+                .and_then(|i| phone::DOMAIN_STRATEGIES.get(i))
+                .map_or("IPIfNonMatch", |s| s);
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.routing.domain_strategy = name.into()),
+            );
+        }
+    });
+    window.on_routing_quic_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |on: bool| {
+            let Some(w) = weak.upgrade() else { return };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.routing.block_quic = on),
+            );
+        }
+    });
+    window.on_rule_add({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| {
+                    st.settings.routing.custom_rules.push(RoutingRule {
+                        domains: Vec::new(),
+                        ips: Vec::new(),
+                        processes: Vec::new(),
+                        network: None,
+                        ports: None,
+                        action: RuleAction::Proxy,
+                        enabled: true,
+                    });
+                }),
+            );
+        }
+    });
+    window.on_rule_action_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32, action: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let action = match action {
+                1 => RuleAction::Direct,
+                2 => RuleAction::Block,
+                _ => RuleAction::Proxy,
+            };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| {
+                    if let Some(rule) = rule_at(st, index) {
+                        rule.action = action;
+                    }
+                }),
+            );
+        }
+    });
+    window.on_rule_enabled_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32, on: bool| {
+            let Some(w) = weak.upgrade() else { return };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| {
+                    if let Some(rule) = rule_at(st, index) {
+                        rule.enabled = on;
+                    }
+                }),
+            );
+        }
+    });
+    window.on_rule_delete({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| {
+                    if let Ok(i) = usize::try_from(index) {
+                        if i < st.settings.routing.custom_rules.len() {
+                            st.settings.routing.custom_rules.remove(i);
+                        }
+                    }
+                }),
+            );
+        }
+    });
+    // Typing: saved without a refresh, so the text field keeps its cursor.
+    window.on_rule_values_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        move |index: i32, kind: i32, text: SharedString| {
+            let Some(w) = weak.upgrade() else { return };
+            let values = phone::rule_values(&text);
+            if let Ok(state) = phone::update_state(&dir, |st| {
+                if let Some(rule) = rule_at(st, index) {
+                    match kind {
+                        1 => rule.ips = values,
+                        2 => rule.processes = values,
+                        _ => rule.domains = values,
+                    }
+                }
+            }) {
+                w.set_routing_error(phone::routing_error(&state).into());
+            }
+        }
+    });
+    window.on_provider_enabled_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |id: SharedString, on: bool| {
+            let Some(w) = weak.upgrade() else { return };
+            let result = phone::edit_sub(&dir, &id, |sub| {
+                if let Some(routing) = sub.provider.routing.as_mut() {
+                    routing.enabled = on;
+                }
+            });
+            show(&w, &shared, result);
+        }
+    });
+    window.on_provider_ignored_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |id: SharedString, on: bool| {
+            let Some(w) = weak.upgrade() else { return };
+            let result = phone::edit_sub(&dir, &id, |sub| {
+                sub.options.ignore_provider_routing = on;
+            });
             show(&w, &shared, result);
         }
     });
