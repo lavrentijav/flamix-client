@@ -1,9 +1,11 @@
 name: Android
 
 # Build a debug APK (Slint UI in Rust via cargo-ndk + Gradle shell) and upload it as an artifact.
+# On v* tags (or manual dispatch) also build signed per-ABI release APKs; tags publish them to a GitHub release.
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -16,36 +18,33 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # sing-box release built for Android (latest stable 1.14.x at the time of M2)
+  # Official prebuilt sing-box release (not built in CI). To bump: change the tag and both digests
+  # (digest = `gh api repos/SagerNet/sing-box/releases/tags/<tag> --jq '.assets[]|[.name,.digest]'`).
   SINGBOX_TAG: v1.14.3
-  SINGBOX_BUILD_TAGS: with_gvisor,with_quic,with_utls,with_wireguard,with_clash_api,badlinkname,tfogo_checklinkname0
+  SINGBOX_VERSION: 1.14.3
+  SINGBOX_SHA256_ARM64: 149569b5dbf01958e6598beb3a13078d6fc0e353ef06f4aff85f5f28bc23593b
+  SINGBOX_SHA256_AMD64: a84a5aea86ad0588b76e23051e9e59405a7ed52358acfb9710cfaa055fe60e4a
 
 jobs:
   singbox:
-    name: sing-box (android arm64 + x86_64)
+    name: sing-box (official android arm64 + x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - name: Clone sing-box ${{ env.SINGBOX_TAG }}
-        run: git clone --depth 1 --branch "$SINGBOX_TAG" https://github.com/SagerNet/sing-box.git sing-box
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: sing-box/go.mod
-          cache-dependency-path: sing-box/go.sum
-
-      - name: Build
-        working-directory: sing-box
+      - name: Download and verify official sing-box
         run: |
-          go version
-          mkdir -p "$GITHUB_WORKSPACE/jni/arm64-v8a" "$GITHUB_WORKSPACE/jni/x86_64"
-          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
-            -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/arm64-v8a/libsingbox.so" ./cmd/sing-box
-          # android/amd64 needs external (cgo) linking: use the NDK clang
-          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          GOOS=android GOARCH=amd64 CGO_ENABLED=1 CC="$NDK_BIN/x86_64-linux-android26-clang" \
-            go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
-            -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/x86_64/libsingbox.so" ./cmd/sing-box
+          set -euo pipefail
+          base="https://github.com/SagerNet/sing-box/releases/download/${SINGBOX_TAG}"
+          mkdir -p dl "$GITHUB_WORKSPACE/jni/arm64-v8a" "$GITHUB_WORKSPACE/jni/x86_64"
+          fetch() { # fetch <arch> <sha256> <abi>
+            local name="sing-box-${SINGBOX_VERSION}-android-$1"
+            curl -fsSL --retry 3 -o "dl/$name.tar.gz" "$base/$name.tar.gz"
+            echo "$2  dl/$name.tar.gz" | sha256sum -c -
+            tar -xzf "dl/$name.tar.gz" -C dl "$name/sing-box"
+            install -m 755 "dl/$name/sing-box" "$GITHUB_WORKSPACE/jni/$3/libsingbox.so"
+          }
+          fetch arm64 "$SINGBOX_SHA256_ARM64" arm64-v8a
+          fetch amd64 "$SINGBOX_SHA256_AMD64" x86_64
           file "$GITHUB_WORKSPACE"/jni/*/libsingbox.so || true
           ls -l "$GITHUB_WORKSPACE"/jni/*/
 
@@ -117,6 +116,112 @@ jobs:
           name: flamix-android-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+  release:
+    name: Signed release APKs
+    needs: singbox
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write # only this job may create/update a release
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: singbox-jnilibs
+          path: android/app/src/main/jniLibs
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Install Android platform 34
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-34" "build-tools;34.0.0"
+          test -f "$ANDROID_HOME/platforms/android-34/android.jar"
+          echo "ANDROID_PLATFORM=android-34" >> "$GITHUB_ENV"
+          echo "ANDROID_JAR=$ANDROID_HOME/platforms/android-34/android.jar" >> "$GITHUB_ENV"
+          echo "ANDROID_BUILD_TOOLS_VERSION=34.0.0" >> "$GITHUB_ENV"
+
+      - name: Build native library (cargo-ndk)
+        run: |
+          cargo ndk -t arm64-v8a -t x86_64 \
+            -o android/app/src/main/jniLibs \
+            build -p flamix-android --release
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Compute version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then v="${GITHUB_REF#refs/tags/v}"; else v="0.3.0"; fi
+          echo "VERSION_NAME=$v" >> "$GITHUB_ENV"
+
+      - name: Decode signing keystore
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$KS_B64" | base64 -d > "$RUNNER_TEMP/flamix-release.p12"
+          chmod 600 "$RUNNER_TEMP/flamix-release.p12"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/flamix-release.p12" >> "$GITHUB_ENV"
+
+      - name: Assemble release APKs
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: gradle --no-daemon assembleRelease
+
+      - name: Verify signatures, rename, checksums
+        run: |
+          set -euo pipefail
+          apksigner="$ANDROID_HOME/build-tools/34.0.0/apksigner"
+          out=android/app/build/outputs/apk/release
+          ls -l "$out"
+          mkdir -p dist
+          for abi in arm64-v8a x86_64; do
+            src=$(ls "$out"/*"$abi"*.apk | head -n1)
+            "$apksigner" verify --print-certs "$src"
+            cp "$src" "dist/Flamix-${VERSION_NAME}-${abi}.apk"
+          done
+          (cd dist && sha256sum Flamix-*.apk | tee SHA256SUMS.txt)
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flamix-android-release-apks
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      - name: Delete keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/flamix-release.p12"
 
   emulator:
     name: Emulator core check (optional)
