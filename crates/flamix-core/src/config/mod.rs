@@ -8,6 +8,7 @@
 //!   captures traffic and forwards it to the selected protocol's outbound directly (sing-box
 //!   protocols) or to Xray's local SOCKS inbound (Xray-only features like xhttp).
 
+pub mod android_tun;
 pub mod mihomo;
 mod routing;
 pub(crate) mod ru_routing;

@@ -9,7 +9,7 @@ import android.util.Log
 /**
  * Hosts the Slint UI. Slint's Android backend requires NativeActivity or a subclass;
  * the Rust `android_main` (app/flamix-android) is loaded via the `android.app.lib_name`
- * meta-data in AndroidManifest.xml. VPN code will be added here in a later milestone.
+ * meta-data in AndroidManifest.xml. VPN consent helper: [startVpn] (M3).
  *
  * M2 debug hook (debuggable builds only): start the activity with string extra `core`
  * = `start` or `stop`, e.g. `adb shell am start -n online.flamix.client/online.flamix.MainActivity --es core start`.
@@ -40,6 +40,30 @@ class MainActivity : NativeActivity() {
             }.start()
             "stop" -> Thread { core.stop(); Log.i(TAG, "core stopped") }.start()
         }
+        // M3 debug: `--es vpn vpn_start` asks consent (first time) and starts the VpnService with the
+        // sample config; `--es vpn vpn_stop` stops it. Runs on the main thread (consent dialog).
+        when (intent?.getStringExtra("vpn")) {
+            "vpn_start" -> startVpn(java.io.File(CoreService.installSampleConfig(this)).readText())
+            "vpn_stop" -> stopVpn()
+        }
+    }
+
+    private var pendingVpnConfig: String? = null
+
+    /** Starts the system VPN with a sing-box config; asks for VPN consent first when needed. */
+    fun startVpn(configJson: String) {
+        if (FlamixVpn.prepare(this)) FlamixVpn.start(this, configJson) else pendingVpnConfig = configJson
+    }
+
+    fun stopVpn() = FlamixVpn.stop(this)
+
+    @Suppress("DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != FlamixVpn.REQUEST_VPN) return
+        val cfg = pendingVpnConfig.also { pendingVpnConfig = null }
+        if (resultCode == RESULT_OK && cfg != null) FlamixVpn.start(this, cfg)
+        else Log.w(TAG, "VPN consent denied")
     }
 
     override fun onDestroy() {
