@@ -69,7 +69,7 @@ PY
   fi
   echo "no consent dialog yet (attempt $i)"; sleep 3
 done
-sleep 12
+sleep 30
 shot 4-after-consent
 
 step "VPN state"

@@ -55,6 +55,7 @@ class CoreService(
     private fun pump(p: Process) {
         try {
             p.inputStream.bufferedReader().forEachLine { line ->
+                FileLog.i("core", line.replace(Regex("\u001B\\[[0-9;]*m"), ""))
                 synchronized(lock) {
                     ring.addLast(line)
                     while (ring.size > maxLogLines) ring.removeFirst()
