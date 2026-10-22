@@ -1,6 +1,6 @@
 // Phone layout of Flamix (M4). The window is shown by the Android entry point (src/lib.rs).
 // Dark colours are copied from app/flamix/ui/theme.slint (keep in sync).
-import { LineEdit, ScrollView, Switch } from "std-widgets.slint";
+import { LineEdit, ScrollView, Switch, TextEdit } from "std-widgets.slint";
 
 global Theme {
     out property <color> window-bg: #2B2621;
@@ -113,6 +113,27 @@ component IconBtn inherits Rectangle {
         height: 22px;
         source: root.icon;
         colorize: root.tint;
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+// Full-width action button (48 dp high).
+component Btn inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    callback clicked();
+    height: 48px;
+    border-radius: Theme.radius;
+    background: root.primary ? (ta.has-hover ? Theme.accent.darker(0.1) : Theme.accent)
+        : (ta.has-hover ? Theme.hover : Theme.card-header);
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text;
+        color: root.primary ? Theme.on-accent : Theme.text;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
     ta := TouchArea { clicked => { root.clicked(); } }
 }
@@ -453,7 +474,13 @@ export component AndroidWindow inherits Window {
     in-out property <bool> sheet-delete-armed: false;
     in property <string> version-text: "";
     in property <string> log-text: "";
-    callback add-subscription(string);
+    callback add-subscription();
+    callback import-links();
+    callback import-clipboard();
+    in-out property <string> add-url;
+    in-out property <string> add-name;
+    in-out property <string> add-backups;
+    in-out property <string> links-text;
     callback refresh-logs();
     callback clear-logs();
 
@@ -574,47 +601,88 @@ export component AndroidWindow inherits Window {
                 }
             }
 
-            // Добавить: subscription URL
-            if root.tab == 1 : VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                padding: 16px;
-                spacing: 12px;
+            // Добавить: subscription form, share links, clipboard import, status line
+            if root.tab == 1 : ScrollView {
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 10px;
 
-                Text {
-                    text: "Ссылка на подписку";
-                    color: Theme.muted;
-                    font-size: 14px;
-                }
-                url := LineEdit {
-                    height: 48px;
-                    font-size: 16px;
-                    placeholder-text: "https://";
-                    accepted => { root.add-subscription(self.text); }
-                }
-                Rectangle {
-                    height: 48px;
-                    border-radius: Theme.radius;
-                    background: Theme.accent;
-                    TouchArea {
-                        clicked => { root.add-subscription(url.text); }
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: sub-card.preferred-height + 24px;
+                        sub-card := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Подписка"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            LineEdit {
+                                height: 48px;
+                                font-size: 15px;
+                                placeholder-text: "Ссылка на подписку (https://…)";
+                                text <=> root.add-url;
+                            }
+                            LineEdit {
+                                height: 48px;
+                                font-size: 15px;
+                                placeholder-text: "Название (необязательно)";
+                                text <=> root.add-name;
+                            }
+                            TextEdit {
+                                height: 96px;
+                                font-size: 14px;
+                                placeholder-text: "Резервные ссылки (необязательно), по одной в строке";
+                                text <=> root.add-backups;
+                            }
+                            Btn {
+                                text: "Добавить";
+                                primary: true;
+                                clicked => { root.add-subscription(); }
+                            }
+                        }
                     }
-                    Text {
-                        text: "Добавить";
-                        color: Theme.on-accent;
-                        font-size: 16px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: links-card.preferred-height + 24px;
+                        links-card := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Ссылки"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text {
+                                text: "vless, vmess, trojan, ss, hy2, tuic, wg; подписки https://; диплинки flamix://, happ://, v2raytun:// — по одной в строке.";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                            TextEdit {
+                                height: 140px;
+                                font-size: 14px;
+                                placeholder-text: "vless://…\nvmess://…\ntrojan://…";
+                                text <=> root.links-text;
+                            }
+                            Btn {
+                                text: "Импортировать";
+                                primary: true;
+                                clicked => { root.import-links(); }
+                            }
+                        }
                     }
-                }
-                Text {
-                    text: root.add-status;
-                    color: Theme.muted;
-                    font-size: 14px;
-                    wrap: word-wrap;
-                }
-                Rectangle {
-                    vertical-stretch: 1;
+
+                    Btn {
+                        text: "Из буфера обмена";
+                        clicked => { root.import-clipboard(); }
+                    }
+                    if root.add-status != "" : Text {
+                        text: root.add-status;
+                        color: Theme.muted;
+                        font-size: 14px;
+                        wrap: word-wrap;
+                    }
                 }
             }
 

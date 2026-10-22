@@ -17,7 +17,7 @@ pub mod tunnel;
 
 slint::include_modules!();
 
-use flamix_core::model::{AppState, Subscription};
+use flamix_core::model::AppState;
 use flamix_core::store;
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel};
 use std::path::{Path, PathBuf};
@@ -48,6 +48,9 @@ mod vpn {
 mod external {
     pub fn open(_url: &str) -> Result<(), String> {
         Err("Открытие ссылок только на Android".into())
+    }
+    pub fn read_clipboard() -> Result<String, String> {
+        Err("Буфер обмена доступен только на Android".into())
     }
 }
 
@@ -165,6 +168,92 @@ fn reload(window: &AndroidWindow, dir: &Path, shared: &Shared) {
     }
 }
 
+/// Fetches subscription `id` on a plain thread and stores the result (UI thread afterwards).
+/// A refresh already in flight for the same id is not started twice.
+fn start_refresh(window: &AndroidWindow, dir: &Path, shared: &Shared, id: String) {
+    let Ok(state) = store::load(dir) else { return };
+    let Some(sub) = state.subscriptions.iter().find(|s| s.id == id).cloned() else {
+        return;
+    };
+    {
+        let mut ui = lock(shared);
+        if ui.updating.contains(&id) {
+            return;
+        }
+        ui.updating.push(id.clone());
+    }
+    refresh(window, &state, shared);
+    let hwid = state.effective_hwid();
+    let weak = window.as_weak();
+    let dir_thread = dir.to_path_buf();
+    let shared_thread = shared.clone();
+    let id_thread = id.clone();
+    let spawned = std::thread::Builder::new()
+        .name("subscription-refresh".into())
+        .spawn(move || {
+            let mut sub = sub;
+            let fetched = phone::fetch_subscription(&mut sub, hwid);
+            let _ = slint::invoke_from_event_loop(move || {
+                lock(&shared_thread).updating.retain(|x| *x != id_thread);
+                let Some(w) = weak.upgrade() else { return };
+                let stored = phone::apply_fetched(&dir_thread, sub);
+                match fetched {
+                    Ok(()) => {
+                        let text = "Подписка обновлена".to_string();
+                        w.set_add_status(text.clone().into());
+                        w.set_status_text(text.into());
+                    }
+                    Err(err) => {
+                        // The error is kept on the subscription (last_error) and shown on its card.
+                        let text = format!("Ошибка обновления: {err}");
+                        w.set_add_status(text.clone().into());
+                        w.set_status_text(text.into());
+                    }
+                }
+                match stored {
+                    Ok(state) => refresh(&w, &state, &shared_thread),
+                    Err(err) => w.set_status_text(err.into()),
+                }
+            });
+        });
+    if let Err(err) = spawned {
+        lock(shared).updating.retain(|x| *x != id);
+        window.set_status_text(format!("Не удалось запустить обновление: {err}").into());
+        reload(window, dir, shared);
+    }
+}
+
+/// Imports pasted text and writes the result line to the add tab. Returns true on success.
+fn import_and_report(window: &AndroidWindow, dir: &Path, shared: &Shared, text: &str) -> bool {
+    match phone::import_text(dir, text) {
+        Ok((outcome, state)) => {
+            refresh(window, &state, shared);
+            let message = match outcome {
+                phone::Imported::Subscription { id, name } => {
+                    let label = if name.is_empty() { id.clone() } else { name };
+                    start_refresh(window, dir, shared, id);
+                    format!("Подписка добавлена: {label}")
+                }
+                phone::Imported::Links { added, skipped } => phone::links_status(added, skipped),
+                phone::Imported::Routing { enabled } => {
+                    if enabled {
+                        "Маршрутизация включена".into()
+                    } else {
+                        "Маршрутизация отключена".into()
+                    }
+                }
+                phone::Imported::Unsupported => "Нет подписки для маршрутизации".into(),
+            };
+            window.set_add_status(message.into());
+            true
+        }
+        Err(err) => {
+            window.set_add_status(err.into());
+            false
+        }
+    }
+}
+
 /// Shows the state returned by a change, or its error text.
 fn show(window: &AndroidWindow, shared: &Shared, result: Result<AppState, String>) {
     match result {
@@ -259,51 +348,7 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
         let shared = shared.clone();
         move |id: SharedString| {
             let Some(w) = weak.upgrade() else { return };
-            let id = id.to_string();
-            let Ok(state) = store::load(&dir) else { return };
-            let Some(sub) = state.subscriptions.iter().find(|s| s.id == id).cloned() else {
-                return;
-            };
-            {
-                let mut ui = lock(&shared);
-                if ui.updating.contains(&id) {
-                    return;
-                }
-                ui.updating.push(id.clone());
-            }
-            refresh(&w, &state, &shared);
-            let hwid = state.effective_hwid();
-            let weak = weak.clone();
-            let dir = dir.clone();
-            let shared = shared.clone();
-            let shared_err = shared.clone();
-            let dir_err = dir.clone();
-            let id_thread = id.clone();
-            // Network fetch on a plain thread; the result is stored and shown on the UI thread.
-            let spawned = std::thread::Builder::new()
-                .name("subscription-refresh".into())
-                .spawn(move || {
-                    let mut sub = sub;
-                    let fetched = phone::fetch_subscription(&mut sub, hwid);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        lock(&shared).updating.retain(|x| *x != id_thread);
-                        let Some(w) = weak.upgrade() else { return };
-                        match fetched {
-                            Ok(()) => show(&w, &shared, phone::apply_fetched(&dir, sub)),
-                            Err(err) => {
-                                // The fetch error is kept on the subscription (last_error).
-                                let _ = phone::apply_fetched(&dir, sub);
-                                w.set_status_text(format!("Ошибка обновления: {err}").into());
-                                reload(&w, &dir, &shared);
-                            }
-                        }
-                    });
-                });
-            if let Err(err) = spawned {
-                lock(&shared_err).updating.retain(|x| *x != id);
-                w.set_status_text(format!("Не удалось запустить обновление: {err}").into());
-                reload(&w, &dir_err, &shared_err);
-            }
+            start_refresh(&w, &dir, &shared, id.to_string());
         }
     });
 
@@ -397,35 +442,60 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
         let weak = window.as_weak();
         let dir = data_dir.clone();
         let shared = shared.clone();
-        move |url| {
+        move || {
             let Some(w) = weak.upgrade() else { return };
-            let mut sub = match phone::new_subscription(&url) {
+            let mut sub = match phone::new_subscription(&w.get_add_url()) {
                 Ok(sub) => sub,
                 Err(err) => {
                     w.set_add_status(err.into());
                     return;
                 }
             };
-            w.set_add_status("Загрузка подписки…".into());
-            let hwid = store::load(&dir).ok().and_then(|s| s.effective_hwid());
-            let weak = weak.clone();
-            let dir = dir.clone();
-            let shared = shared.clone();
-            // Network fetch on a plain thread; the result is applied on the UI thread.
-            let spawned = std::thread::Builder::new()
-                .name("subscription".into())
-                .spawn(move || {
-                    let fetched = phone::fetch_subscription(&mut sub, hwid).map(|()| sub);
-                    let _ = slint::invoke_from_event_loop(move || {
-                        let Some(w) = weak.upgrade() else { return };
-                        match fetched {
-                            Ok(sub) => add_fetched(&w, &dir, &shared, sub),
-                            Err(err) => w.set_add_status(format!("Ошибка: {err}").into()),
-                        }
-                    });
-                });
-            if let Err(err) = spawned {
-                w.set_add_status(format!("Не удалось запустить загрузку: {err}").into());
+            sub.name = w.get_add_name().trim().to_string();
+            sub.backup_urls = phone::parse_backup_urls(&w.get_add_backups());
+            let id = sub.id.clone();
+            match phone::add_subscription(&dir, sub) {
+                Ok(state) => {
+                    refresh(&w, &state, &shared);
+                    w.set_add_url("".into());
+                    w.set_add_name("".into());
+                    w.set_add_backups("".into());
+                    w.set_add_status("Подписка добавлена, загрузка…".into());
+                    start_refresh(&w, &dir, &shared, id);
+                }
+                Err(err) => w.set_add_status(err.into()),
+            }
+        }
+    });
+
+    window.on_import_links({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let text = w.get_links_text().to_string();
+            if text.trim().is_empty() {
+                return;
+            }
+            if import_and_report(&w, &dir, &shared, &text) {
+                w.set_links_text("".into());
+            }
+        }
+    });
+
+    window.on_import_clipboard({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            match external::read_clipboard() {
+                Ok(text) if !text.trim().is_empty() => {
+                    import_and_report(&w, &dir, &shared, &text);
+                }
+                Ok(_) => w.set_add_status("Буфер обмена пуст".into()),
+                Err(err) => w.set_add_status(err.into()),
             }
         }
     });
@@ -450,17 +520,6 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
     });
 
     window.run()
-}
-
-/// Saves a fetched subscription and shows the result (UI thread).
-fn add_fetched(window: &AndroidWindow, dir: &Path, shared: &Shared, sub: Subscription) {
-    match phone::add_subscription(dir, sub) {
-        Ok(state) => {
-            refresh(window, &state, shared);
-            window.set_add_status("Подписка добавлена".into());
-        }
-        Err(err) => window.set_add_status(err.into()),
-    }
 }
 
 /// Called by `android-activity` from the `NativeActivity` glue.

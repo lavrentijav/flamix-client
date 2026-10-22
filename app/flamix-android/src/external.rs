@@ -60,6 +60,40 @@ pub fn open(url: &str) -> Result<(), String> {
     }
 }
 
+/// Text of the system clipboard (empty when there is none). Blocking JNI call; run it off the UI
+/// thread when that matters.
+pub fn read_clipboard() -> Result<String, String> {
+    let handles = (*HANDLES.lock().unwrap_or_else(|e| e.into_inner()))
+        .ok_or_else(|| "JNI не инициализирован".to_string())?;
+    // SAFETY: as in `open`.
+    let vm = unsafe { JavaVM::from_raw(handles.vm as *mut jni::sys::JavaVM) }
+        .map_err(|e| e.to_string())?;
+    let mut guard = vm.attach_current_thread().map_err(|e| e.to_string())?;
+    let env: &mut jni::JNIEnv = &mut guard;
+    let activity =
+        ManuallyDrop::new(unsafe { JObject::from_raw(handles.activity as jni::sys::jobject) });
+    let class = find_class(env, &activity).map_err(|e| e.to_string())?;
+    let result = env
+        .call_static_method(
+            &class,
+            "readClipboard",
+            "(Landroid/content/Context;)Ljava/lang/String;",
+            &[JValue::Object(&activity)],
+        )
+        .and_then(|v| v.l());
+    match result {
+        Ok(obj) => {
+            let text = JString::from(obj);
+            let value: String = env.get_string(&text).map_err(|e| e.to_string())?.into();
+            Ok(value)
+        }
+        Err(e) => {
+            let _ = env.exception_clear();
+            Err(format!("readClipboard: {e}"))
+        }
+    }
+}
+
 fn find_class<'l>(
     env: &mut jni::JNIEnv<'l>,
     activity: &JObject,

@@ -7,7 +7,8 @@
 
 use flamix_core::config::{self, android_tun, ConnectContext, CoreKind};
 use flamix_core::model::{AppState, Server, Subscription};
-use flamix_core::{store, subscription};
+use flamix_core::provider_routing::RoutingLinkAction;
+use flamix_core::{deeplink, link, store, subscription};
 use std::path::Path;
 
 /// Shown when the selected server has no sing-box outbound (e.g. xhttp, which needs Xray).
@@ -621,6 +622,110 @@ pub fn remove_subscription(dir: &Path, id: &str) -> Result<AppState, String> {
     })
 }
 
+/// One non-empty, trimmed line per backup URL (the "Резервные ссылки" box).
+pub fn parse_backup_urls(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Result line for a share-link import.
+pub fn links_status(added: usize, skipped: usize) -> String {
+    if added == 0 && skipped == 0 {
+        return "Все серверы уже добавлены".into();
+    }
+    let mut text = format!("Добавлено серверов: {added}");
+    if skipped > 0 {
+        text.push_str(&format!(", пропущено: {skipped}"));
+    }
+    text
+}
+
+/// What a pasted or clipboard text turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Imported {
+    /// A new subscription was stored; the caller fetches it next.
+    Subscription { id: String, name: String },
+    /// Local servers were added from share links.
+    Links { added: usize, skipped: usize },
+    /// Provider routing of the subscription that owns the selected server.
+    Routing { enabled: bool },
+    /// Routing link while no subscription is selected.
+    Unsupported,
+}
+
+/// Imports a deep link, a subscription URL or share links (desktop `apply_import`, phone side).
+/// Saves the state and returns the outcome together with the new state.
+pub fn import_text(dir: &Path, text: &str) -> Result<(Imported, AppState), String> {
+    let import =
+        deeplink::parse_import(text).ok_or_else(|| "Не удалось распознать ссылку".to_string())?;
+    let mut state = store::load(dir).map_err(|e| e.to_string())?;
+    let outcome = match import {
+        deeplink::Import::Subscription { url, name } => {
+            let mut sub = new_subscription(&url)?;
+            if state.subscriptions.iter().any(|s| s.url == sub.url) {
+                return Err("Эта подписка уже добавлена".into());
+            }
+            sub.name = name.unwrap_or_default();
+            let outcome = Imported::Subscription {
+                id: sub.id.clone(),
+                name: sub.name.clone(),
+            };
+            state.subscriptions.push(sub);
+            outcome
+        }
+        deeplink::Import::Links(text) => {
+            let (servers, errors) = link::parse_links(&text, "local");
+            let mut added = 0;
+            for server in servers {
+                if state.local_servers.iter().any(|s| s.id == server.id) {
+                    continue;
+                }
+                state.local_servers.push(server);
+                added += 1;
+            }
+            Imported::Links {
+                added,
+                skipped: errors.len(),
+            }
+        }
+        deeplink::Import::Routing(action) => apply_routing(&mut state, action),
+    };
+    store::save(dir, &state).map_err(|e| e.to_string())?;
+    Ok((outcome, state))
+}
+
+/// Applies a `happ://routing` action to the subscription of the selected server.
+fn apply_routing(state: &mut AppState, action: RoutingLinkAction) -> Imported {
+    let owner = state.selected_server.as_deref().and_then(|id| {
+        state
+            .subscriptions
+            .iter()
+            .position(|sub| sub.servers.iter().any(|s| s.id == id))
+    });
+    let Some(index) = owner else {
+        return Imported::Unsupported;
+    };
+    let sub = &mut state.subscriptions[index];
+    match action {
+        RoutingLinkAction::Add(routing) => sub.provider.routing = Some(routing),
+        RoutingLinkAction::AddAndActivate(mut routing) => {
+            routing.enabled = true;
+            sub.provider.routing = Some(routing);
+        }
+        RoutingLinkAction::Off => {
+            if let Some(routing) = &mut sub.provider.routing {
+                routing.enabled = false;
+            }
+        }
+    }
+    Imported::Routing {
+        enabled: sub.provider.routing.as_ref().is_some_and(|r| r.enabled),
+    }
+}
+
 /// Random lowercase hex id (same scheme as the desktop controller).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -658,6 +763,26 @@ mod tests {
         let sub = new_subscription("  https://example.com/sub  ").unwrap();
         assert_eq!(sub.url, "https://example.com/sub");
         assert_eq!(sub.id.len(), 16);
+    }
+
+    #[test]
+    fn backup_lines_are_trimmed_and_non_empty() {
+        let parsed = parse_backup_urls("  https://a/1 \n\n https://b/2\r\n");
+        assert_eq!(parsed, ["https://a/1", "https://b/2"]);
+        assert_eq!(links_status(2, 1), "Добавлено серверов: 2, пропущено: 1");
+        assert_eq!(links_status(0, 0), "Все серверы уже добавлены");
+    }
+
+    #[test]
+    fn import_text_recognises_subscription_and_rejects_garbage() {
+        let dir = std::env::temp_dir().join(format!("flamix-import-test-{}", random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (outcome, state) =
+            import_text(&dir, "https://example.com/sub?x=1").expect("subscription");
+        assert!(matches!(outcome, Imported::Subscription { .. }));
+        assert_eq!(state.subscriptions.len(), 1);
+        assert!(import_text(&dir, "hello world").is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
