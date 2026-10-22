@@ -382,12 +382,14 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
                 }
             }
         }
-        ConnectionMode::Tun => {
-            // sing-box always captures the TUN (it is the only core with a `tun` inbound) and
-            // forwards to the protocol outbound, or to a local SOCKS inbound run by Xray when
-            // the transport is Xray-only (xhttp/kcp/quic) — or when `core_override` forces it.
+        ConnectionMode::Tun | ConnectionMode::Tproxy => {
+            // sing-box always captures the privileged inbound — the only core with `tun` and
+            // `tproxy` inbounds — and forwards to the protocol outbound, or to a local SOCKS
+            // inbound run by Xray when the transport is Xray-only (xhttp/kcp/quic) — or when
+            // `core_override` forces it. TPROXY (Linux-only) and TUN share this plan;
+            // `singbox::build_config` picks the inbound shape from `settings.mode`.
             //
-            // `core_override` selection in TUN:
+            // `core_override` selection:
             // - "xray": run the internal Xray SOCKS hop for Xray-capable servers (falls back to
             //   the native sing-box outbound with a warning for hysteria2/tuic);
             // - "sing-box"/"auto": native sing-box outbound when it can express the server,

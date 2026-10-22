@@ -487,6 +487,10 @@ pub enum ConnectionMode {
     Proxy,
     /// Virtual network interface capturing all traffic (needs admin/root).
     Tun,
+    /// Linux-only transparent proxy via `nftables TPROXY` — no visible tunnel
+    /// device, applications see the real network. Requires root. See
+    /// `docs/transparent-proxy.md`.
+    Tproxy,
 }
 
 /// How the core-level balancer spreads new connections across the primary and its backups.
@@ -751,6 +755,21 @@ pub struct Settings {
     pub tun_icmp: String,
     /// CIDRs excluded from auto-route.
     pub tun_route_exclude: Vec<String>,
+    /// Linux transparent-proxy port (sing-box `tproxy` inbound). Local only.
+    pub tproxy_port: u16,
+    /// Netfilter fwmark used by the TPROXY policy-routing lookup.
+    pub tproxy_mark: u32,
+    /// Routing table id for the TPROXY `ip rule` lookup.
+    pub tproxy_table: u32,
+    /// Additional CIDRs excluded from TPROXY on top of the baked-in private
+    /// / loopback / link-local / multicast / CGNAT bypass set.
+    pub tproxy_route_exclude: Vec<String>,
+    /// Redirect traffic forwarded from AP interfaces into the tunnel.
+    /// Works with both `Tun` and `Tproxy` modes on Linux.
+    pub ap_tether_enabled: bool,
+    /// Interfaces whose forwarded traffic is sent through the tunnel when
+    /// `ap_tether_enabled` is on (e.g. `["wlan0", "usb0"]`).
+    pub ap_interfaces: Vec<String>,
     /// Enable xray `mux` (not for xtls flows).
     pub mux: bool,
     /// xray mux multiplexing concurrency.
@@ -806,6 +825,12 @@ impl Default for Settings {
             tun_strict_route: true,
             tun_icmp: "reply".into(),
             tun_route_exclude: Vec::new(),
+            tproxy_port: 12345,
+            tproxy_mark: 0x1a2b,
+            tproxy_table: 100,
+            tproxy_route_exclude: Vec::new(),
+            ap_tether_enabled: false,
+            ap_interfaces: Vec::new(),
             mux: false,
             mux_concurrency: 8,
             core_override: "auto".into(),
@@ -956,6 +981,33 @@ mod tests {
         assert_eq!(s.failover, f);
         let json = serde_json::to_string(&f).unwrap();
         assert_eq!(serde_json::from_str::<Failover>(&json).unwrap(), f);
+    }
+
+    #[test]
+    fn tproxy_defaults_and_serde() {
+        let s = Settings::default();
+        assert_eq!(s.mode, ConnectionMode::Proxy);
+        assert_eq!(s.tproxy_port, 12345);
+        assert_eq!(s.tproxy_mark, 0x1a2b);
+        assert_eq!(s.tproxy_table, 100);
+        assert!(s.tproxy_route_exclude.is_empty());
+        assert!(!s.ap_tether_enabled);
+        assert!(s.ap_interfaces.is_empty());
+
+        // Old state files (no new keys) still load with the defaults.
+        let s2: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s2.tproxy_port, s.tproxy_port);
+        assert_eq!(s2.tproxy_mark, s.tproxy_mark);
+        assert_eq!(s2.ap_tether_enabled, s.ap_tether_enabled);
+        assert_eq!(s2.ap_interfaces, s.ap_interfaces);
+
+        // The new ConnectionMode variant uses the lowercase tag.
+        let m: ConnectionMode = serde_json::from_str("\"tproxy\"").unwrap();
+        assert_eq!(m, ConnectionMode::Tproxy);
+        assert_eq!(
+            serde_json::to_string(&ConnectionMode::Tproxy).unwrap(),
+            "\"tproxy\""
+        );
     }
 
     #[test]
