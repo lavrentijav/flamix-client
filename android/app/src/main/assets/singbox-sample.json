@@ -1,0 +1,24 @@
+{
+  "log": { "level": "info", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "type": "udp", "tag": "dns-direct", "server": "1.1.1.1" }
+    ],
+    "final": "dns-direct"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 10808
+    }
+  ],
+  "outbounds": [
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "final": "direct",
+    "default_domain_resolver": "dns-direct"
+  }
+}

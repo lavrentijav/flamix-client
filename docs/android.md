@@ -1,6 +1,6 @@
 # Android: architecture and plan
 
-Status: **planned**. Android comes first; iOS follows (needs an Apple Developer account and a tester device).
+Status: **M1 done, M2 in progress** (see Milestones). Android comes first; iOS follows (needs an Apple Developer account and a tester device).
 
 ## What runs where
 
@@ -50,3 +50,14 @@ app/flamix/src/android_main.rs     android-activity entry point (slint android b
 
 - Play Store distribution is not planned for now; APK from GitHub Releases only.
 - Which Android versions to support: minimum API 26 (Android 8) proposed.
+
+## M2: core in the app (proxy-only)
+
+- CI job `singbox` builds sing-box (`SINGBOX_TAG` in `.github/workflows/android.yml`) for `GOOS=android`
+  (arm64 -> `arm64-v8a`, amd64 -> `x86_64`) as `libsingbox.so`; the `apk` job drops it into `jniLibs/`.
+- `CoreService.kt` runs it from `nativeLibraryDir` with the sample config `assets/singbox-sample.json`
+  (mixed inbound `127.0.0.1:10808`, direct outbound), copied to `filesDir` on start.
+- Debug trigger (debuggable builds only):
+  `adb shell am start -n online.flamix.client/online.flamix.MainActivity --es core start` (or `--es core stop`).
+  Log tag `FlamixCore`.
+- `scripts/android-m2-check.sh <apk>` does this on an emulator; CI job `emulator` runs it (optional, `continue-on-error`).
