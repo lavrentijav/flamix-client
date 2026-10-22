@@ -38,12 +38,14 @@ jobs:
         working-directory: sing-box
         run: |
           go version
-          for pair in arm64:arm64-v8a amd64:x86_64; do
-            arch=${pair%%:*}; abi=${pair##*:}
-            mkdir -p "$GITHUB_WORKSPACE/jni/$abi"
-            GOOS=android GOARCH=$arch CGO_ENABLED=0 go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
-              -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/$abi/libsingbox.so" ./cmd/sing-box
-          done
+          mkdir -p "$GITHUB_WORKSPACE/jni/arm64-v8a" "$GITHUB_WORKSPACE/jni/x86_64"
+          GOOS=android GOARCH=arm64 CGO_ENABLED=0 go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
+            -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/arm64-v8a/libsingbox.so" ./cmd/sing-box
+          # android/amd64 needs external (cgo) linking: use the NDK clang
+          NDK_BIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          GOOS=android GOARCH=amd64 CGO_ENABLED=1 CC="$NDK_BIN/x86_64-linux-android26-clang" \
+            go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
+            -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/x86_64/libsingbox.so" ./cmd/sing-box
           file "$GITHUB_WORKSPACE"/jni/*/libsingbox.so || true
           ls -l "$GITHUB_WORKSPACE"/jni/*/
 
