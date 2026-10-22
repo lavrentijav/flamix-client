@@ -1,5 +1,11 @@
 {
   "log": { "level": "info", "timestamp": true },
+  "dns": {
+    "servers": [
+      { "type": "udp", "tag": "dns-direct", "server": "1.1.1.1" }
+    ],
+    "final": "dns-direct"
+  },
   "inbounds": [
     {
       "type": "mixed",
@@ -11,5 +17,8 @@
   "outbounds": [
     { "type": "direct", "tag": "direct" }
   ],
-  "route": { "final": "direct" }
+  "route": {
+    "final": "direct",
+    "default_domain_resolver": "dns-direct"
+  }
 }
