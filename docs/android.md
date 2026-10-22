@@ -89,3 +89,17 @@ app/flamix/src/android_main.rs     android-activity entry point (slint android b
   `Flamix-X.Y.Z-x86_64.apk`, verifies them with `apksigner`, and attaches them with `SHA256SUMS.txt` to the GitHub release.
   versionName = tag, versionCode = major*1000000 + minor*1000 + patch. `workflow_dispatch` builds the APKs as an artifact only.
 - Bumping sing-box: change `SINGBOX_TAG`, `SINGBOX_VERSION` and both `SINGBOX_SHA256_*` (digests from the release assets API).
+
+## M4 phone fixes (debug notes)
+
+- Instant disconnect, two root causes found with `scripts/android-diag.sh` (emulator job, artifact `emulator-diagnostics`):
+  1. stock sing-box dies at start with `netlink socket in Android is banned by Google` because the config had
+     `route.auto_detect_interface` (network monitor). `android_tun::android_config` now removes it.
+  2. `TunnelService.waitForPort` opened a socket on the main thread (`NetworkOnMainThreadException`, swallowed), so the
+     core port never "answered" and the service stopped itself after the wait. Tunnel start now runs on a worker thread.
+  Also: remote rule-sets are stripped from the Android core config (a failed download is FATAL at start); TODO ship them as local files.
+- In-app log: `<files dir>/flamix.log` (Rust `applog.rs` + Kotlin `FileLog.kt`, 200 KB rotation, core output included);
+  Settings tab shows the last 200 lines. Pull from a device: `adb shell run-as online.flamix.client cat files/flamix.log`.
+- Server list groups by measured exit IP (`phone::exit_groups`), shows "x N", unknown exit shows the entry address with "вход".
+  Backups: `phone::backup_ids` (same exit IP, or explicit `settings.failover.backups`; unknown exit has none).
+- TODO: "Проверить выходной IP" on Android (the probe lives in the desktop controller and starts a throwaway core).

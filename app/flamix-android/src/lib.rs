@@ -6,6 +6,7 @@
 //! The window is `AndroidWindow` from `ui/android.slint`. State lives in `state.json` in the app's
 //! files dir (same format as the desktop app); see [`phone`] for the logic.
 
+pub mod applog;
 #[cfg(unix)]
 pub mod bridge;
 pub mod phone;
@@ -49,6 +50,9 @@ fn refresh(window: &AndroidWindow, state: &AppState) {
             selected: Some(row.id.as_str()) == selected,
             name: row.name.into(),
             subtitle: row.subtitle.into(),
+            address: row.address.into(),
+            is_exit: row.is_exit,
+            group: i32::try_from(row.group).unwrap_or(0),
         })
         .collect();
     window.set_servers(ModelRc::new(VecModel::from(items)));
@@ -62,6 +66,28 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
         Ok(state) => refresh(&window, &state),
         Err(err) => window.set_status_text(format!("Не удалось прочитать данные: {err}").into()),
     }
+
+    window.set_version_text(env!("CARGO_PKG_VERSION").into());
+    window.set_log_text(applog::tail(&data_dir, 200).into());
+    window.on_refresh_logs({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_log_text(applog::tail(&dir, 200).into());
+            }
+        }
+    });
+    window.on_clear_logs({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        move || {
+            applog::clear(&dir);
+            if let Some(w) = weak.upgrade() {
+                w.set_log_text("".into());
+            }
+        }
+    });
 
     window.on_select_server({
         let weak = window.as_weak();
@@ -89,6 +115,7 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
         move || {
             let Some(w) = weak.upgrade() else { return };
             if vpn::is_running() {
+                applog::log("I", "ui", "disconnect pressed");
                 let text = match vpn::disconnect() {
                     Ok(()) => "Отключение…".to_string(),
                     Err(err) => err,
@@ -96,13 +123,17 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
                 w.set_status_text(text.into());
                 return;
             }
-            let text = match store::load(&dir)
+            applog::log("I", "ui", "connect pressed");
+            let result = store::load(&dir)
                 .map_err(|e| e.to_string())
                 .and_then(|state| phone::vpn_config_json(&state))
-                .and_then(|json| vpn::connect(&json))
-            {
+                .and_then(|json| vpn::connect(&json));
+            let text = match result {
                 Ok(()) => "Запрошено подключение VPN".to_string(),
-                Err(err) => err,
+                Err(err) => {
+                    applog::log("E", "ui", &format!("connect failed: {err}"));
+                    err
+                }
             };
             w.set_status_text(text.into());
         }
@@ -183,8 +214,15 @@ fn android_main(app: slint::android::AndroidApp) {
     let data_dir = app
         .internal_data_path()
         .unwrap_or_else(|| PathBuf::from("."));
+    applog::init(&data_dir);
+    applog::log("I", "android_main", "start");
     bridge::init(app.vm_as_ptr(), app.activity_as_ptr());
-    if slint::android::init(app).is_ok() {
-        let _ = run(data_dir);
+    match slint::android::init(app) {
+        Ok(()) => {
+            if let Err(e) = run(data_dir) {
+                applog::log("E", "android_main", &format!("ui exited with error: {e}"));
+            }
+        }
+        Err(e) => applog::log("E", "android_main", &format!("slint init failed: {e}")),
     }
 }

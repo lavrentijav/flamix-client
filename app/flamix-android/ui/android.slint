@@ -1,6 +1,6 @@
 // Phone layout of Flamix (M4). The window is shown by the Android entry point (src/lib.rs).
 // Dark colours are copied from app/flamix/ui/theme.slint (keep in sync).
-import { LineEdit, ListView } from "std-widgets.slint";
+import { LineEdit, ListView, ScrollView } from "std-widgets.slint";
 
 global Theme {
     out property <color> window-bg: #2B2621;
@@ -18,23 +18,41 @@ global Theme {
 export struct ServerItem {
     name: string,
     subtitle: string,
+    address: string,
+    /// true = measured exit IP, false = entry address (shown with a small "вход" label)
+    is-exit: bool,
+    /// servers sharing this exit IP (0 = unique/unknown)
+    group: int,
     selected: bool,
 }
 
 component BottomTab inherits Rectangle {
     in property <string> label;
+    in property <image> icon;
     in property <bool> active;
     callback clicked();
     background: transparent;
     touch := TouchArea {
         clicked => { root.clicked(); }
     }
-    Text {
-        text: root.label;
-        color: root.active ? Theme.accent : Theme.muted;
-        font-size: 15px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    VerticalLayout {
+        alignment: center;
+        spacing: 2px;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                width: 24px;
+                height: 24px;
+                source: root.icon;
+                colorize: root.active ? Theme.accent : Theme.muted;
+            }
+        }
+        Text {
+            text: root.label;
+            color: root.active ? Theme.accent : Theme.muted;
+            font-size: 12px;
+            horizontal-alignment: center;
+        }
     }
 }
 
@@ -54,9 +72,24 @@ export component AndroidWindow inherits Window {
 
     callback select-server(int);
     callback connect-pressed();
+    in property <string> version-text: "";
+    in property <string> log-text: "";
     callback add-subscription(string);
+    callback refresh-logs();
+    callback clear-logs();
+
+    // Paint the area under the system status bar like the top bar.
+    Rectangle {
+        y: 0px;
+        height: root.safe-area-insets.top;
+        background: Theme.panel-bg;
+    }
 
     VerticalLayout {
+        padding-top: root.safe-area-insets.top;
+        padding-bottom: root.safe-area-insets.bottom;
+        padding-left: root.safe-area-insets.left;
+        padding-right: root.safe-area-insets.right;
         // top bar
         Rectangle {
             height: 56px;
@@ -74,10 +107,12 @@ export component AndroidWindow inherits Window {
         // pages (only one visible)
         Rectangle {
             vertical-stretch: 1;
+            min-height: 100px;
 
             // Серверы: connect button, selected server, server list
-            VerticalLayout {
-                visible: root.tab == 0;
+            if root.tab == 0 : VerticalLayout {
+                width: parent.width;
+                height: parent.height;
                 padding: 16px;
                 spacing: 8px;
 
@@ -146,11 +181,33 @@ export component AndroidWindow inherits Window {
                                 font-size: 16px;
                                 overflow: elide;
                             }
-                            Text {
-                                text: server.subtitle;
-                                color: Theme.muted;
-                                font-size: 13px;
-                                overflow: elide;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                alignment: start;
+                                Text {
+                                    text: server.address;
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                                if !server.is-exit : Text {
+                                    text: "вход";
+                                    color: Theme.muted;
+                                    font-size: 10px;
+                                    vertical-alignment: center;
+                                }
+                                if server.group > 1 : Text {
+                                    text: "×" + server.group;
+                                    color: Theme.accent;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                }
+                                Text {
+                                    text: server.subtitle;
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
                             }
                         }
                     }
@@ -158,8 +215,9 @@ export component AndroidWindow inherits Window {
             }
 
             // Добавить: subscription URL
-            VerticalLayout {
-                visible: root.tab == 1;
+            if root.tab == 1 : VerticalLayout {
+                width: parent.width;
+                height: parent.height;
                 padding: 16px;
                 spacing: 12px;
 
@@ -200,15 +258,72 @@ export component AndroidWindow inherits Window {
                 }
             }
 
-            // Настройки: placeholder
-            VerticalLayout {
-                visible: root.tab == 2;
+            // Настройки: connection mode, version, logs
+            if root.tab == 2 : VerticalLayout {
+                width: parent.width;
+                height: parent.height;
                 padding: 16px;
+                spacing: 8px;
                 Text {
-                    text: "Настройки появятся в следующей версии.";
+                    text: "Режим подключения";
                     color: Theme.muted;
                     font-size: 14px;
-                    wrap: word-wrap;
+                }
+                Text {
+                    text: "VPN (весь трафик устройства)";
+                    color: Theme.text;
+                    font-size: 16px;
+                }
+                Text {
+                    text: "Версия: " + root.version-text;
+                    color: Theme.text;
+                    font-size: 14px;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Логи";
+                        color: Theme.muted;
+                        font-size: 14px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Rectangle {
+                        width: 110px;
+                        height: 40px;
+                        border-radius: Theme.radius;
+                        background: Theme.panel-bg;
+                        TouchArea { clicked => { root.refresh-logs(); } }
+                        Text { text: "Обновить"; color: Theme.text; font-size: 14px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                    Rectangle {
+                        width: 110px;
+                        height: 40px;
+                        border-radius: Theme.radius;
+                        background: Theme.accent;
+                        TouchArea { clicked => { root.clear-logs(); } }
+                        Text { text: "Очистить"; color: Theme.on-accent; font-size: 14px;
+                            horizontal-alignment: center; vertical-alignment: center; }
+                    }
+                }
+                Rectangle {
+                    vertical-stretch: 1;
+                    background: Theme.panel-bg;
+                    border-radius: Theme.radius;
+                    ScrollView {
+                        x: 8px;
+                        y: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height - 16px;
+                        Text {
+                            width: parent.width;
+                            text: root.log-text == "" ? "Лог пуст" : root.log-text;
+                            color: Theme.muted;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+                    }
                 }
             }
         }
@@ -220,16 +335,19 @@ export component AndroidWindow inherits Window {
             HorizontalLayout {
                 BottomTab {
                     label: "Серверы";
+                    icon: @image-url("../../flamix/assets/icons/list.svg");
                     active: root.tab == 0;
                     clicked => { root.tab = 0; }
                 }
                 BottomTab {
                     label: "Добавить";
+                    icon: @image-url("../../flamix/assets/icons/add.svg");
                     active: root.tab == 1;
                     clicked => { root.tab = 1; }
                 }
                 BottomTab {
                     label: "Настройки";
+                    icon: @image-url("../../flamix/assets/icons/settings.svg");
                     active: root.tab == 2;
                     clicked => { root.tab = 2; }
                 }

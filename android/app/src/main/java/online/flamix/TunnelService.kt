@@ -23,22 +23,38 @@ import java.net.Socket
  * runs with the app's uid, so its outbound sockets use the underlying network, no protect() needed.
  */
 class TunnelService : VpnService() {
-    private var tun: ParcelFileDescriptor? = null
+    @Volatile private var tun: ParcelFileDescriptor? = null
+    private val worker = java.util.concurrent.Executors.newSingleThreadExecutor()
     private val core by lazy { CoreService(this) }
 
+    override fun onCreate() {
+        super.onCreate()
+        FileLog.init(this)
+        FileLog.i(TAG, "service created")
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        FileLog.i(TAG, "onStartCommand action=${intent?.action}")
         when (intent?.action) {
             ACTION_STOP -> {
-                shutdown()
-                stopSelf()
+                FileLog.i(TAG, "stop requested by app")
+                core.stop() // unblocks a start that is still waiting for the core port
+                worker.execute {
+                    shutdown()
+                    stopSelf()
+                }
             }
             ACTION_START -> {
                 // startForegroundService() requires startForeground() within a few seconds.
                 startForegroundCompat()
                 val config = intent.getStringExtra(EXTRA_CONFIG)
-                if (config == null || !startTunnel(config)) {
-                    shutdown()
-                    stopSelf()
+                // Must not run on the main thread: waitForPort opens sockets (NetworkOnMainThreadException).
+                worker.execute {
+                    if (config == null || !startTunnel(config)) {
+                        FileLog.e(TAG, "tunnel start failed (config=${config != null}); stopping service")
+                        shutdown()
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -57,7 +73,7 @@ class TunnelService : VpnService() {
                 .addDisallowedApplication(packageName)
                 .establish()
         } catch (e: Exception) {
-            Log.e(TAG, "establish failed", e)
+            FileLog.e(TAG, "establish failed", e)
             null
         } ?: return false
         tun = pfd
@@ -68,18 +84,18 @@ class TunnelService : VpnService() {
             val port = socksPort(cfg)
             val cfgFile = File(filesDir, "singbox-vpn.json").apply { writeText(cfg.toString()) }
             if (!core.start(cfgFile.path)) {
-                Log.e(TAG, "core already running")
+                FileLog.e(TAG, "core already running")
                 return false
             }
             if (!waitForPort(port)) {
-                Log.e(TAG, "core did not open 127.0.0.1:$port; log=${core.logTail().takeLast(5)}")
+                FileLog.e(TAG, "core did not open 127.0.0.1:$port (alive=${core.isRunning}, probe=$lastProbeError); core output:\n${core.logTail().takeLast(30).joinToString("\n")}")
                 return false
             }
             val ok = NativeTunnel.start(fd, port, MTU)
-            if (!ok) Log.e(TAG, "tunnel start failed: ${NativeTunnel.lastError()}")
+            if (!ok) FileLog.e(TAG, "NativeTunnel.start false: ${NativeTunnel.lastError()}") else FileLog.i(TAG, "tunnel started fd=$fd port=$port")
             ok
         } catch (e: Exception) {
-            Log.e(TAG, "tunnel start failed", e)
+            FileLog.e(TAG, "tunnel start failed", e)
             false
         }
     }
@@ -94,14 +110,17 @@ class TunnelService : VpnService() {
         throw IllegalArgumentException("config has no mixed/socks inbound")
     }
 
+    @Volatile private var lastProbeError = ""
+
     private fun waitForPort(port: Int): Boolean {
-        val deadline = System.currentTimeMillis() + 8000
+        val deadline = System.currentTimeMillis() + 20000
         while (System.currentTimeMillis() < deadline) {
             if (!core.isRunning) return false
             try {
                 Socket().use { it.connect(InetSocketAddress("127.0.0.1", port), 200) }
                 return true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                lastProbeError = e.toString()
                 Thread.sleep(100)
             }
         }
@@ -117,12 +136,14 @@ class TunnelService : VpnService() {
     }
 
     override fun onRevoke() {
+        FileLog.w(TAG, "onRevoke (VPN revoked by system/user)")
         // User turned the VPN off in system settings.
         shutdown()
         stopSelf()
     }
 
     override fun onDestroy() {
+        FileLog.w(TAG, "service destroyed; core output:\n${core.logTail().takeLast(15).joinToString("\n")}")
         shutdown()
         super.onDestroy()
     }

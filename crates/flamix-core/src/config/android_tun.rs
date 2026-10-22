@@ -24,12 +24,31 @@ pub const ANDROID_TUN_ADDRESS: &str = "172.19.0.1/30";
 /// Returns `None` when the server has no sing-box outbound (e.g. xhttp, which needs Xray).
 pub fn android_config(
     server: &Server,
+    backups: &[&Server],
     settings: &Settings,
     api_port: u16,
     ctx: &ConnectContext,
 ) -> Option<Value> {
     singbox::outbound(server, settings)?;
-    let mut cfg = singbox::full_config_with(server, settings, false, None, api_port, ctx);
+    // Backups (chosen by the caller, by exit IP) form a failover cluster only when enabled.
+    let nodes: Vec<Server> = std::iter::once(server)
+        .chain(backups.iter().copied())
+        .cloned()
+        .collect();
+    let mut cfg = if settings.failover.enabled && nodes.len() > 1 {
+        singbox::full_config_cluster_with(&nodes, settings, false, None, api_port, ctx)
+    } else {
+        singbox::full_config_with(server, settings, false, None, api_port, ctx)
+    };
+    // Stock sing-box on Android (non-root) dies at start with "netlink socket in Android is
+    // banned by Google" when the network monitor is created, which `auto_detect_interface` needs.
+    // Not needed here: the app is excluded from the VPN, so the core's sockets use the real network.
+    if let Some(route) = cfg.get_mut("route").and_then(Value::as_object_mut) {
+        route.remove("auto_detect_interface");
+    }
+    strip_remote_rule_sets(&mut cfg);
+    // Core output is copied into flamix.log (Settings -> Логи); warn keeps it readable.
+    cfg["log"] = serde_json::json!({"level": "warn", "timestamp": false});
     for inbound in cfg.get_mut("inbounds")?.as_array_mut()? {
         if inbound["type"] == "mixed" {
             let ib = inbound.as_object_mut()?;
@@ -38,6 +57,24 @@ pub fn android_config(
         }
     }
     Some(cfg)
+}
+
+/// Removes remote `.srs` rule sets and every route/DNS rule that uses them. The core downloads
+/// them at start (through the proxy); if the download fails or is slow the core exits with FATAL
+/// and the VPN drops at once. TODO: ship the rule sets as local files and re-enable routing.
+fn strip_remote_rule_sets(cfg: &mut Value) {
+    if let Some(route) = cfg.get_mut("route").and_then(Value::as_object_mut) {
+        route.remove("rule_set");
+    }
+    for (section, key) in [("route", "rules"), ("dns", "rules")] {
+        if let Some(rules) = cfg
+            .get_mut(section)
+            .and_then(|s| s.get_mut(key))
+            .and_then(Value::as_array_mut)
+        {
+            rules.retain(|r| !r.to_string().contains("\"rule_set\""));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -68,7 +105,26 @@ mod tests {
     }
 
     fn cfg(settings: &Settings) -> Value {
-        android_config(&vless(), settings, 9090, &ConnectContext::default()).unwrap()
+        android_config(&vless(), &[], settings, 9090, &ConnectContext::default()).unwrap()
+    }
+
+    #[test]
+    fn android_config_has_no_auto_detect_interface() {
+        let c = cfg(&Settings::default());
+        assert!(c["route"].get("auto_detect_interface").is_none());
+        assert!(c["route"].get("default_interface").is_none());
+    }
+
+    #[test]
+    fn remote_rule_sets_are_stripped() {
+        let mut c = json!({
+            "route": {"rule_set": [{"tag": "x"}], "rules": [{"rule_set": ["x"], "outbound": "direct"}, {"protocol": "dns"}]},
+            "dns": {"rules": [{"rule_set": ["x"], "server": "d"}]}
+        });
+        strip_remote_rule_sets(&mut c);
+        assert!(c["route"].get("rule_set").is_none());
+        assert_eq!(c["route"]["rules"].as_array().unwrap().len(), 1);
+        assert!(c["dns"]["rules"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -112,9 +168,14 @@ mod tests {
     fn android_config_none_for_non_singbox_server() {
         let mut s = vless();
         s.transport.network = Network::Xhttp;
-        assert!(
-            android_config(&s, &Settings::default(), 9090, &ConnectContext::default()).is_none()
-        );
+        assert!(android_config(
+            &s,
+            &[],
+            &Settings::default(),
+            9090,
+            &ConnectContext::default()
+        )
+        .is_none());
     }
 
     /// `sing-box check` on the generated config (real binary via FLAMIX_SINGBOX_BIN).
