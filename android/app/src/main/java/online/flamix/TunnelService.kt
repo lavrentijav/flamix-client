@@ -104,7 +104,7 @@ class TunnelService : VpnService() {
     }
 
     private fun waitForPort(port: Int): Boolean {
-        val deadline = System.currentTimeMillis() + 8000
+        val deadline = System.currentTimeMillis() + 20000
         while (System.currentTimeMillis() < deadline) {
             if (!core.isRunning) return false
             try {
