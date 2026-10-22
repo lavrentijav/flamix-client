@@ -637,6 +637,9 @@ export component AndroidWindow inherits Window {
     callback long-press-start();
     callback long-press-end();
 
+    // About page (full screen, opened from Settings).
+    in-out property <bool> about-open: false;
+
     // Hidden device id editor (opened by a long press on the version line).
     in property <bool> hwid-open: false;
     in property <string> hwid-auto;
@@ -1323,6 +1326,34 @@ export component AndroidWindow inherits Window {
                         }
                     }
 
+                    // Opens the About page (licences, links).
+                    Rectangle {
+                        height: 56px;
+                        background: about-ta.has-hover ? Theme.hover : Theme.card-body;
+                        border-radius: Theme.radius;
+                        about-ta := TouchArea { clicked => { root.about-open = true; } }
+                        HorizontalLayout {
+                            x: 14px;
+                            width: parent.width - 28px;
+                            height: parent.height;
+                            spacing: 8px;
+                            Text {
+                                horizontal-stretch: 1;
+                                text: "О программе";
+                                color: Theme.text;
+                                font-size: 15px;
+                                vertical-alignment: center;
+                            }
+                            Image {
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - self.height) / 2;
+                                source: @image-url("../../flamix/assets/icons/chevron-right.svg");
+                                colorize: Theme.muted;
+                            }
+                        }
+                    }
+
                     Rectangle {
                         background: Theme.card-body;
                         border-radius: Theme.radius;
@@ -1445,6 +1476,127 @@ export component AndroidWindow inherits Window {
                     Btn { horizontal-stretch: 1; text: "Сбросить"; clicked => { root.hwid-reset(); } }
                 }
                 Btn { text: "Закрыть"; clicked => { root.hwid-close(); } }
+            }
+        }
+    }
+
+    // About page: version, description, licences, links as selectable text.
+    if root.about-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: Theme.window-bg;
+        VerticalLayout {
+            padding-top: root.safe-area-insets.top + 8px;
+            padding-bottom: 12px;
+            padding-left: 12px;
+            padding-right: 12px;
+            spacing: 12px;
+            HorizontalLayout {
+                height: 48px;
+                spacing: 8px;
+                Rectangle {
+                    width: 48px;
+                    height: 48px;
+                    border-radius: 24px;
+                    background: close-ta.has-hover ? Theme.hover : transparent;
+                    Image {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        width: 22px;
+                        height: 22px;
+                        source: @image-url("../../flamix/assets/icons/close.svg");
+                        colorize: Theme.text;
+                    }
+                    close-ta := TouchArea { clicked => { root.about-open = false; } }
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: "О программе";
+                    color: Theme.text;
+                    font-size: 20px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+            }
+            ScrollView {
+                VerticalLayout {
+                    spacing: 12px;
+                    padding-bottom: 16px;
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: about-main.preferred-height + 24px;
+                        about-main := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 6px;
+                            Text { text: "Flamix"; color: Theme.text; font-size: 20px; font-weight: 600; }
+                            Text { text: "Версия " + root.version-text; color: Theme.text; font-size: 14px; }
+                            Text {
+                                text: "Кроссплатформенный VPN-клиент на Rust с интерфейсом Slint.";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: about-links.preferred-height + 24px;
+                        about-links := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 6px;
+                            Text { text: "Ссылки"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: "Исходный код"; color: Theme.muted; font-size: 12px; }
+                            TextInput {
+                                read-only: true;
+                                font-size: 14px;
+                                text: "https://github.com/lavrentijav/flamix-client";
+                                color: Theme.text;
+                                wrap: word-wrap;
+                            }
+                            Text { text: "Релизы"; color: Theme.muted; font-size: 12px; }
+                            TextInput {
+                                read-only: true;
+                                font-size: 14px;
+                                text: "https://github.com/lavrentijav/flamix-client/releases";
+                                color: Theme.text;
+                                wrap: word-wrap;
+                            }
+                            Text { text: "Сообщить о проблеме"; color: Theme.muted; font-size: 12px; }
+                            TextInput {
+                                read-only: true;
+                                font-size: 14px;
+                                text: "https://github.com/lavrentijav/flamix-client/issues";
+                                color: Theme.text;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: about-lic.preferred-height + 24px;
+                        about-lic := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 6px;
+                            Text { text: "Лицензии"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: "Flamix — GPL-3.0-or-later"; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                            Text { text: "Xray-core — MPL-2.0"; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                            Text { text: "sing-box — GPL-3.0"; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                            Text { text: "Slint — royalty-free / GPL-3.0"; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                            Text { text: "Иконки Alfa-Bank — MIT"; color: Theme.muted; font-size: 13px; wrap: word-wrap; }
+                        }
+                    }
+                }
             }
         }
     }
