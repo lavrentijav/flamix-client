@@ -16,14 +16,55 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # sing-box release built for Android (latest stable 1.14.x at the time of M2)
+  SINGBOX_TAG: v1.14.3
+  SINGBOX_BUILD_TAGS: with_gvisor,with_quic,with_utls,with_wireguard,with_clash_api,badlinkname,tfogo_checklinkname0
 
 jobs:
+  singbox:
+    name: sing-box (android arm64 + x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Clone sing-box ${{ env.SINGBOX_TAG }}
+        run: git clone --depth 1 --branch "$SINGBOX_TAG" https://github.com/SagerNet/sing-box.git sing-box
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sing-box/go.mod
+          cache-dependency-path: sing-box/go.sum
+
+      - name: Build
+        working-directory: sing-box
+        run: |
+          go version
+          for pair in arm64:arm64-v8a amd64:x86_64; do
+            arch=${pair%%:*}; abi=${pair##*:}
+            mkdir -p "$GITHUB_WORKSPACE/jni/$abi"
+            GOOS=android GOARCH=$arch CGO_ENABLED=0 go build -tags "$SINGBOX_BUILD_TAGS" -trimpath \
+              -ldflags "-s -w" -o "$GITHUB_WORKSPACE/jni/$abi/libsingbox.so" ./cmd/sing-box
+          done
+          file "$GITHUB_WORKSPACE"/jni/*/libsingbox.so || true
+          ls -l "$GITHUB_WORKSPACE"/jni/*/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: singbox-jnilibs
+          path: jni
+          if-no-files-found: error
+
   apk:
     name: Debug APK
+    needs: singbox
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: singbox-jnilibs
+          path: android/app/src/main/jniLibs
 
       - uses: actions/setup-java@v4
         with:
@@ -74,3 +115,31 @@ jobs:
           name: flamix-android-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+  emulator:
+    name: Emulator core check (optional)
+    needs: apk
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: flamix-android-debug-apk
+          path: apk
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 34
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: scripts/android-m2-check.sh apk/app-debug.apk
