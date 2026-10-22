@@ -580,6 +580,18 @@ fn build_config(
             "strict_route": settings.tun_strict_route,
             "route_exclude_address": route_exclude,
         }));
+    } else if settings.mode == crate::model::ConnectionMode::Tproxy && upstream_socks.is_none() {
+        // Linux transparent-proxy capture: nftables TPROXY diverts matched packets to this
+        // local port. No tun device is created, so applications see the real network. The
+        // netfilter rules that make traffic reach this port live in flamix-sys (installed
+        // alongside the elevated core, torn down on exit).
+        inbounds.push(json!({
+            "type": "tproxy",
+            "tag": "tproxy-in",
+            "listen": "127.0.0.1",
+            "listen_port": settings.tproxy_port,
+            "network": "tcp udp",
+        }));
     } else if upstream_socks.is_none() {
         // With an upstream SOCKS chain the Xray process binds the local listener.
         // LIMITATION: sing-box's `mixed` inbound always serves UDP (TCP + UDP on one port);
@@ -1269,6 +1281,33 @@ mod tests {
         assert!(sets.iter().any(|s| {
             s["tag"] == json!("geosite-category-ru") && s["download_detour"] == json!("proxy")
         }));
+    }
+
+    #[test]
+    fn full_config_tproxy_shape() {
+        let s = server(Credentials::Vless {
+            uuid: "u".into(),
+            flow: None,
+            encryption: None,
+        });
+        let settings = Settings {
+            mode: ConnectionMode::Tproxy,
+            tproxy_port: 24680,
+            ..Settings::default()
+        };
+        // TProxy uses the sing-box native outbound path (no upstream SOCKS, no tun).
+        let cfg = full_config(&s, &settings, false, None, 10819);
+
+        let inbound = &cfg["inbounds"][0];
+        assert_eq!(inbound["type"], json!("tproxy"));
+        assert_eq!(inbound["listen"], json!("127.0.0.1"));
+        assert_eq!(inbound["listen_port"], json!(24680));
+        assert_eq!(inbound["network"], json!("tcp udp"));
+        // No mixed and no tun inbound in TProxy mode.
+        let inbounds = cfg["inbounds"].as_array().unwrap();
+        assert!(inbounds
+            .iter()
+            .all(|i| i["type"] != json!("mixed") && i["type"] != json!("tun")));
     }
 
     #[test]

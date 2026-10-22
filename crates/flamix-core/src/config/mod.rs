@@ -438,12 +438,16 @@ pub fn plan_cluster(nodes: &[Server], settings: &Settings, ctx: &ConnectContext)
                 });
             }
             let api_port = api_port(CoreKind::SingBox, settings);
+            // `tun=true` adds the tun inbound; `tun=false` with `settings.mode == Tproxy` adds
+            // the tproxy inbound instead. Both paths keep `elevated: true` (TUN needs the
+            // tunnel device, TProxy needs the netfilter rules + CAP_NET_ADMIN).
+            let tun = settings.mode == ConnectionMode::Tun;
             plans.push(CorePlan {
                 core: CoreKind::SingBox,
                 config: singbox::full_config_with(
                     primary,
                     settings,
-                    true,
+                    tun,
                     upstream_socks,
                     api_port,
                     ctx,
@@ -643,6 +647,38 @@ mod tests {
         assert_eq!(plan[1].config["outbounds"][0]["type"], "socks");
         assert_eq!(plan[1].config["outbounds"][0]["server_port"], 10808);
         assert_eq!(plan[1].config["inbounds"][0]["type"], "tun");
+    }
+
+    #[test]
+    fn tproxy_regular_protocol_singbox_only() {
+        let settings = Settings {
+            mode: ConnectionMode::Tproxy,
+            tproxy_port: 54321,
+            ..Settings::default()
+        };
+        let s = server(
+            Credentials::Vless {
+                uuid: "u".into(),
+                flow: None,
+                encryption: None,
+            },
+            Transport {
+                network: Network::Ws,
+                path: Some("/ws".into()),
+                ..Transport::default()
+            },
+        );
+        let plan = plan(&s, &settings);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].core, CoreKind::SingBox);
+        assert!(plan[0].elevated);
+        assert_eq!(plan[0].config["inbounds"][0]["type"], "tproxy");
+        assert_eq!(plan[0].config["inbounds"][0]["listen_port"], 54321);
+        assert!(plan[0].config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["type"] != "tun"));
     }
 
     #[test]
