@@ -64,6 +64,10 @@ struct UiState {
     updating: Vec<String>,
     /// Subscription the settings sheet is editing.
     sheet_id: String,
+    /// Id of the current press on the version line (0 = none); a long press fires only while
+    /// its id is still current.
+    press: u64,
+    press_seq: u64,
 }
 
 type Shared = Arc<Mutex<UiState>>;
@@ -151,6 +155,34 @@ fn rule_at(state: &mut AppState, index: i32) -> Option<&mut RoutingRule> {
     state.settings.routing.custom_rules.get_mut(i)
 }
 
+/// Pushes the settings chips (core, theme, language) from `state`.
+fn refresh_settings(window: &AndroidWindow, state: &AppState) {
+    let core = phone::CORE_OVERRIDES
+        .iter()
+        .position(|c| *c == state.settings.core_override)
+        .unwrap_or(0);
+    window.set_core_index(i32::try_from(core).unwrap_or(0));
+    window.set_theme_index(match state.settings.theme {
+        flamix_core::model::Theme::System => 0,
+        flamix_core::model::Theme::Dark => 1,
+        flamix_core::model::Theme::Light => 2,
+    });
+    window.set_language_index(if state.settings.language.eq_ignore_ascii_case("en") {
+        1
+    } else {
+        0
+    });
+}
+
+/// Pushes the DNS fields and the ping URL (on load and after a save; the user edits them in place).
+fn load_settings_fields(window: &AndroidWindow, state: &AppState) {
+    let dns = &state.settings.dns;
+    window.set_dns_remote(dns.remote.clone().into());
+    window.set_dns_direct(dns.direct.clone().into());
+    window.set_dns_bootstrap(dns.bootstrap.clone().into());
+    window.set_ping_url(state.settings.ping_url.clone().into());
+}
+
 /// Pushes the routing tab (presets, Anixart mirror, rules, provider routing) from `state`.
 fn refresh_routing(window: &AndroidWindow, state: &AppState) {
     let routing = &state.settings.routing;
@@ -195,9 +227,19 @@ fn refresh_routing(window: &AndroidWindow, state: &AppState) {
     window.set_providers(ModelRc::new(VecModel::from(providers)));
 }
 
+/// Opens the device id editor with the current values.
+fn open_device_id_editor(window: &AndroidWindow, dir: &Path) {
+    let Ok(state) = store::load(dir) else { return };
+    window.set_hwid_auto(state.device_id.clone().unwrap_or_default().into());
+    window.set_hwid_input(state.hwid_override.clone().unwrap_or_default().into());
+    window.set_hwid_error("".into());
+    window.set_hwid_open(true);
+}
+
 /// Pushes the subscription cards and the selection from `state` into the window.
 fn refresh(window: &AndroidWindow, state: &AppState, shared: &Shared) {
     refresh_routing(window, state);
+    refresh_settings(window, state);
     let (filter, updating) = {
         let ui = lock(shared);
         (ui.filter.clone(), ui.updating.clone())
@@ -321,6 +363,9 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
     let window = AndroidWindow::new()?;
     let shared: Shared = Arc::new(Mutex::new(UiState::default()));
     reload(&window, &data_dir, &shared);
+    if let Ok(state) = store::load(&data_dir) {
+        load_settings_fields(&window, &state);
+    }
 
     window.set_version_text(env!("CARGO_PKG_VERSION").into());
     window.set_log_text(applog::tail(&data_dir, 200).into());
@@ -638,6 +683,182 @@ pub fn run(data_dir: PathBuf) -> Result<(), slint::PlatformError> {
                 sub.options.ignore_provider_routing = on;
             });
             show(&w, &shared, result);
+        }
+    });
+
+    // Settings tab.
+    window.on_core_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let name = usize::try_from(index)
+                .ok()
+                .and_then(|i| phone::CORE_OVERRIDES.get(i))
+                .map_or("auto", |c| c);
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.core_override = name.into()),
+            );
+        }
+    });
+    window.on_theme_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let theme = match index {
+                1 => flamix_core::model::Theme::Dark,
+                2 => flamix_core::model::Theme::Light,
+                _ => flamix_core::model::Theme::System,
+            };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.theme = theme),
+            );
+        }
+    });
+    window.on_language_changed({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move |index: i32| {
+            let Some(w) = weak.upgrade() else { return };
+            let language = if index == 1 { "en" } else { "ru" };
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.settings.language = language.into()),
+            );
+        }
+    });
+    window.on_dns_save({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let remote = w.get_dns_remote().trim().to_string();
+            let direct = w.get_dns_direct().trim().to_string();
+            let bootstrap = w.get_dns_bootstrap().trim().to_string();
+            if let Err(err) = phone::check_dns(&remote, &direct) {
+                w.set_status_text(err.into());
+                return;
+            }
+            let result = phone::update_state(&dir, |st| {
+                st.settings.dns.remote = remote;
+                st.settings.dns.direct = direct;
+                st.settings.dns.bootstrap = bootstrap;
+            });
+            match result {
+                Ok(state) => {
+                    load_settings_fields(&w, &state);
+                    show(&w, &shared, Ok(state));
+                    w.set_status_text("DNS сохранён".into());
+                }
+                Err(err) => w.set_status_text(err.into()),
+            }
+        }
+    });
+    window.on_ping_save({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let url = w.get_ping_url().trim().to_string();
+            if phone::safe_url(&url)
+                .filter(|u| u.starts_with("http"))
+                .is_none()
+            {
+                w.set_status_text("Адрес должен начинаться с http:// или https://".into());
+                return;
+            }
+            let result = phone::update_state(&dir, |st| st.settings.ping_url = url);
+            match result {
+                Ok(state) => {
+                    load_settings_fields(&w, &state);
+                    show(&w, &shared, Ok(state));
+                    w.set_status_text("Адрес сохранён".into());
+                }
+                Err(err) => w.set_status_text(err.into()),
+            }
+        }
+    });
+    window.on_long_press_start({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let press = {
+                let mut ui = lock(&shared);
+                ui.press_seq += 1;
+                ui.press = ui.press_seq;
+                ui.press
+            };
+            let weak = weak.clone();
+            let dir = dir.clone();
+            let shared = shared.clone();
+            slint::Timer::single_shot(Duration::from_millis(700), move || {
+                {
+                    let mut ui = lock(&shared);
+                    if ui.press != press {
+                        return;
+                    }
+                    ui.press = 0;
+                }
+                let Some(w) = weak.upgrade() else { return };
+                open_device_id_editor(&w, &dir);
+            });
+        }
+    });
+    window.on_long_press_end({
+        let shared = shared.clone();
+        move || {
+            lock(&shared).press = 0;
+        }
+    });
+    window.on_hwid_save({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            let input = w.get_hwid_input().to_string();
+            match phone::hwid_from_input(&input) {
+                Ok(value) => {
+                    let result = phone::update_state(&dir, |st| st.hwid_override = value);
+                    w.set_hwid_open(false);
+                    show(&w, &shared, result);
+                }
+                Err(err) => w.set_hwid_error(err.into()),
+            }
+        }
+    });
+    window.on_hwid_reset({
+        let weak = window.as_weak();
+        let dir = data_dir.clone();
+        let shared = shared.clone();
+        move || {
+            let Some(w) = weak.upgrade() else { return };
+            w.set_hwid_open(false);
+            show(
+                &w,
+                &shared,
+                phone::update_state(&dir, |st| st.hwid_override = None),
+            );
+        }
+    });
+    window.on_hwid_close({
+        let weak = window.as_weak();
+        move || {
+            if let Some(w) = weak.upgrade() {
+                w.set_hwid_open(false);
+            }
         }
     });
 

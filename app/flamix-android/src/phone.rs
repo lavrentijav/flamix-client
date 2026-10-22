@@ -869,6 +869,32 @@ pub fn provider_cards(state: &AppState) -> Vec<ProviderCard> {
         .collect()
 }
 
+/// Core names of the UI chips, in order (`Settings::core_override` values).
+pub const CORE_OVERRIDES: [&str; 4] = ["auto", "xray", "sing-box", "mihomo"];
+
+/// Error text of the device id editor (the same wording as the desktop dialog).
+pub const HWID_ERROR: &str = "от 8 до 64 символов: латиница, цифры, - и _";
+
+/// Parses the device id editor input: empty clears the override, otherwise it must be valid.
+pub fn hwid_from_input(input: &str) -> Result<Option<String>, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else if flamix_core::model::valid_hwid(value) {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(HWID_ERROR.to_string())
+    }
+}
+
+/// Checks the DNS fields. `remote` and `direct` are required; `bootstrap` may be empty.
+pub fn check_dns(remote: &str, direct: &str) -> Result<(), String> {
+    if remote.trim().is_empty() || direct.trim().is_empty() {
+        return Err("Укажите оба DNS-адреса: через прокси и напрямую".into());
+    }
+    Ok(())
+}
+
 /// Random lowercase hex id (same scheme as the desktop controller).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -965,6 +991,18 @@ mod tests {
             enabled: true,
         });
         assert_eq!(routing_error(&st), "Правило 2: хотя бы одно значение");
+    }
+
+    #[test]
+    fn hwid_input_rules() {
+        assert_eq!(hwid_from_input("  "), Ok(None));
+        assert_eq!(
+            hwid_from_input(" abcd-1234_x "),
+            Ok(Some("abcd-1234_x".to_string()))
+        );
+        assert!(hwid_from_input("short").is_err());
+        assert!(hwid_from_input("bad space here").is_err());
+        assert!(check_dns("", "x").is_err());
     }
 
     #[test]

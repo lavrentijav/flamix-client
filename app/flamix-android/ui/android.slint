@@ -593,6 +593,31 @@ export component AndroidWindow inherits Window {
     callback provider-enabled-changed(string, bool);
     callback provider-ignored-changed(string, bool);
 
+    // Settings tab
+    in property <int> core-index: 0;
+    in property <int> theme-index: 0;
+    in property <int> language-index: 0;
+    in-out property <string> dns-remote;
+    in-out property <string> dns-direct;
+    in-out property <string> dns-bootstrap;
+    in-out property <string> ping-url;
+    callback core-changed(int);
+    callback theme-changed(int);
+    callback language-changed(int);
+    callback dns-save();
+    callback ping-save();
+    callback long-press-start();
+    callback long-press-end();
+
+    // Hidden device id editor (opened by a long press on the version line).
+    in property <bool> hwid-open: false;
+    in property <string> hwid-auto;
+    in-out property <string> hwid-input;
+    in property <string> hwid-error;
+    callback hwid-save();
+    callback hwid-reset();
+    callback hwid-close();
+
     // Subscription settings sheet (opened by a card's settings button).
     in-out property <bool> sheet-open: false;
     in-out property <string> sheet-name;
@@ -1022,74 +1047,177 @@ export component AndroidWindow inherits Window {
                 horizontal-alignment: center;
             }
 
-            // Настройки: connection mode, version, logs
-            if root.tab == 3 : VerticalLayout {
-                width: parent.width;
-                height: parent.height;
-                padding: 16px;
-                spacing: 8px;
-                Text {
-                    text: "Режим подключения";
-                    color: Theme.muted;
-                    font-size: 14px;
-                }
-                Text {
-                    text: "VPN (весь трафик устройства)";
-                    color: Theme.text;
-                    font-size: 16px;
-                }
-                Text {
-                    text: "Версия: " + root.version-text;
-                    color: Theme.text;
-                    font-size: 14px;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text {
-                        text: "Логи";
-                        color: Theme.muted;
-                        font-size: 14px;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                    }
+            // Настройки: connection, core, DNS, ping URL, interface, version, logs
+            if root.tab == 3 : ScrollView {
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 12px;
+
                     Rectangle {
-                        width: 110px;
-                        height: 40px;
+                        background: Theme.card-body;
                         border-radius: Theme.radius;
-                        background: Theme.panel-bg;
-                        TouchArea { clicked => { root.refresh-logs(); } }
-                        Text { text: "Обновить"; color: Theme.text; font-size: 14px;
-                            horizontal-alignment: center; vertical-alignment: center; }
+                        height: conn-col.preferred-height + 24px;
+                        conn-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 6px;
+                            Text { text: "Режим подключения"; color: Theme.muted; font-size: 12px; }
+                            Text { text: "VPN (весь трафик устройства)"; color: Theme.text; font-size: 16px; font-weight: 600; wrap: word-wrap; }
+                        }
                     }
+
                     Rectangle {
-                        width: 110px;
-                        height: 40px;
+                        background: Theme.card-body;
                         border-radius: Theme.radius;
-                        background: Theme.accent;
-                        TouchArea { clicked => { root.clear-logs(); } }
-                        Text { text: "Очистить"; color: Theme.on-accent; font-size: 14px;
-                            horizontal-alignment: center; vertical-alignment: center; }
+                        height: core-col.preferred-height + 24px;
+                        core-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Ядро"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                Chip { horizontal-stretch: 1; text: "Авто"; selected: root.core-index == 0; clicked => { root.core-changed(0); } }
+                                Chip { horizontal-stretch: 1; text: "Xray"; selected: root.core-index == 1; clicked => { root.core-changed(1); } }
+                                Chip { horizontal-stretch: 1; text: "sing-box"; selected: root.core-index == 2; clicked => { root.core-changed(2); } }
+                                Chip { horizontal-stretch: 1; text: "mihomo"; selected: root.core-index == 3; clicked => { root.core-changed(3); } }
+                            }
+                            Text {
+                                text: "На Android VPN работает на sing-box: выбор Xray или mihomo сохраняется, но на телефоне не применяется.";
+                                color: Theme.muted;
+                                font-size: 12px;
+                                wrap: word-wrap;
+                            }
+                        }
                     }
-                }
-                Rectangle {
-                    vertical-stretch: 1;
-                    background: Theme.panel-bg;
-                    border-radius: Theme.radius;
-                    ScrollView {
-                        x: 8px;
-                        y: 8px;
-                        width: parent.width - 16px;
-                        height: parent.height - 16px;
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: dns-col.preferred-height + 24px;
+                        dns-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "DNS"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: "Через прокси"; color: Theme.muted; font-size: 12px; }
+                            LineEdit { height: 48px; font-size: 14px; placeholder-text: "https://1.1.1.1/dns-query"; text <=> root.dns-remote; }
+                            Text { text: "Напрямую"; color: Theme.muted; font-size: 12px; }
+                            LineEdit { height: 48px; font-size: 14px; placeholder-text: "https://77.88.8.8/dns-query"; text <=> root.dns-direct; }
+                            Text { text: "Bootstrap (IP, необязательно)"; color: Theme.muted; font-size: 12px; }
+                            LineEdit { height: 48px; font-size: 14px; placeholder-text: "77.88.8.8"; text <=> root.dns-bootstrap; }
+                            Btn { text: "Сохранить DNS"; primary: true; clicked => { root.dns-save(); } }
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: ping-col.preferred-height + 24px;
+                        ping-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Адрес для проверки задержки"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            LineEdit { height: 48px; font-size: 14px; placeholder-text: "https://www.gstatic.com/generate_204"; text <=> root.ping-url; }
+                            Btn { text: "Сохранить адрес"; primary: true; clicked => { root.ping-save(); } }
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: ui-col.preferred-height + 24px;
+                        ui-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Тема"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                Chip { horizontal-stretch: 1; text: "Системная"; selected: root.theme-index == 0; clicked => { root.theme-changed(0); } }
+                                Chip { horizontal-stretch: 1; text: "Тёмная"; selected: root.theme-index == 1; clicked => { root.theme-changed(1); } }
+                                Chip { horizontal-stretch: 1; text: "Светлая"; selected: root.theme-index == 2; clicked => { root.theme-changed(2); } }
+                            }
+                            Text { text: "Язык"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 4px;
+                                Chip { horizontal-stretch: 1; text: "Русский"; selected: root.language-index == 0; clicked => { root.language-changed(0); } }
+                                Chip { horizontal-stretch: 1; text: "English"; selected: root.language-index == 1; clicked => { root.language-changed(1); } }
+                            }
+                        }
+                    }
+
+                    // The version line: a long press opens the device id editor (not documented).
+                    Rectangle {
+                        height: 48px;
+                        background: version-ta.has-hover ? Theme.hover : transparent;
+                        border-radius: Theme.radius;
+                        version-ta := TouchArea {
+                            pointer-event(ev) => {
+                                if (ev.kind == PointerEventKind.down) { root.long-press-start(); }
+                                if (ev.kind == PointerEventKind.up || ev.kind == PointerEventKind.cancel) { root.long-press-end(); }
+                            }
+                        }
                         Text {
-                            width: parent.width;
-                            text: root.log-text == "" ? "Лог пуст" : root.log-text;
+                            x: 12px;
+                            width: parent.width - 24px;
+                            height: parent.height;
+                            text: "Версия: " + root.version-text;
                             color: Theme.muted;
-                            font-size: 11px;
-                            wrap: word-wrap;
+                            font-size: 14px;
+                            vertical-alignment: center;
+                        }
+                    }
+
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: log-col.preferred-height + 24px;
+                        log-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "Логи"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                Btn { horizontal-stretch: 1; text: "Обновить"; clicked => { root.refresh-logs(); } }
+                                Btn { horizontal-stretch: 1; text: "Очистить"; primary: true; clicked => { root.clear-logs(); } }
+                            }
+                            Rectangle {
+                                height: 260px;
+                                background: Theme.panel-bg;
+                                border-radius: 8px;
+                                clip: true;
+                                log-view := ScrollView {
+                                    x: 0px;
+                                    y: 0px;
+                                    width: parent.width;
+                                    height: parent.height;
+                                    // Starts scrolled to the bottom (newest lines) until the user scrolls.
+                                    content-y: min(0px, self.visible-height - self.content-height);
+                                    VerticalLayout {
+                                        padding: 8px;
+                                        Text {
+                                            text: root.log-text == "" ? "Лог пуст" : root.log-text;
+                                            color: Theme.muted;
+                                            font-size: 11px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+
         }
 
         // bottom tabs (each at least 48 dp high; widths follow the label text)
@@ -1127,6 +1255,48 @@ export component AndroidWindow inherits Window {
                     active: root.tab == 4;
                     clicked => { root.tab = 4; }
                 }
+            }
+        }
+    }
+
+    // Device id editor (hidden feature).
+    if root.hwid-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.width;
+        height: root.height;
+        background: #000000B3;
+        TouchArea { clicked => { root.hwid-close(); } }
+        Rectangle {
+            x: 0px;
+            y: parent.height - self.height;
+            width: parent.width;
+            height: hwid-col.preferred-height + 32px;
+            background: Theme.panel-bg;
+            border-radius: 16px;
+            TouchArea { }
+            hwid-col := VerticalLayout {
+                x: 16px;
+                y: 16px;
+                width: parent.width - 32px;
+                spacing: 10px;
+                Text { text: "Идентификатор устройства"; color: Theme.text; font-size: 18px; font-weight: 600; }
+                Text { text: "Автоматический"; color: Theme.muted; font-size: 13px; }
+                LineEdit { height: 48px; font-size: 14px; read-only: true; text: root.hwid-auto; }
+                Text { text: "Свой HWID"; color: Theme.muted; font-size: 13px; }
+                LineEdit { height: 48px; font-size: 15px; text <=> root.hwid-input; }
+                if root.hwid-error != "" : Text {
+                    text: root.hwid-error;
+                    color: Theme.danger;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Btn { horizontal-stretch: 1; text: "Сохранить"; primary: true; clicked => { root.hwid-save(); } }
+                    Btn { horizontal-stretch: 1; text: "Сбросить"; clicked => { root.hwid-reset(); } }
+                }
+                Btn { text: "Закрыть"; clicked => { root.hwid-close(); } }
             }
         }
     }
