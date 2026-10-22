@@ -6,7 +6,9 @@
 //! touches the file itself.
 
 use flamix_core::config::{self, android_tun, ConnectContext, CoreKind};
-use flamix_core::model::{AppState, RoutingPreset, RoutingRule, RuleAction, Server, Subscription};
+use flamix_core::model::{
+    AppState, RoutingPreset, RoutingRule, RuleAction, Server, Subscription, TrafficInfo,
+};
 use flamix_core::provider_routing::RoutingLinkAction;
 use flamix_core::{deeplink, link, store, subscription};
 use std::path::Path;
@@ -895,6 +897,134 @@ pub fn check_dns(remote: &str, direct: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Days in the statistics chart.
+pub const CHART_DAYS: usize = 30;
+
+/// One header card of the statistics tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatCard {
+    pub title: String,
+    pub value: String,
+    pub up: String,
+    pub down: String,
+}
+
+/// One day column: bar heights relative to the busiest day (`0.0..=1.0`) and its label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayBar {
+    pub label: String,
+    pub up: f32,
+    pub down: f32,
+}
+
+/// Everything the statistics tab shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsView {
+    pub cards: Vec<StatCard>,
+    pub days: Vec<DayBar>,
+    pub top: Vec<TopEntry>,
+}
+
+/// Sum of upload and download over several counters (quota and expiry are not summed).
+fn sum_traffic<'a>(infos: impl IntoIterator<Item = &'a TrafficInfo>) -> TrafficInfo {
+    let mut out = TrafficInfo::default();
+    for info in infos {
+        out.upload = out.upload.saturating_add(info.upload);
+        out.download = out.download.saturating_add(info.download);
+    }
+    out
+}
+
+fn card(title: &str, info: &TrafficInfo) -> StatCard {
+    StatCard {
+        title: title.into(),
+        value: human_bytes(info.used()),
+        up: format!("↑ {}", human_bytes(info.upload)),
+        down: format!("↓ {}", human_bytes(info.download)),
+    }
+}
+
+/// Statistics of the phone: lifetime total, today and the last 30 days, the daily columns and
+/// the busiest servers (by locally accounted traffic). `today` is the local calendar day.
+pub fn stats_view(state: &AppState, today: chrono::NaiveDate) -> StatsView {
+    let total = sum_traffic(state.servers().map(|s| &s.local_traffic));
+    let key = today.format("%Y-%m-%d").to_string();
+    let today_info = state.daily_traffic.get(&key).copied().unwrap_or_default();
+    let days: Vec<(chrono::NaiveDate, TrafficInfo)> = (0..CHART_DAYS)
+        .rev()
+        .map(|offset| {
+            let date = today
+                .checked_sub_days(chrono::Days::new(offset as u64))
+                .unwrap_or(today);
+            let info = state
+                .daily_traffic
+                .get(&date.format("%Y-%m-%d").to_string())
+                .copied()
+                .unwrap_or_default();
+            (date, info)
+        })
+        .collect();
+    let month = sum_traffic(days.iter().map(|(_, info)| info));
+    let busiest = days.iter().map(|(_, i)| i.used()).max().unwrap_or(0).max(1) as f64;
+    let last = days.len().saturating_sub(1);
+    let bars = days
+        .iter()
+        .enumerate()
+        .map(|(i, (date, info))| DayBar {
+            // A label every 7 days, counted back from today.
+            label: if (last - i) % 7 == 0 {
+                date.format("%d.%m").to_string()
+            } else {
+                String::new()
+            },
+            up: (info.upload as f64 / busiest) as f32,
+            down: (info.download as f64 / busiest) as f32,
+        })
+        .collect();
+    let mut servers: Vec<&Server> = state.servers().collect();
+    servers.sort_by_key(|s| std::cmp::Reverse(s.local_traffic.used()));
+    let max = servers
+        .first()
+        .map(|s| s.local_traffic.used())
+        .unwrap_or(0)
+        .max(1);
+    let top = servers
+        .into_iter()
+        .filter(|s| s.local_traffic.used() > 0)
+        .take(6)
+        .map(|s| TopEntry {
+            name: s.name.clone(),
+            iso: s
+                .country
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map_or_else(|| "UN".to_string(), str::to_ascii_uppercase),
+            used: s.local_traffic.used(),
+            fraction: s.local_traffic.used() as f32 / max as f32,
+        })
+        .collect();
+    StatsView {
+        cards: vec![
+            card("Всего", &total),
+            card("Сегодня", &today_info),
+            card("30 дней", &month),
+        ],
+        days: bars,
+        top,
+    }
+}
+
+/// One server line of the statistics tab: country, name, used bytes and the share of the top one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopEntry {
+    pub name: String,
+    pub iso: String,
+    pub used: u64,
+    /// Share of the busiest server (`0.0..=1.0`).
+    pub fraction: f32,
+}
+
 /// Random lowercase hex id (same scheme as the desktop controller).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -1003,6 +1133,50 @@ mod tests {
         assert!(hwid_from_input("short").is_err());
         assert!(hwid_from_input("bad space here").is_err());
         assert!(check_dns("", "x").is_err());
+    }
+
+    #[test]
+    fn stats_totals_days_and_top_servers() {
+        let mut st = AppState::default();
+        let mut a = srv("a", "a.example");
+        a.local_traffic = TrafficInfo {
+            upload: 100,
+            download: 900,
+            total: None,
+            expire: None,
+        };
+        a.country = Some("de".into());
+        st.local_servers.push(a);
+        st.local_servers.push(srv("b", "b.example"));
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        st.daily_traffic.insert(
+            "2026-10-22".into(),
+            TrafficInfo {
+                upload: 10,
+                download: 30,
+                total: None,
+                expire: None,
+            },
+        );
+        st.daily_traffic.insert(
+            "2026-10-01".into(),
+            TrafficInfo {
+                upload: 0,
+                download: 60,
+                total: None,
+                expire: None,
+            },
+        );
+        let view = stats_view(&st, today);
+        assert_eq!(view.cards[0].value, human_bytes(1000));
+        assert_eq!(view.cards[1].value, human_bytes(40));
+        assert_eq!(view.cards[2].value, human_bytes(100));
+        assert_eq!(view.days.len(), CHART_DAYS);
+        assert_eq!(view.days[CHART_DAYS - 1].label, "22.10");
+        assert!((view.days[CHART_DAYS - 1].down - 0.75).abs() < 0.001);
+        assert_eq!(view.top.len(), 1);
+        assert_eq!(view.top[0].iso, "DE");
+        assert_eq!(view.top[0].fraction, 1.0);
     }
 
     #[test]

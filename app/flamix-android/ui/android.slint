@@ -51,6 +51,29 @@ export struct PhoneRule {
     processes: string,
 }
 
+/// One header card of the statistics tab.
+export struct PhoneStatCard {
+    title: string,
+    value: string,
+    up: string,
+    down: string,
+}
+
+/// One day column of the statistics chart (bar heights 0..1 of the busiest day).
+export struct PhoneDay {
+    label: string,
+    up: float,
+    down: float,
+}
+
+/// One busiest-server line of the statistics tab.
+export struct PhoneTop {
+    name: string,
+    iso: string,
+    used: string,
+    fraction: float,
+}
+
 /// One subscription row of the provider-routing section.
 export struct PhoneProvider {
     id: string,
@@ -593,6 +616,11 @@ export component AndroidWindow inherits Window {
     callback provider-enabled-changed(string, bool);
     callback provider-ignored-changed(string, bool);
 
+    // Statistics tab
+    in property <[PhoneStatCard]> stat-cards;
+    in property <[PhoneDay]> stat-days;
+    in property <[PhoneTop]> stat-top;
+
     // Settings tab
     in property <int> core-index: 0;
     in property <int> theme-index: 0;
@@ -1038,13 +1066,133 @@ export component AndroidWindow inherits Window {
                 }
             }
 
-            // Статистика: filled in step 5
-            if root.tab == 4 : Text {
-                text: "Статистика появится в следующей версии приложения.";
-                color: Theme.muted;
-                font-size: 14px;
-                wrap: word-wrap;
-                horizontal-alignment: center;
+            // Статистика: totals, 30-day columns, busiest servers
+            if root.tab == 4 : ScrollView {
+                VerticalLayout {
+                    padding: 12px;
+                    spacing: 12px;
+                    Text { text: "Статистика"; color: Theme.text; font-size: 20px; font-weight: 600; }
+                    HorizontalLayout {
+                        spacing: 6px;
+                        for card in root.stat-cards : Rectangle {
+                            horizontal-stretch: 1;
+                            background: Theme.card-body;
+                            border-radius: Theme.radius;
+                            height: stat-col.preferred-height + 20px;
+                            stat-col := VerticalLayout {
+                                x: 8px;
+                                y: 10px;
+                                width: parent.width - 16px;
+                                spacing: 3px;
+                                Text { text: card.title; color: Theme.muted; font-size: 12px; overflow: elide; }
+                                Text { text: card.value; color: Theme.text; font-size: 16px; font-weight: 600; overflow: elide; }
+                                Text { text: card.up; color: Theme.muted; font-size: 11px; overflow: elide; }
+                                Text { text: card.down; color: Theme.muted; font-size: 11px; overflow: elide; }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: chart-col.preferred-height + 24px;
+                        chart-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 8px;
+                            Text { text: "За 30 дней"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            Text { text: "Оранжевый — отправлено, синий — получено за день"; color: Theme.muted; font-size: 11px; wrap: word-wrap; }
+                            Rectangle {
+                                height: 160px;
+                                HorizontalLayout {
+                                    spacing: 2px;
+                                    alignment: stretch;
+                                    for day in root.stat-days : Rectangle {
+                                        horizontal-stretch: 1;
+                                        background: transparent;
+                                        // upload (bottom, accent)
+                                        Rectangle {
+                                            x: 0px;
+                                            width: parent.width;
+                                            height: max(parent.height * day.up, 0px);
+                                            y: parent.height - self.height;
+                                            background: Theme.accent;
+                                            border-radius: 2px;
+                                        }
+                                        // download (on top of upload, info blue)
+                                        Rectangle {
+                                            x: 0px;
+                                            width: parent.width;
+                                            height: max(parent.height * day.down, 0px);
+                                            y: parent.height - parent.height * day.up - self.height;
+                                            background: Theme.info;
+                                            border-radius: 2px;
+                                        }
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 2px;
+                                for day in root.stat-days : Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 14px;
+                                    Text {
+                                        width: parent.width + 24px;
+                                        x: -12px;
+                                        text: day.label;
+                                        color: Theme.muted;
+                                        font-size: 9px;
+                                        horizontal-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        background: Theme.card-body;
+                        border-radius: Theme.radius;
+                        height: top-col.preferred-height + 24px;
+                        top-col := VerticalLayout {
+                            x: 12px;
+                            y: 12px;
+                            width: parent.width - 24px;
+                            spacing: 10px;
+                            Text { text: "Самые используемые серверы"; color: Theme.text; font-size: 15px; font-weight: 600; }
+                            for entry in root.stat-top : VerticalLayout {
+                                spacing: 4px;
+                                HorizontalLayout {
+                                    spacing: 8px;
+                                    Text {
+                                        horizontal-stretch: 1;
+                                        text: entry.iso + "  " + entry.name;
+                                        color: Theme.text;
+                                        font-size: 14px;
+                                        overflow: elide;
+                                    }
+                                    Text { text: entry.used; color: Theme.muted; font-size: 12px; }
+                                }
+                                Rectangle {
+                                    height: 4px;
+                                    border-radius: 2px;
+                                    background: Theme.track;
+                                    Rectangle {
+                                        x: 0px;
+                                        width: min(parent.width * entry.fraction, parent.width);
+                                        height: parent.height;
+                                        border-radius: 2px;
+                                        background: Theme.accent;
+                                    }
+                                }
+                            }
+                            if root.stat-top.length == 0 : Text {
+                                text: "Пока нет данных: трафик считается по мере работы VPN.";
+                                color: Theme.muted;
+                                font-size: 13px;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
             }
 
             // Настройки: connection, core, DNS, ping URL, interface, version, logs

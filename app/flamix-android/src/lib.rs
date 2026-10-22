@@ -155,6 +155,43 @@ fn rule_at(state: &mut AppState, index: i32) -> Option<&mut RoutingRule> {
     state.settings.routing.custom_rules.get_mut(i)
 }
 
+/// Pushes the statistics tab (today, 30 days, lifetime, columns, busiest servers).
+fn refresh_stats(window: &AndroidWindow, state: &AppState) {
+    let view = phone::stats_view(state, chrono::Local::now().date_naive());
+    let cards: Vec<PhoneStatCard> = view
+        .cards
+        .into_iter()
+        .map(|c| PhoneStatCard {
+            title: c.title.into(),
+            value: c.value.into(),
+            up: c.up.into(),
+            down: c.down.into(),
+        })
+        .collect();
+    window.set_stat_cards(ModelRc::new(VecModel::from(cards)));
+    let days: Vec<PhoneDay> = view
+        .days
+        .into_iter()
+        .map(|d| PhoneDay {
+            label: d.label.into(),
+            up: d.up,
+            down: d.down,
+        })
+        .collect();
+    window.set_stat_days(ModelRc::new(VecModel::from(days)));
+    let top: Vec<PhoneTop> = view
+        .top
+        .into_iter()
+        .map(|t| PhoneTop {
+            name: t.name.into(),
+            iso: t.iso.into(),
+            used: phone::human_bytes(t.used).into(),
+            fraction: t.fraction,
+        })
+        .collect();
+    window.set_stat_top(ModelRc::new(VecModel::from(top)));
+}
+
 /// Pushes the settings chips (core, theme, language) from `state`.
 fn refresh_settings(window: &AndroidWindow, state: &AppState) {
     let core = phone::CORE_OVERRIDES
@@ -238,6 +275,7 @@ fn open_device_id_editor(window: &AndroidWindow, dir: &Path) {
 
 /// Pushes the subscription cards and the selection from `state` into the window.
 fn refresh(window: &AndroidWindow, state: &AppState, shared: &Shared) {
+    refresh_stats(window, state);
     refresh_routing(window, state);
     refresh_settings(window, state);
     let (filter, updating) = {
