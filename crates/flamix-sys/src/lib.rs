@@ -6,6 +6,10 @@ pub mod elevation;
 pub mod runner;
 pub mod stats;
 pub mod sysproxy;
+/// Linux transparent-proxy helper (nftables TPROXY + policy routing). Public API lives on
+/// every target so the UI layer can read [`transparent::TproxyPlan`] uniformly; actual
+/// install/remove runs only on Linux (added in M2 alongside the elevated watchdog).
+pub mod transparent;
 
 /// Error type of flamix-sys.
 #[derive(Debug, thiserror::Error)]
