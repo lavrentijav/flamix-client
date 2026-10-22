@@ -17,6 +17,7 @@ slint-build = "1"
 [dependencies]
 flamix-core = { workspace = true }
 serde_json = { workspace = true }
+chrono = { workspace = true }
 # Subscription fetch runs on a current-thread runtime (src/phone.rs) on every platform.
 tokio = { workspace = true }
 # Slint's android backend (android-activity 0.6). Safe to enable on every target; on the

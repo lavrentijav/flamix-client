@@ -6,15 +6,18 @@
 //! touches the file itself.
 
 use flamix_core::config::{self, android_tun, ConnectContext, CoreKind};
-use flamix_core::model::{AppState, Server, Subscription};
-use flamix_core::{store, subscription};
+use flamix_core::model::{
+    AppState, RoutingPreset, RoutingRule, RuleAction, Server, Subscription, TrafficInfo,
+};
+use flamix_core::provider_routing::RoutingLinkAction;
+use flamix_core::{deeplink, link, store, subscription};
 use std::path::Path;
 
 /// Shown when the selected server has no sing-box outbound (e.g. xhttp, which needs Xray).
 pub const UNSUPPORTED_MESSAGE: &str = "Этот сервер не поддерживается на Android";
 
 /// One row of the server list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ServerRow {
     pub id: String,
     pub name: String,
@@ -26,7 +29,16 @@ pub struct ServerRow {
     pub is_exit: bool,
     /// Number of servers (>1) sharing this exit IP; 0 = unique or unknown exit.
     pub group: usize,
+    /// Desktop encoding: [`PING_UNTESTED`], [`PING_FAILED`] or the latency in ms.
+    pub ping: i32,
+    /// Quota fraction used and "осталось X" text, when the server reports a quota.
+    pub quota: Option<(f32, String)>,
 }
+
+/// `ServerRow::ping`: not tested yet.
+pub const PING_UNTESTED: i32 = -2;
+/// `ServerRow::ping`: the last test failed.
+pub const PING_FAILED: i32 = -1;
 
 /// Servers in storage order: subscriptions first, then local servers (unordered by exit).
 fn stored_servers(state: &AppState) -> Vec<&Server> {
@@ -63,7 +75,6 @@ pub fn exit_groups(state: &AppState) -> Vec<Vec<String>> {
 }
 
 /// Every server the phone list shows, in list order: members of one exit group are adjacent.
-/// The list index used by the UI is the index into this vector.
 pub fn all_servers(state: &AppState) -> Vec<&Server> {
     let all = stored_servers(state);
     exit_groups(state)
@@ -73,30 +84,350 @@ pub fn all_servers(state: &AppState) -> Vec<&Server> {
         .collect()
 }
 
+/// Row for one server; `groups` is the result of [`exit_groups`] for `state`.
+fn row(state: &AppState, server: &Server, groups: &[Vec<String>]) -> ServerRow {
+    let exit = exit_ip(state, &server.id);
+    let group = exit
+        .and_then(|_| groups.iter().find(|g| g.contains(&server.id)))
+        .map_or(0, Vec::len);
+    let quota = server.traffic.and_then(|t| {
+        t.remaining().map(|left| {
+            (
+                t.used_fraction().unwrap_or(0.0),
+                format!("осталось {}", human_bytes(left)),
+            )
+        })
+    });
+    ServerRow {
+        id: server.id.clone(),
+        name: server.name.clone(),
+        subtitle: format!(
+            "{} · {}",
+            server.protocol().as_str(),
+            server.transport.network.as_str()
+        ),
+        address: exit.map_or_else(|| server.address.clone(), str::to_string),
+        is_exit: exit.is_some(),
+        group: if group > 1 { group } else { 0 },
+        ping: ping_code(server),
+        quota,
+    }
+}
+
 pub fn server_rows(state: &AppState) -> Vec<ServerRow> {
     let groups = exit_groups(state);
     all_servers(state)
         .into_iter()
-        .map(|s| {
-            let exit = exit_ip(state, &s.id);
-            let group = exit
-                .and_then(|_| groups.iter().find(|g| g.contains(&s.id)))
-                .map_or(0, |g| g.len())
-                .max(1);
-            ServerRow {
-                id: s.id.clone(),
-                name: s.name.clone(),
-                subtitle: format!(
-                    "{} · {}",
-                    s.protocol().as_str(),
-                    s.transport.network.as_str()
-                ),
-                address: exit.map_or_else(|| s.address.clone(), str::to_string),
-                is_exit: exit.is_some(),
-                group: if group > 1 { group } else { 0 },
-            }
-        })
+        .map(|s| row(state, s, &groups))
         .collect()
+}
+
+/// Encodes `Server::last_ping_ms` like the desktop UI (see [`PING_UNTESTED`]).
+fn ping_code(server: &Server) -> i32 {
+    match server.last_ping_ms {
+        None => PING_UNTESTED,
+        Some(None) => PING_FAILED,
+        Some(Some(ms)) => i32::try_from(ms).unwrap_or(i32::MAX),
+    }
+}
+
+/// Binary size text: `15 GB`, `1.2 MB` (1024 base, one decimal below 10).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if value < 10.0 {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+/// Longest URL handed to the OS opener (same limit as the desktop app).
+const MAX_URL_LEN: usize = 2048;
+
+/// Provider-supplied link that is safe to open: http(s), tg:// or mailto:, single line.
+pub fn safe_url(raw: &str) -> Option<String> {
+    let url = raw.trim();
+    if url.is_empty() || url.len() > MAX_URL_LEN {
+        return None;
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return None;
+    }
+    let lower = url.to_ascii_lowercase();
+    let ok = if let Some(rest) = lower
+        .strip_prefix("https://")
+        .or_else(|| lower.strip_prefix("http://"))
+    {
+        rest.split(['/', '?', '#'])
+            .next()
+            .is_some_and(|host| !host.is_empty() && !host.starts_with('@'))
+    } else if let Some(rest) = lower.strip_prefix("tg://") {
+        !rest.is_empty()
+    } else if let Some(rest) = lower.strip_prefix("mailto:") {
+        !rest.is_empty()
+    } else {
+        false
+    };
+    ok.then(|| url.to_string())
+}
+
+/// Banner tones (the same numbers the desktop `SubscriptionItem.banner-tone` uses).
+pub const TONE_INFO: i32 = 0;
+pub const TONE_RED: i32 = 1;
+pub const TONE_GREEN: i32 = 2;
+/// Custom `#hex` colour, carried in [`BannerView::color`].
+pub const TONE_CUSTOM: i32 = 3;
+/// Expiry notice.
+pub const TONE_WARNING: i32 = 4;
+
+/// Provider banner of a subscription, ready for the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BannerView {
+    pub text: String,
+    pub tone: i32,
+    /// RGBA, only for [`TONE_CUSTOM`].
+    pub color: Option<[u8; 4]>,
+    /// Empty when there is no (valid) button.
+    pub button_text: String,
+    /// Checked with [`safe_url`]; empty when there is no button.
+    pub link: String,
+}
+
+/// Maps a Happ banner colour (`red|blue|green|#RGB|#RRGGBB|#RRGGBBAA`) to a tone.
+pub fn banner_tone(color: Option<&str>) -> (i32, Option<[u8; 4]>) {
+    let Some(raw) = color.map(str::trim).filter(|c| !c.is_empty()) else {
+        return (TONE_INFO, None);
+    };
+    match raw.to_ascii_lowercase().as_str() {
+        "red" => return (TONE_RED, None),
+        "green" => return (TONE_GREEN, None),
+        "blue" => return (TONE_INFO, None),
+        _ => {}
+    }
+    match parse_hex_color(raw) {
+        Some(rgba) => (TONE_CUSTOM, Some(rgba)),
+        None => (TONE_INFO, None),
+    }
+}
+
+/// `#RGB`, `#RRGGBB` or `#RRGGBBAA` (the `#` is required).
+fn parse_hex_color(raw: &str) -> Option<[u8; 4]> {
+    let hex = raw.strip_prefix('#')?;
+    if !hex.is_ascii() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    match hex.len() {
+        3 => {
+            let nibble = |i: usize| u8::from_str_radix(&hex[i..i + 1], 16).ok().map(|n| n * 17);
+            Some([nibble(0)?, nibble(1)?, nibble(2)?, 255])
+        }
+        6 => Some([byte(0)?, byte(2)?, byte(4)?, 255]),
+        8 => Some([byte(0)?, byte(2)?, byte(4)?, byte(6)?]),
+        _ => None,
+    }
+}
+
+/// The banner of a subscription: the expiry notice has priority over the info banner.
+pub fn banner_view(sub: &Subscription) -> Option<BannerView> {
+    let provider = &sub.provider;
+    if let Some(text) = provider
+        .expire_notice
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        let link = provider.expire_button_link.as_deref().and_then(safe_url);
+        return Some(BannerView {
+            text: text.to_string(),
+            tone: TONE_WARNING,
+            color: None,
+            button_text: link
+                .as_ref()
+                .map(|_| "Продлить".to_string())
+                .unwrap_or_default(),
+            link: link.unwrap_or_default(),
+        });
+    }
+    let banner = provider.info_banner.as_ref()?;
+    let text = banner.text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (tone, color) = banner_tone(banner.color.as_deref());
+    let link = banner.button_link.as_deref().and_then(safe_url);
+    let button_text = match (&link, banner.button_text.as_deref().map(str::trim)) {
+        (None, _) => String::new(),
+        (Some(_), Some(t)) if !t.is_empty() => t.to_string(),
+        (Some(_), _) => "Открыть".to_string(),
+    };
+    Some(BannerView {
+        text: text.to_string(),
+        tone,
+        color,
+        button_text,
+        link: link.unwrap_or_default(),
+    })
+}
+
+/// Support link kind: 0 none, 1 Telegram, 2 e-mail, 3 website (the icon the card shows).
+pub const SUPPORT_NONE: i32 = 0;
+
+/// Support link of a subscription as (url, kind). Unsafe links count as absent.
+pub fn support_link(sub: &Subscription) -> (String, i32) {
+    let Some(url) = sub.support_url.as_deref().and_then(safe_url) else {
+        return (String::new(), SUPPORT_NONE);
+    };
+    let kind = match flamix_core::support::support_kind(&url) {
+        flamix_core::support::SupportKind::Telegram => 1,
+        flamix_core::support::SupportKind::Email => 2,
+        flamix_core::support::SupportKind::Website => 3,
+    };
+    (url, kind)
+}
+
+/// One subscription card of the servers tab (`local` = the manually added servers).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubCard {
+    /// Empty for the local-servers card.
+    pub id: String,
+    pub name: String,
+    pub local: bool,
+    pub collapsed: bool,
+    pub pinned: bool,
+    pub updating: bool,
+    /// (text, quota fraction, expiry text) when the subscription reports traffic.
+    pub traffic: Option<(String, f32, String)>,
+    pub banner: Option<BannerView>,
+    pub announce: String,
+    pub error: String,
+    pub support_url: String,
+    pub support_kind: i32,
+    pub web_url: String,
+    pub servers: Vec<ServerRow>,
+}
+
+/// Subscription line: "осталось X из Y", or "без лимита" with the used amount.
+fn traffic_line(info: &flamix_core::model::TrafficInfo) -> (String, f32) {
+    let fraction = info.used_fraction().unwrap_or(0.0);
+    let text = match (info.total, info.remaining()) {
+        (Some(total), Some(left)) if total > 0 => {
+            format!("осталось {} из {}", human_bytes(left), human_bytes(total))
+        }
+        _ => format!("без лимита, использовано {}", human_bytes(info.used())),
+    };
+    (text, fraction)
+}
+
+/// "до dd.mm.yyyy" for the expiry timestamp (UTC date), empty when it never expires.
+fn expire_line(info: &flamix_core::model::TrafficInfo) -> String {
+    let Some(seconds) = info.expire.filter(|s| *s > 0) else {
+        return String::new();
+    };
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|dt| format!("до {}", dt.format("%d.%m.%Y")))
+        .unwrap_or_default()
+}
+
+/// Cards for the servers tab. `updating` = ids with a refresh in flight. A non-empty `filter`
+/// (case-insensitive) keeps only matching servers and drops cards left without any match.
+pub fn sub_cards(state: &AppState, updating: &[String], filter: &str) -> Vec<SubCard> {
+    let needle = filter.trim().to_lowercase();
+    let groups = exit_groups(state);
+    let matches = |r: &ServerRow| {
+        needle.is_empty()
+            || [&r.name, &r.subtitle, &r.address]
+                .iter()
+                .any(|t| t.to_lowercase().contains(&needle))
+    };
+    let mut cards = Vec::new();
+    for sub in &state.subscriptions {
+        let servers: Vec<ServerRow> = sub
+            .servers
+            .iter()
+            .map(|s| row(state, s, &groups))
+            .filter(|r| matches(r))
+            .collect();
+        if !needle.is_empty() && servers.is_empty() && !sub.name.to_lowercase().contains(&needle) {
+            continue;
+        }
+        let (support_url, support_kind) = support_link(sub);
+        let banner = banner_view(sub);
+        // The plain announce line is hidden when the banner already shows the same text.
+        let announce = sub.announce.clone().unwrap_or_default();
+        let announce = match &banner {
+            Some(b) if b.text.trim() == announce.trim() => String::new(),
+            _ => announce,
+        };
+        let error = if sub.provider.hwid.is_some_and(|h| h.max_devices_reached) {
+            "Достигнут лимит устройств".to_string()
+        } else {
+            sub.last_error.clone().unwrap_or_default()
+        };
+        cards.push(SubCard {
+            id: sub.id.clone(),
+            name: if sub.name.is_empty() {
+                sub.auto_title.clone().unwrap_or_else(|| sub.url.clone())
+            } else {
+                sub.name.clone()
+            },
+            local: false,
+            collapsed: sub.collapsed,
+            pinned: sub.pinned,
+            updating: updating.contains(&sub.id),
+            traffic: sub.traffic.map(|t| {
+                let (text, fraction) = traffic_line(&t);
+                (text, fraction, expire_line(&t))
+            }),
+            banner,
+            announce,
+            error,
+            support_url,
+            support_kind,
+            web_url: sub
+                .web_page_url
+                .as_deref()
+                .and_then(safe_url)
+                .unwrap_or_default(),
+            servers,
+        });
+    }
+    let local: Vec<ServerRow> = state
+        .local_servers
+        .iter()
+        .map(|s| row(state, s, &groups))
+        .filter(|r| matches(r))
+        .collect();
+    if !local.is_empty() {
+        cards.push(SubCard {
+            id: String::new(),
+            name: "Добавленные вручную".into(),
+            local: true,
+            collapsed: false,
+            pinned: false,
+            updating: false,
+            traffic: None,
+            banner: None,
+            announce: String::new(),
+            error: String::new(),
+            support_url: String::new(),
+            support_kind: SUPPORT_NONE,
+            web_url: String::new(),
+            servers: local,
+        });
+    }
+    // Pinned subscriptions first; the rest keep their order (the local card stays last).
+    cards.sort_by_key(|c| !c.pinned);
+    cards
 }
 
 /// Backups of `id`: the explicit `settings.failover.backups` when set, otherwise the other
@@ -248,6 +579,452 @@ pub fn update_state(dir: &Path, f: impl FnOnce(&mut AppState)) -> Result<AppStat
     Ok(state)
 }
 
+/// Stores a refreshed subscription in place of the one with the same id. The UI-only flags
+/// (pinned, collapsed) are kept from the stored copy, like the desktop controller does.
+pub fn apply_fetched(dir: &Path, mut sub: Subscription) -> Result<AppState, String> {
+    update_state(dir, |state| {
+        if let Some(existing) = state.subscriptions.iter_mut().find(|s| s.id == sub.id) {
+            sub.pinned = existing.pinned;
+            sub.collapsed = existing.collapsed;
+            *existing = sub;
+        }
+    })
+}
+
+/// Changes one subscription in the stored state (`f` gets the stored subscription).
+pub fn edit_sub(
+    dir: &Path,
+    id: &str,
+    f: impl FnOnce(&mut Subscription),
+) -> Result<AppState, String> {
+    update_state(dir, |state| {
+        if let Some(sub) = state.subscriptions.iter_mut().find(|s| s.id == id) {
+            f(sub);
+        }
+    })
+}
+
+/// Removes a subscription and its servers. A selection pointing into it is cleared.
+pub fn remove_subscription(dir: &Path, id: &str) -> Result<AppState, String> {
+    update_state(dir, |state| {
+        let owned: Vec<String> = state
+            .subscriptions
+            .iter()
+            .filter(|s| s.id == id)
+            .flat_map(|s| s.servers.iter().map(|x| x.id.clone()))
+            .collect();
+        state.subscriptions.retain(|s| s.id != id);
+        if state
+            .selected_server
+            .as_deref()
+            .is_some_and(|sel| owned.iter().any(|o| o == sel))
+        {
+            state.selected_server = None;
+        }
+    })
+}
+
+/// One non-empty, trimmed line per backup URL (the "Резервные ссылки" box).
+pub fn parse_backup_urls(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Result line for a share-link import.
+pub fn links_status(added: usize, skipped: usize) -> String {
+    if added == 0 && skipped == 0 {
+        return "Все серверы уже добавлены".into();
+    }
+    let mut text = format!("Добавлено серверов: {added}");
+    if skipped > 0 {
+        text.push_str(&format!(", пропущено: {skipped}"));
+    }
+    text
+}
+
+/// What a pasted or clipboard text turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Imported {
+    /// A new subscription was stored; the caller fetches it next.
+    Subscription { id: String, name: String },
+    /// Local servers were added from share links.
+    Links { added: usize, skipped: usize },
+    /// Provider routing of the subscription that owns the selected server.
+    Routing { enabled: bool },
+    /// Routing link while no subscription is selected.
+    Unsupported,
+}
+
+/// Imports a deep link, a subscription URL or share links (desktop `apply_import`, phone side).
+/// Saves the state and returns the outcome together with the new state.
+pub fn import_text(dir: &Path, text: &str) -> Result<(Imported, AppState), String> {
+    let import =
+        deeplink::parse_import(text).ok_or_else(|| "Не удалось распознать ссылку".to_string())?;
+    let mut state = store::load(dir).map_err(|e| e.to_string())?;
+    let outcome = match import {
+        deeplink::Import::Subscription { url, name } => {
+            let mut sub = new_subscription(&url)?;
+            if state.subscriptions.iter().any(|s| s.url == sub.url) {
+                return Err("Эта подписка уже добавлена".into());
+            }
+            sub.name = name.unwrap_or_default();
+            let outcome = Imported::Subscription {
+                id: sub.id.clone(),
+                name: sub.name.clone(),
+            };
+            state.subscriptions.push(sub);
+            outcome
+        }
+        deeplink::Import::Links(text) => {
+            let (servers, errors) = link::parse_links(&text, "local");
+            let mut added = 0;
+            for server in servers {
+                if state.local_servers.iter().any(|s| s.id == server.id) {
+                    continue;
+                }
+                state.local_servers.push(server);
+                added += 1;
+            }
+            Imported::Links {
+                added,
+                skipped: errors.len(),
+            }
+        }
+        deeplink::Import::Routing(action) => apply_routing(&mut state, action),
+    };
+    store::save(dir, &state).map_err(|e| e.to_string())?;
+    Ok((outcome, state))
+}
+
+/// Applies a `happ://routing` action to the subscription of the selected server.
+fn apply_routing(state: &mut AppState, action: RoutingLinkAction) -> Imported {
+    let owner = state.selected_server.as_deref().and_then(|id| {
+        state
+            .subscriptions
+            .iter()
+            .position(|sub| sub.servers.iter().any(|s| s.id == id))
+    });
+    let Some(index) = owner else {
+        return Imported::Unsupported;
+    };
+    let sub = &mut state.subscriptions[index];
+    match action {
+        RoutingLinkAction::Add(routing) => sub.provider.routing = Some(routing),
+        RoutingLinkAction::AddAndActivate(mut routing) => {
+            routing.enabled = true;
+            sub.provider.routing = Some(routing);
+        }
+        RoutingLinkAction::Off => {
+            if let Some(routing) = &mut sub.provider.routing {
+                routing.enabled = false;
+            }
+        }
+    }
+    Imported::Routing {
+        enabled: sub.provider.routing.as_ref().is_some_and(|r| r.enabled),
+    }
+}
+
+/// One custom routing rule as the routing tab shows it. `kind` is the value list shown first
+/// (0 domains, 1 IP/subnets, 2 processes): the first non-empty list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleCard {
+    pub index: usize,
+    /// 0 proxy, 1 direct, 2 block.
+    pub action: i32,
+    pub enabled: bool,
+    pub kind: i32,
+    pub domains: String,
+    pub ips: String,
+    pub processes: String,
+}
+
+/// One subscription row of the provider-routing section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCard {
+    pub id: String,
+    pub name: String,
+    pub rules_text: String,
+    /// The provider routing profile is switched on.
+    pub enabled: bool,
+    /// The user ignores the provider routing of this subscription.
+    pub ignored: bool,
+}
+
+/// Routing preset index used by the UI: 0 Global, 1 Обход РФ, 2 Свои правила.
+pub fn preset_index(preset: RoutingPreset) -> i32 {
+    match preset {
+        RoutingPreset::Global => 0,
+        RoutingPreset::BypassRu => 1,
+        RoutingPreset::Custom => 2,
+    }
+}
+
+pub fn preset_from_index(index: i32) -> RoutingPreset {
+    match index {
+        0 => RoutingPreset::Global,
+        1 => RoutingPreset::BypassRu,
+        _ => RoutingPreset::Custom,
+    }
+}
+
+/// Domain strategy names in the order of the UI chips.
+pub const DOMAIN_STRATEGIES: [&str; 3] = ["AsIs", "IPIfNonMatch", "IPOnDemand"];
+
+/// Rule value lists, in UI order: domains, IPs, processes.
+fn rule_lists(rule: &RoutingRule) -> [&Vec<String>; 3] {
+    [&rule.domains, &rule.ips, &rule.processes]
+}
+
+pub fn rule_cards(state: &AppState) -> Vec<RuleCard> {
+    state
+        .settings
+        .routing
+        .custom_rules
+        .iter()
+        .enumerate()
+        .map(|(index, rule)| {
+            let text = |list: &Vec<String>| list.join("\n");
+            let kind = rule_lists(rule)
+                .iter()
+                .position(|list| !list.is_empty())
+                .unwrap_or(0);
+            RuleCard {
+                index,
+                action: match rule.action {
+                    RuleAction::Proxy => 0,
+                    RuleAction::Direct => 1,
+                    RuleAction::Block => 2,
+                },
+                enabled: rule.enabled,
+                kind: i32::try_from(kind).unwrap_or(0),
+                domains: text(&rule.domains),
+                ips: text(&rule.ips),
+                processes: text(&rule.processes),
+            }
+        })
+        .collect()
+}
+
+/// Values typed into one rule field: one per line or comma, trimmed, empty ones dropped.
+pub fn rule_values(text: &str) -> Vec<String> {
+    text.split(['\n', ','])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// First validation problem of the custom rules ("" when valid).
+pub fn routing_error(state: &AppState) -> String {
+    for (index, rule) in state.settings.routing.custom_rules.iter().enumerate() {
+        if rule.enabled && rule_lists(rule).iter().all(|list| list.is_empty()) {
+            return format!("Правило {}: хотя бы одно значение", index + 1);
+        }
+    }
+    String::new()
+}
+
+/// Russian plural for a rule count ("1 правило", "2 правила", "5 правил").
+pub fn rules_label(count: usize) -> String {
+    let (n10, n100) = (count % 10, count % 100);
+    let word = if n10 == 1 && n100 != 11 {
+        "правило"
+    } else if (2..=4).contains(&n10) && !(12..=14).contains(&n100) {
+        "правила"
+    } else {
+        "правил"
+    };
+    format!("{count} {word}")
+}
+
+/// Subscriptions with provider routing (or with the ignore flag set).
+pub fn provider_cards(state: &AppState) -> Vec<ProviderCard> {
+    state
+        .subscriptions
+        .iter()
+        .filter_map(|sub| {
+            let routing = sub.provider.routing.as_ref();
+            if routing.is_none() && !sub.options.ignore_provider_routing {
+                return None;
+            }
+            let count = routing.map_or(0, |r| r.rules.len());
+            Some(ProviderCard {
+                id: sub.id.clone(),
+                name: if sub.name.is_empty() {
+                    sub.url.clone()
+                } else {
+                    sub.name.clone()
+                },
+                rules_text: if routing.is_some() {
+                    rules_label(count)
+                } else {
+                    String::new()
+                },
+                enabled: routing.is_some_and(|r| r.enabled),
+                ignored: sub.options.ignore_provider_routing,
+            })
+        })
+        .collect()
+}
+
+/// Core names of the UI chips, in order (`Settings::core_override` values).
+pub const CORE_OVERRIDES: [&str; 4] = ["auto", "xray", "sing-box", "mihomo"];
+
+/// Error text of the device id editor (the same wording as the desktop dialog).
+pub const HWID_ERROR: &str = "от 8 до 64 символов: латиница, цифры, - и _";
+
+/// Parses the device id editor input: empty clears the override, otherwise it must be valid.
+pub fn hwid_from_input(input: &str) -> Result<Option<String>, String> {
+    let value = input.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else if flamix_core::model::valid_hwid(value) {
+        Ok(Some(value.to_string()))
+    } else {
+        Err(HWID_ERROR.to_string())
+    }
+}
+
+/// Checks the DNS fields. `remote` and `direct` are required; `bootstrap` may be empty.
+pub fn check_dns(remote: &str, direct: &str) -> Result<(), String> {
+    if remote.trim().is_empty() || direct.trim().is_empty() {
+        return Err("Укажите оба DNS-адреса: через прокси и напрямую".into());
+    }
+    Ok(())
+}
+
+/// Days in the statistics chart.
+pub const CHART_DAYS: usize = 30;
+
+/// One header card of the statistics tab.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatCard {
+    pub title: String,
+    pub value: String,
+    pub up: String,
+    pub down: String,
+}
+
+/// One day column: bar heights relative to the busiest day (`0.0..=1.0`) and its label.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DayBar {
+    pub label: String,
+    pub up: f32,
+    pub down: f32,
+}
+
+/// Everything the statistics tab shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsView {
+    pub cards: Vec<StatCard>,
+    pub days: Vec<DayBar>,
+    pub top: Vec<TopEntry>,
+}
+
+/// Sum of upload and download over several counters (quota and expiry are not summed).
+fn sum_traffic<'a>(infos: impl IntoIterator<Item = &'a TrafficInfo>) -> TrafficInfo {
+    let mut out = TrafficInfo::default();
+    for info in infos {
+        out.upload = out.upload.saturating_add(info.upload);
+        out.download = out.download.saturating_add(info.download);
+    }
+    out
+}
+
+fn card(title: &str, info: &TrafficInfo) -> StatCard {
+    StatCard {
+        title: title.into(),
+        value: human_bytes(info.used()),
+        up: format!("↑ {}", human_bytes(info.upload)),
+        down: format!("↓ {}", human_bytes(info.download)),
+    }
+}
+
+/// Statistics of the phone: lifetime total, today and the last 30 days, the daily columns and
+/// the busiest servers (by locally accounted traffic). `today` is the local calendar day.
+pub fn stats_view(state: &AppState, today: chrono::NaiveDate) -> StatsView {
+    let total = sum_traffic(state.servers().map(|s| &s.local_traffic));
+    let key = today.format("%Y-%m-%d").to_string();
+    let today_info = state.daily_traffic.get(&key).copied().unwrap_or_default();
+    let days: Vec<(chrono::NaiveDate, TrafficInfo)> = (0..CHART_DAYS)
+        .rev()
+        .map(|offset| {
+            let date = today
+                .checked_sub_days(chrono::Days::new(offset as u64))
+                .unwrap_or(today);
+            let info = state
+                .daily_traffic
+                .get(&date.format("%Y-%m-%d").to_string())
+                .copied()
+                .unwrap_or_default();
+            (date, info)
+        })
+        .collect();
+    let month = sum_traffic(days.iter().map(|(_, info)| info));
+    let busiest = days.iter().map(|(_, i)| i.used()).max().unwrap_or(0).max(1) as f64;
+    let last = days.len().saturating_sub(1);
+    let bars = days
+        .iter()
+        .enumerate()
+        .map(|(i, (date, info))| DayBar {
+            // A label every 7 days, counted back from today.
+            label: if (last - i) % 7 == 0 {
+                date.format("%d.%m").to_string()
+            } else {
+                String::new()
+            },
+            up: (info.upload as f64 / busiest) as f32,
+            down: (info.download as f64 / busiest) as f32,
+        })
+        .collect();
+    let mut servers: Vec<&Server> = state.servers().collect();
+    servers.sort_by_key(|s| std::cmp::Reverse(s.local_traffic.used()));
+    let max = servers
+        .first()
+        .map(|s| s.local_traffic.used())
+        .unwrap_or(0)
+        .max(1);
+    let top = servers
+        .into_iter()
+        .filter(|s| s.local_traffic.used() > 0)
+        .take(6)
+        .map(|s| TopEntry {
+            name: s.name.clone(),
+            iso: s
+                .country
+                .as_deref()
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map_or_else(|| "UN".to_string(), str::to_ascii_uppercase),
+            used: s.local_traffic.used(),
+            fraction: s.local_traffic.used() as f32 / max as f32,
+        })
+        .collect();
+    StatsView {
+        cards: vec![
+            card("Всего", &total),
+            card("Сегодня", &today_info),
+            card("30 дней", &month),
+        ],
+        days: bars,
+        top,
+    }
+}
+
+/// One server line of the statistics tab: country, name, used bytes and the share of the top one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopEntry {
+    pub name: String,
+    pub iso: String,
+    pub used: u64,
+    /// Share of the busiest server (`0.0..=1.0`).
+    pub fraction: f32,
+}
+
 /// Random lowercase hex id (same scheme as the desktop controller).
 fn random_hex(bytes: usize) -> String {
     use std::collections::hash_map::RandomState;
@@ -285,6 +1062,121 @@ mod tests {
         let sub = new_subscription("  https://example.com/sub  ").unwrap();
         assert_eq!(sub.url, "https://example.com/sub");
         assert_eq!(sub.id.len(), 16);
+    }
+
+    #[test]
+    fn backup_lines_are_trimmed_and_non_empty() {
+        let parsed = parse_backup_urls("  https://a/1 \n\n https://b/2\r\n");
+        assert_eq!(parsed, ["https://a/1", "https://b/2"]);
+        assert_eq!(links_status(2, 1), "Добавлено серверов: 2, пропущено: 1");
+        assert_eq!(links_status(0, 0), "Все серверы уже добавлены");
+    }
+
+    #[test]
+    fn import_text_recognises_subscription_and_rejects_garbage() {
+        let dir = std::env::temp_dir().join(format!("flamix-import-test-{}", random_hex(4)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (outcome, state) =
+            import_text(&dir, "https://example.com/sub?x=1").expect("subscription");
+        assert!(matches!(outcome, Imported::Subscription { .. }));
+        assert_eq!(state.subscriptions.len(), 1);
+        assert!(import_text(&dir, "hello world").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn rule_values_and_plural() {
+        assert_eq!(
+            rule_values(" geosite:ru,\n domain:a.com \n\n"),
+            ["geosite:ru", "domain:a.com"]
+        );
+        assert_eq!(rules_label(1), "1 правило");
+        assert_eq!(rules_label(3), "3 правила");
+        assert_eq!(rules_label(11), "11 правил");
+        assert_eq!(rules_label(22), "22 правила");
+    }
+
+    #[test]
+    fn custom_rules_validation_and_kind() {
+        let mut st = AppState::default();
+        st.settings.routing.custom_rules.push(RoutingRule {
+            domains: Vec::new(),
+            ips: vec!["10.0.0.0/8".into()],
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Direct,
+            enabled: true,
+        });
+        assert_eq!(routing_error(&st), "");
+        let cards = rule_cards(&st);
+        assert_eq!((cards[0].kind, cards[0].action), (1, 1));
+        st.settings.routing.custom_rules.push(RoutingRule {
+            domains: Vec::new(),
+            ips: Vec::new(),
+            processes: Vec::new(),
+            network: None,
+            ports: None,
+            action: RuleAction::Block,
+            enabled: true,
+        });
+        assert_eq!(routing_error(&st), "Правило 2: хотя бы одно значение");
+    }
+
+    #[test]
+    fn hwid_input_rules() {
+        assert_eq!(hwid_from_input("  "), Ok(None));
+        assert_eq!(
+            hwid_from_input(" abcd-1234_x "),
+            Ok(Some("abcd-1234_x".to_string()))
+        );
+        assert!(hwid_from_input("short").is_err());
+        assert!(hwid_from_input("bad space here").is_err());
+        assert!(check_dns("", "x").is_err());
+    }
+
+    #[test]
+    fn stats_totals_days_and_top_servers() {
+        let mut st = AppState::default();
+        let mut a = srv("a", "a.example");
+        a.local_traffic = TrafficInfo {
+            upload: 100,
+            download: 900,
+            total: None,
+            expire: None,
+        };
+        a.country = Some("de".into());
+        st.local_servers.push(a);
+        st.local_servers.push(srv("b", "b.example"));
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 22).unwrap();
+        st.daily_traffic.insert(
+            "2026-10-22".into(),
+            TrafficInfo {
+                upload: 10,
+                download: 30,
+                total: None,
+                expire: None,
+            },
+        );
+        st.daily_traffic.insert(
+            "2026-10-01".into(),
+            TrafficInfo {
+                upload: 0,
+                download: 60,
+                total: None,
+                expire: None,
+            },
+        );
+        let view = stats_view(&st, today);
+        assert_eq!(view.cards[0].value, human_bytes(1000));
+        assert_eq!(view.cards[1].value, human_bytes(40));
+        assert_eq!(view.cards[2].value, human_bytes(100));
+        assert_eq!(view.days.len(), CHART_DAYS);
+        assert_eq!(view.days[CHART_DAYS - 1].label, "22.10");
+        assert!((view.days[CHART_DAYS - 1].down - 0.5).abs() < 0.001);
+        assert_eq!(view.top.len(), 1);
+        assert_eq!(view.top[0].iso, "DE");
+        assert_eq!(view.top[0].fraction, 1.0);
     }
 
     #[test]
@@ -388,5 +1280,76 @@ mod tests {
         );
         st.settings.failover.backups = vec!["b".into()];
         assert_eq!(backup_ids(&st, "a"), ["b"], "explicit list wins");
+    }
+
+    #[test]
+    fn safe_url_accepts_only_expected_schemes() {
+        assert!(safe_url("https://example.com/pay").is_some());
+        assert!(safe_url("tg://resolve?domain=x").is_some());
+        assert!(safe_url("mailto:a@b.c").is_some());
+        assert!(safe_url("javascript:alert(1)").is_none());
+        assert!(safe_url("https://exa mple.com").is_none());
+        assert!(safe_url("https://").is_none());
+    }
+
+    #[test]
+    fn banner_tones_and_expiry_priority() {
+        assert_eq!(banner_tone(Some("red")), (TONE_RED, None));
+        assert_eq!(
+            banner_tone(Some("#0f0")),
+            (TONE_CUSTOM, Some([0, 255, 0, 255]))
+        );
+        assert_eq!(banner_tone(Some("nonsense")), (TONE_INFO, None));
+        let mut sub = new_subscription("https://example.com/sub").unwrap();
+        sub.provider.info_banner = Some(flamix_core::model::InfoBanner {
+            text: "Информация".into(),
+            color: Some("green".into()),
+            button_text: None,
+            button_link: Some("https://example.com/x".into()),
+        });
+        let banner = banner_view(&sub).expect("info banner");
+        assert_eq!(
+            (banner.tone, banner.button_text.as_str()),
+            (TONE_GREEN, "Открыть")
+        );
+        sub.provider.expire_notice = Some("Подписка истекла".into());
+        assert_eq!(banner_view(&sub).expect("expiry").tone, TONE_WARNING);
+    }
+
+    #[test]
+    fn sub_cards_filter_and_quota_text() {
+        let mut st = AppState::default();
+        let mut sub = new_subscription("https://example.com/sub").unwrap();
+        sub.name = "Main".into();
+        sub.traffic = Some(flamix_core::model::TrafficInfo {
+            upload: 0,
+            download: 1024 * 1024,
+            total: Some(10 * 1024 * 1024),
+            expire: Some(1_798_761_600),
+        });
+        let mut a = srv("a", "a.example");
+        a.name = "Alpha".into();
+        a.traffic = sub.traffic;
+        sub.servers = vec![a, srv("b", "b.example")];
+        st.subscriptions.push(sub);
+        st.local_servers.push(srv("c", "c.example"));
+
+        let all = sub_cards(&st, &[], "");
+        assert_eq!(all.len(), 2, "subscription and local card");
+        let card = &all[0];
+        let (text, fraction, expire) = card.traffic.clone().expect("traffic");
+        assert_eq!(text, "осталось 9.0 MB из 10 MB");
+        assert!((fraction - 0.1).abs() < 0.001);
+        assert_eq!(expire, "до 01.01.2027");
+        assert_eq!(
+            card.servers[0].quota.as_ref().map(|q| q.1.as_str()),
+            Some("осталось 9.0 MB")
+        );
+
+        let found = sub_cards(&st, &[], "alpha");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].servers.len(), 1);
+        assert!(sub_cards(&st, &[], "zzz").is_empty());
+        assert!(!sub_cards(&st, &["x".into()], "")[0].updating);
     }
 }
