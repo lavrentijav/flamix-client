@@ -5,6 +5,7 @@
 
     <application
         android:label="Flamix"
+        android:icon="@mipmap/ic_launcher"
         android:allowBackup="false"
         android:extractNativeLibs="true"
         android:theme="@android:style/Theme.Material.NoActionBar">
