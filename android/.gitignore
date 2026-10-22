@@ -1,0 +1,5 @@
+.gradle/
+build/
+local.properties
+# Native libs are produced by cargo-ndk (see .github/workflows/android.yml)
+app/src/main/jniLibs/
