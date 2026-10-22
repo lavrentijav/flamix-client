@@ -6,8 +6,8 @@
 //! The window is `AndroidWindow` from `ui/android.slint`. State lives in `state.json` in the app's
 //! files dir (same format as the desktop app); see [`phone`] for the logic.
 
-#[cfg(unix)]
 pub mod applog;
+#[cfg(unix)]
 pub mod bridge;
 pub mod phone;
 #[cfg(unix)]

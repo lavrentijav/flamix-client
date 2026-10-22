@@ -46,6 +46,7 @@ pub fn android_config(
     if let Some(route) = cfg.get_mut("route").and_then(Value::as_object_mut) {
         route.remove("auto_detect_interface");
     }
+    strip_remote_rule_sets(&mut cfg);
     for inbound in cfg.get_mut("inbounds")?.as_array_mut()? {
         if inbound["type"] == "mixed" {
             let ib = inbound.as_object_mut()?;
@@ -54,6 +55,24 @@ pub fn android_config(
         }
     }
     Some(cfg)
+}
+
+/// Removes remote `.srs` rule sets and every route/DNS rule that uses them. The core downloads
+/// them at start (through the proxy); if the download fails or is slow the core exits with FATAL
+/// and the VPN drops at once. TODO: ship the rule sets as local files and re-enable routing.
+fn strip_remote_rule_sets(cfg: &mut Value) {
+    if let Some(route) = cfg.get_mut("route").and_then(Value::as_object_mut) {
+        route.remove("rule_set");
+    }
+    for (section, key) in [("route", "rules"), ("dns", "rules")] {
+        if let Some(rules) = cfg
+            .get_mut(section)
+            .and_then(|s| s.get_mut(key))
+            .and_then(Value::as_array_mut)
+        {
+            rules.retain(|r| !r.to_string().contains("\"rule_set\""));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,6 +111,18 @@ mod tests {
         let c = cfg(&Settings::default());
         assert!(c["route"].get("auto_detect_interface").is_none());
         assert!(c["route"].get("default_interface").is_none());
+    }
+
+    #[test]
+    fn remote_rule_sets_are_stripped() {
+        let mut c = json!({
+            "route": {"rule_set": [{"tag": "x"}], "rules": [{"rule_set": ["x"], "outbound": "direct"}, {"protocol": "dns"}]},
+            "dns": {"rules": [{"rule_set": ["x"], "server": "d"}]}
+        });
+        strip_remote_rule_sets(&mut c);
+        assert!(c["route"].get("rule_set").is_none());
+        assert_eq!(c["route"]["rules"].as_array().unwrap().len(), 1);
+        assert!(c["dns"]["rules"].as_array().unwrap().is_empty());
     }
 
     #[test]
