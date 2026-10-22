@@ -38,7 +38,9 @@ The window has a tab rail on the left, the server list in the middle and the con
 - **Routing** — presets "Global", "RU bypass" and "Custom rules"; a switch for the Anixart mirror (direct or via the
   proxy); your own rules by domains, IPs and processes with the actions "proxy", "direct", "block"; routing pushed
   by the provider.
-- **Settings** — Proxy or TUN mode, core choice (Auto, Xray, sing-box, mihomo), ports, LAN access, system proxy, UDP,
+- **Settings** — Proxy, TUN or **TProxy** mode (Linux-only transparent proxy via nftables — no visible `tun0`,
+  applications cannot tell they are being filtered) and **AP tether** (traffic forwarded through `wlan0`/`usb0`
+  goes into the tunnel); core choice (Auto, Xray, sing-box, mihomo), ports, LAN access, system proxy, UDP,
   sniffing, TUN parameters, DNS, the ping test address, geo data, autostart, theme.
 - **Statistics** — traffic for the last 30 days and the most used servers.
 - **About** — version, core versions, licenses, backup of settings and subscriptions.
@@ -88,6 +90,10 @@ see **[docs/install.md](docs/install.md)**.
 2. **Pick a server** in the list. The "Ping test" button shows its latency.
 3. **Connect** with the power button on the right. **Proxy** mode sets the system proxy and opens local
    SOCKS5 `10808` and HTTP `10809`. **TUN** mode routes all system traffic and needs administrator or root rights.
+   **TProxy** mode (Linux, root) is a netfilter-based transparent proxy: applications see no `tun0`, no
+   `HTTPS_PROXY`, just the real network with its direct route removed and the proxy inserted. An optional
+   **AP tether** forwards traffic from interfaces like `wlan0` (hostapd) or `usb0` (USB tethering) through the
+   same tunnel. Details — [docs/transparent-proxy.md](docs/transparent-proxy.md).
 4. **Choose routing** on the "Routing" tab. "RU bypass" is usually the right choice for Russian sites.
 5. **Update the subscription** with the button on its card. If the main address fails, the client tries the backups.
 
