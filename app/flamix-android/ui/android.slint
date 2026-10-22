@@ -116,7 +116,7 @@ component BottomTab inherits Rectangle {
     in property <bool> active;
     callback clicked();
     horizontal-stretch: 1;
-    min-width: lbl.preferred-width + 12px;
+    min-width: lbl.preferred-width + 6px;
     background: transparent;
     touch := TouchArea {
         clicked => { root.clicked(); }
@@ -136,7 +136,7 @@ component BottomTab inherits Rectangle {
         lbl := Text {
             text: root.label;
             color: root.active ? Theme.accent : Theme.muted;
-            font-size: 11px;
+            font-size: 10px;
             horizontal-alignment: center;
         }
     }
