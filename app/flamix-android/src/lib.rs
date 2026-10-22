@@ -3,6 +3,9 @@
 //! Kept in its own crate so the Android build does not pull in the desktop-only
 //! dependencies of `app/flamix` (tray, native file dialogs, clipboard, ...).
 
+#[cfg(unix)]
+pub mod tunnel;
+
 slint::slint! {
     export component MainWindow inherits Window {
         title: "Flamix";

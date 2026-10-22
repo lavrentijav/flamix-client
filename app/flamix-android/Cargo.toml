@@ -16,5 +16,13 @@ crate-type = ["cdylib", "rlib"]
 # host it is simply unused. Renderer: femtovg (same as the desktop app).
 slint = { version = "1", default-features = false, features = ["std", "compat-1-2", "backend-android-activity-06", "renderer-femtovg"] }
 
+# VPN data path (see src/tunnel.rs): the VpnService fd is read in-process by tun2proxy, which
+# forwards to the sing-box core's local SOCKS inbound. Unix only: it builds on the Linux host
+# (so ru1 clippy/tests cover it) and on Android; the Windows desktop build skips it.
+[target.'cfg(unix)'.dependencies]
+jni = "0.21"
+tun2proxy = { version = "0.8", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
 [lints]
 workspace = true
