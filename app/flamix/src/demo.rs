@@ -596,9 +596,9 @@ fn setup_with(ui: &AppWindow, collapse_all: bool) -> anyhow::Result<()> {
     }
     {
         let w = ui.as_weak();
-        ui.on_mode_changed(move |tun| {
+        ui.on_mode_changed(move |index| {
             if let Some(ui) = w.upgrade() {
-                ui.set_tun_mode(tun);
+                ui.set_mode_index(index);
             }
         });
     }
@@ -644,7 +644,11 @@ fn apply_state(ui: &AppWindow, state: &AppState) {
     if !iso.is_empty() {
         ui.set_selected_flag(flags::flag(&iso));
     }
-    ui.set_tun_mode(state.settings.mode == ConnectionMode::Tun);
+    ui.set_mode_index(match state.settings.mode {
+        ConnectionMode::Proxy => 0,
+        ConnectionMode::Tun => 1,
+        ConnectionMode::Tproxy => 2,
+    });
 }
 
 /// What `--screenshot` renders.

@@ -40,7 +40,7 @@ export component AppWindow inherits Window {
     in property <string> status-text;
     in property <string> speed-text;
     in property <bool> needs-admin: false;
-    in-out property <bool> tun-mode: false;
+    in-out property <int> mode-index: 0; // 0 Proxy, 1 TUN, 2 TProxy
     in-out property <string> search-text;
     in property <bool> dark: true;
     // Segoe-first for the WinUI look; the screenshot switches this to the bundled font.
@@ -66,7 +66,7 @@ export component AppWindow inherits Window {
     callback delete-subscription(string);
     callback import-clipboard();
     callback sort-by-ping();
-    callback mode-changed(bool);
+    callback mode-changed(int);
     callback search-changed(string);
     callback toggle-edit();
     callback add-subscription();
@@ -154,7 +154,7 @@ export component AppWindow inherits Window {
                 status-text: root.status-text;
                 speed-text: root.speed-text;
                 needs-admin: root.needs-admin;
-                tun-mode <=> root.tun-mode;
+                mode-index <=> root.mode-index;
                 toggle-connect => { root.toggle-connect(); }
                 ping-selected => { root.ping-selected(); }
                 mode-changed(v) => { root.mode-changed(v); }

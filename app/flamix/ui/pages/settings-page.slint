@@ -8,7 +8,8 @@ import { Segmented } from "../components/segmented.slint";
 
 export global SettingsBridge {
     // --- Основные · Подключение ------------------------------------------
-    in-out property <bool> tun-mode: false;
+    // 0 Proxy, 1 TUN, 2 TProxy.
+    in-out property <int> mode-index: 0;
     in-out property <int> socks-port: 10808;
     in-out property <int> http-port: 10809;
     in-out property <bool> allow-lan: false;
@@ -70,6 +71,8 @@ export global SettingsBridge {
     in-out property <string> core-override: "auto";
     in-out property <string> fingerprint: "chrome";
     in-out property <string> bypass: "";
+    in-out property <bool> ap-tether-enabled: false;
+    in-out property <string> ap-interfaces: "";
 
     // --- Состояние --------------------------------------------------------
     in property <string> ports-error: "";
@@ -80,7 +83,7 @@ export global SettingsBridge {
     in-out property <bool> reset-confirm: false;
 
     callback changed();
-    callback mode-changed(bool);
+    callback mode-changed(int);
     callback update-geo();
     callback reset-confirmed();
     callback reset-cancelled();
@@ -170,57 +173,11 @@ export component SettingsPage inherits Rectangle {
                             vertical-alignment: center;
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Rectangle {
-                            width: 160px;
-                            height: 32px;
-                            border-radius: 8px;
-                            background: Theme.track;
-                            HorizontalLayout {
-                                padding: 3px;
-                                spacing: 3px;
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                    border-radius: 6px;
-                                    background: !SettingsBridge.tun-mode ? Theme.accent : transparent;
-                                    Text {
-                                        text: "Proxy";
-                                        color: !SettingsBridge.tun-mode ? Theme.on-accent : Theme.muted;
-                                        font-size: 12px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => {
-                                            if (SettingsBridge.tun-mode) {
-                                                SettingsBridge.tun-mode = false;
-                                                SettingsBridge.mode-changed(false);
-                                            }
-                                        }
-                                    }
-                                }
-                                Rectangle {
-                                    horizontal-stretch: 1;
-                                    border-radius: 6px;
-                                    background: SettingsBridge.tun-mode ? Theme.accent : transparent;
-                                    Text {
-                                        text: "TUN";
-                                        color: SettingsBridge.tun-mode ? Theme.on-accent : Theme.muted;
-                                        font-size: 12px;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
-                                    }
-                                    TouchArea {
-                                        mouse-cursor: pointer;
-                                        clicked => {
-                                            if (!SettingsBridge.tun-mode) {
-                                                SettingsBridge.tun-mode = true;
-                                                SettingsBridge.mode-changed(true);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                        Segmented {
+                            width: 210px;
+                            options: ["Proxy", "TUN", "TProxy"];
+                            current: SettingsBridge.mode-index;
+                            selected(i) => { SettingsBridge.mode-changed(i); }
                         }
                     }
 
@@ -294,6 +251,34 @@ export component SettingsPage inherits Rectangle {
                             checked <=> SettingsBridge.sniffing;
                             toggled => { SettingsBridge.changed(); }
                         }
+                    }
+                }
+
+                // ---------------- Точка доступа ----------------
+                SettingsCard {
+                    title: "Точка доступа";
+
+                    SettingsRow {
+                        label: "Раздавать интернет через туннель";
+                        Switch {
+                            checked <=> SettingsBridge.ap-tether-enabled;
+                            toggled => { SettingsBridge.changed(); }
+                        }
+                    }
+                    if SettingsBridge.ap-tether-enabled : SettingsField {
+                        label: "Интерфейсы";
+                        hint: "через запятую, например wlan0, usb0";
+                        LineEdit {
+                            placeholder-text: "wlan0, usb0";
+                            text <=> SettingsBridge.ap-interfaces;
+                            edited => { SettingsBridge.changed(); }
+                        }
+                    }
+                    Text {
+                        text: "Работает в режимах TUN и TProxy на Linux. Включает пересылку трафика с выбранных интерфейсов в туннель.";
+                        color: Theme.muted;
+                        font-size: 11px;
+                        wrap: word-wrap;
                     }
                 }
 

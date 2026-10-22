@@ -523,7 +523,7 @@ impl Controller {
 
     /// Snapshot the state and paint the whole window. Must run on the UI thread.
     pub(crate) fn apply_to(&self, ui: &AppWindow) {
-        let (subs, locals, name, iso, tun, device_id) = {
+        let (subs, locals, name, iso, mode, device_id) = {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let updating = self.updating.lock().unwrap_or_else(|e| e.into_inner());
             let query = ui.get_search_text().to_string();
@@ -533,7 +533,11 @@ impl Controller {
                 view::build_local_servers(&state, &query, sort),
                 view::selected_name(&state),
                 view::selected_iso(&state),
-                state.settings.mode == ConnectionMode::Tun,
+                match state.settings.mode {
+                    ConnectionMode::Proxy => 0,
+                    ConnectionMode::Tun => 1,
+                    ConnectionMode::Tproxy => 2,
+                },
                 state.device_id.clone().unwrap_or_default(),
             )
         };
@@ -546,7 +550,7 @@ impl Controller {
         } else {
             ui.set_selected_flag(flags::flag(&iso));
         }
-        ui.set_tun_mode(tun);
+        ui.set_mode_index(mode);
     }
 
     /// Paint synchronously (used during construction, before the event loop runs).
@@ -1390,16 +1394,19 @@ impl Controller {
         }
     }
 
-    fn mode_changed(self: &Arc<Self>, tun: bool) {
+    /// `index`: 0 Proxy, 1 TUN, 2 TProxy. TProxy is always selectable on desktop; privilege
+    /// problems surface when connecting (the Android client checks root itself).
+    fn mode_changed(self: &Arc<Self>, index: i32) {
+        let tun = index == 1;
         let needs_admin = tun && cfg!(windows) && !elevation::is_elevated();
         self.set_needs_admin(needs_admin);
         if needs_admin {
             self.set_status("Для TUN нужен запуск от администратора");
         }
-        let new_mode = if tun {
-            ConnectionMode::Tun
-        } else {
-            ConnectionMode::Proxy
+        let new_mode = match index {
+            1 => ConnectionMode::Tun,
+            2 => ConnectionMode::Tproxy,
+            _ => ConnectionMode::Proxy,
         };
         let changed = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1575,7 +1582,7 @@ impl Controller {
         }
         {
             let this = Arc::clone(self);
-            ui.on_mode_changed(move |tun| this.mode_changed(tun));
+            ui.on_mode_changed(move |index| this.mode_changed(index));
         }
         {
             let this = Arc::clone(self);
@@ -1875,7 +1882,12 @@ impl Controller {
 
     /// Tray Proxy/TUN switch.
     pub(crate) fn set_mode_public(self: &Arc<Self>, tun: bool) {
-        self.mode_changed(tun);
+        self.mode_changed(i32::from(tun));
+    }
+
+    /// Settings page mode control: 0 Proxy, 1 TUN, 2 TProxy.
+    pub(crate) fn set_mode_index_public(self: &Arc<Self>, index: i32) {
+        self.mode_changed(index);
     }
 
     /// Tray "Выход": disconnect, save and stop the event loop.
